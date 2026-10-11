@@ -144,6 +144,12 @@ pub struct SimConfig {
     /// re-examine unlocked queued requests (:277-278, :404-421). Flags only for A/B diagnosis.
     pub guard_trim: bool,
     pub guard_examine: bool,
+    /// Demote walk located at RELEASE time from the live node holding the last leased page,
+    /// walking parent links (peer_kv_demote.py select_demote_path); false = walk the path stored at
+    /// lookup time (v2). Split refreshes both fragments (unified_tree_core.py:123, 1285-1335);
+    /// false = v2. Flags only for A/B diagnosis; defaults = engine behavior.
+    pub demote_relocate: bool,
+    pub split_refresh: bool,
     /// Owner lease budget (64 GiB at 2,912,256 B per 64-token page = 1.51 M tokens).
     pub lease_budget_tokens: u64,
     /// Leases pin the source tree nodes (false = engine behavior: eviction is lease-blind).
@@ -227,6 +233,8 @@ impl Default for SimConfig {
             guard_budget_tokens: 3_000_000,
             guard_trim: true,
             guard_examine: true,
+            demote_relocate: true,
+            split_refresh: true,
             lease_budget_tokens: 1_510_000,
             lease_pins: false,
             jit_lead_tokens: 131_072,
@@ -678,6 +686,7 @@ impl<'a> Sim<'a> {
             radix.demote_scope =
                 if c.demote_scope_device { DemoteScope::DeviceAndHost } else { DemoteScope::Host };
             radix.record_evictions = true;
+            radix.split_refresh = c.split_refresh;
             p.push(PW {
                 beta,
                 radix,
@@ -731,7 +740,14 @@ impl<'a> Sim<'a> {
                 ib_inv: 0.0,
             })
             .collect();
-        let smg = (0..c.n_p).map(|_| TwoTierRadix::new(u64::MAX / 4, u64::MAX / 4)).collect();
+        // Router-side trees (SMG cache_aware) keep their calibrated split behavior (no refresh).
+        let smg = (0..c.n_p)
+            .map(|_| {
+                let mut t = TwoTierRadix::new(u64::MAX / 4, u64::MAX / 4);
+                t.split_refresh = false;
+                t
+            })
+            .collect();
         let lo = c.warm_s;
         let hi = c.warm_s + c.score_s;
         Self {
@@ -1708,7 +1724,12 @@ impl<'a> Sim<'a> {
         self.p[src].leased_tok = self.p[src].leased_tok.saturating_sub(pulled_now);
         if self.c.demote_source {
             let sp = std::mem::take(&mut self.reqs[r as usize].pull_src_path);
-            let (_, _, why) = self.p[src].radix.demote_walk(&sp, lookup_t);
+            let (_, _, why) = if self.c.demote_relocate {
+                let leased = runs_prefix(&self.reqs[r as usize].runs, upto);
+                self.p[src].radix.demote_from(&leased, lookup_t)
+            } else {
+                self.p[src].radix.demote_walk(&sp, lookup_t)
+            };
             self.demote_stop[why as usize] += 1;
         }
         self.reqs[r as usize].pull_lease = None;

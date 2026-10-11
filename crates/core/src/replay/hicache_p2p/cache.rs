@@ -193,6 +193,8 @@ pub struct TwoTierRadix {
     pub stats: CacheStats,
     pub evictions: Vec<HostEviction>,
     pub record_evictions: bool,
+    /// Split refreshes both fragments' access time (engine behavior); false = v2 behavior.
+    pub split_refresh: bool,
 }
 
 /// Longest common prefix of node runs `eruns` and prompt runs `pruns[ri..]` (offset `off` into
@@ -273,6 +275,7 @@ impl TwoTierRadix {
             stats: CacheStats::default(),
             evictions: Vec::new(),
             record_evictions: false,
+            split_refresh: true,
         }
     }
 
@@ -580,6 +583,60 @@ impl TwoTierRadix {
         (fn_, fb, reason)
     }
 
+    /// Demote walk as the engine runs it at RELEASE time (peer_kv_demote.py select_demote_path,
+    /// :117-148 + docstring step 3): find the live node whose last page is the last leased page by
+    /// a read-only match of the leased prefix `runs` NOW (a lease ending inside a node, or a gone or
+    /// shorter path -> no_node), then walk PARENT links toward the root. Flag a node only if it has
+    /// no child outside the path and no local access at or after `lookup_t`; stop at the first node
+    /// that fails (children / branch / access), at a node without a host copy (no_host) or at the
+    /// root. Returns (flagged nodes, flagged blocks, reason as demote_walk).
+    pub fn demote_from(&mut self, runs: &[(u64, u32)], lookup_t: f64) -> (u64, u64, u8) {
+        let want = run_blocks(runs) as u32;
+        let m = self.walk(runs, None, false);
+        let Some(&(last_id, last_m)) = m.path.last() else { return (0, 0, 0) };
+        if m.total() < want || !self.nodes[last_id as usize].alive || last_m < self.nodes[last_id as usize].nb {
+            return (0, 0, 0);
+        }
+        let mut node = last_id;
+        let mut path_child = NONE;
+        let mut reason = 5u8;
+        let mut flagged: Vec<NodeId> = Vec::new();
+        while node != NONE && node != ROOT {
+            let n = &self.nodes[node as usize];
+            if !n.alive || !n.host {
+                reason = 1;
+                break;
+            }
+            let allowed = if path_child == NONE { 0 } else { 1 };
+            if n.ch.len() > allowed {
+                reason = if path_child == NONE { 2 } else { 3 };
+                break;
+            }
+            if n.last >= lookup_t {
+                reason = 4;
+                break;
+            }
+            if !n.demoted {
+                flagged.push(node);
+            }
+            path_child = node;
+            node = n.par;
+        }
+        let (mut fn_, mut fb) = (0u64, 0u64);
+        for id in flagged {
+            let n = &mut self.nodes[id as usize];
+            n.demoted = true;
+            fn_ += 1;
+            fb += n.nb as u64;
+            if !n.host_pinned() {
+                self.push(id);
+            }
+        }
+        self.stats.demote_flagged_nodes += fn_;
+        self.stats.demote_flagged_blocks += fb;
+        (fn_, fb, reason)
+    }
+
     /// Insert a run list (write-through: device + host) and touch its path. With
     /// `host_only` the new and existing-host-only nodes stay host-only (pull landing on host).
     /// Returns the path nodes.
@@ -614,7 +671,7 @@ impl TwoTierRadix {
             let (m, ri2, off2) = lcp(&self.nodes[ch as usize].runs, runs, ri, off);
             let cnb = self.nodes[ch as usize].nb;
             if m < cnb {
-                ch = self.split(node, key, ch, m);
+                ch = self.split(node, key, ch, m, t);
             }
             {
                 let c = &self.nodes[ch as usize];
@@ -651,7 +708,7 @@ impl TwoTierRadix {
     }
 
     /// Split `ch` (child of `parent` under `key`) after `m` blocks; returns the upper node.
-    fn split(&mut self, parent: NodeId, key: u64, ch: NodeId, m: u32) -> NodeId {
+    fn split(&mut self, parent: NodeId, key: u64, ch: NodeId, m: u32, t: f64) -> NodeId {
         let (a, b) = split_runs(&self.nodes[ch as usize].runs, m);
         let (cdev, chost, clast, clock, clease, chlock, cdem, chost_t) = {
             let c = &self.nodes[ch as usize];
@@ -679,6 +736,15 @@ impl TwoTierRadix {
         }
         self.nodes[mid_id as usize].ch.insert(bkey, ch);
         self.nodes[parent as usize].ch.insert(key, mid_id);
+        // Engine: a new node is created with a fresh access time and the split child gets a fresh
+        // time too (unified_tree_core.py:123 and 1285-1335 @831bac2694): both fragments are recent.
+        if self.split_refresh {
+            self.nodes[mid_id as usize].last = t;
+            self.nodes[ch as usize].last = t;
+            if !self.nodes[ch as usize].pinned() {
+                self.push(ch);
+            }
+        }
         // Parent's device-child count is unchanged: `mid` replaces `ch` with the same residency.
         mid_id
     }
@@ -1057,6 +1123,31 @@ mod tests {
         c.insert(&runs(30, 4), 4.0, false);
         c.check().unwrap();
         assert_eq!(c.match_peek(&runs(0, 4)).total(), 0);
+    }
+
+    #[test]
+    fn demote_from_walks_parents_at_release_time() {
+        // Leased prefix = blocks 0..8 of one chain (lookup at t = 2).
+        let mut c = TwoTierRadix::new(100, 100);
+        c.insert(&runs(0, 8), 1.0, false);
+        // A split between lookup and release creates a branch point at block 4 (other session
+        // part inserted at t = 1.5, before the lookup, so no access after the lookup on 0..4
+        // except the touch of the shared upper part at 1.5).
+        c.insert(&[(0, 4), (500, 2)], 1.5, false);
+        let (n, b, why) = c.demote_from(&runs(0, 8), 2.0);
+        assert_eq!((n, b, why), (1, 4, 3), "only the lower fragment; stop at the new branch point");
+        // Without a branch the walk reaches the root and flags the whole path.
+        let mut d = TwoTierRadix::new(100, 100);
+        d.insert(&runs(0, 8), 1.0, false);
+        assert_eq!(d.demote_from(&runs(0, 8), 2.0), (1, 8, 5));
+        // A lease that ends inside a node flags nothing.
+        let mut e = TwoTierRadix::new(100, 100);
+        e.insert(&runs(0, 8), 1.0, false);
+        assert_eq!(e.demote_from(&runs(0, 6), 2.0), (0, 0, 0));
+        // An access after the lookup stops the walk.
+        let mut f = TwoTierRadix::new(100, 100);
+        f.insert(&runs(0, 8), 3.0, false);
+        assert_eq!(f.demote_from(&runs(0, 8), 2.0).2, 4);
     }
 
     #[test]
