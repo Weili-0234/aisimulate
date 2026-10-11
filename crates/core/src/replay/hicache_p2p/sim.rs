@@ -159,6 +159,15 @@ pub struct SimConfig {
     /// hit - alternative's own hit. lambda < 0 = off.
     pub cs_r3_lambda: f64,
     pub cs_r3_rho: f64,
+    /// R1 session pair (REROUTE reroute_cf.py replay(): pair): once a session (scope "session" =
+    /// task instance, "key" = agent chain) has used 2 distinct P, the detour target is chosen among
+    /// those 2 only. "off" = no restriction.
+    pub cs_pair: String,
+    /// R2 hysteresis per agent chain: within N requests (cs_hyst_n > 0) or T seconds (cs_hyst_t > 0)
+    /// of the last move, the detour threshold is k x margin (reroute_cf.py replay(): N / T / k).
+    pub cs_hyst_n: u32,
+    pub cs_hyst_t: f64,
+    pub cs_hyst_k: f64,
     /// Owner lease budget (64 GiB at 2,912,256 B per 64-token page = 1.51 M tokens).
     pub lease_budget_tokens: u64,
     /// Leases pin the source tree nodes (false = engine behavior: eviction is lease-blind).
@@ -247,6 +256,10 @@ impl Default for SimConfig {
             cs_workload: "ledger".into(),
             cs_r3_lambda: -1.0,
             cs_r3_rho: 0.10,
+            cs_pair: "off".into(),
+            cs_hyst_n: 0,
+            cs_hyst_t: 0.0,
+            cs_hyst_k: 1.0,
             lease_budget_tokens: 1_510_000,
             lease_pins: false,
             jit_lead_tokens: 131_072,
@@ -624,6 +637,17 @@ pub struct SimReport {
     /// P queue wait (waiting queue -> first forward) p50 / p95; D wait p50 / p95.
     pub p_queue_pct: [f64; 2],
     pub d_wait_pct: [f64; 2],
+    /// Spread metrics with REROUTE's offline definitions (reroute_cf.py): engine-clock TTFT
+    /// (P entry -> first token) p25/p50/p90/p99; distinct P per (session, fixed 120 / 300-s bin)
+    /// [mean, % bins with >= 3 P]; reroute = detour to a P with less hit than the owner; reroutes
+    /// per 10 requests for sessions with >= 10 requests [p25, p50, p75, p90, mean]; per agent chain:
+    /// after a reroute A->B, share returning to A within 1 / 2 / 3 requests, and of the next moves
+    /// the share going to a third P (A->B->C) [ret1, ret2, ret3, abc share].
+    pub ttft_engine: [f64; 4],
+    pub dp_bins_w120: [f64; 2],
+    pub dp_bins_w300: [f64; 2],
+    pub rr_per10_ge10: [f64; 5],
+    pub aba: [f64; 4],
     pub lookup_miss_all: u64,
     pub lease_refused_all: u64,
     pub repulls_all: u64,
@@ -682,6 +706,10 @@ pub struct Sim<'a> {
     ideal: TwoTierRadix,
     smg: Vec<TwoTierRadix>,
     sticky: FxHashMap<(u64, String), u16>,
+    /// R1: distinct P used per session scope; R2: (last P, move time, requests since the move) per
+    /// agent chain.
+    pair_set: FxHashMap<(u64, u32), Vec<u16>>,
+    rr_last: FxHashMap<(u64, u32), (u16, f64, u32)>,
     rr: usize,
     drr: usize,
     pulls_all: u64,
@@ -809,6 +837,8 @@ impl<'a> Sim<'a> {
             ideal: TwoTierRadix::new(u64::MAX / 4, u64::MAX / 4),
             smg,
             sticky: FxHashMap::default(),
+            pair_set: FxHashMap::default(),
+            rr_last: FxHashMap::default(),
             rr: 0,
             drr: 0,
             pulls_all: 0,
@@ -1341,7 +1371,23 @@ impl<'a> Sim<'a> {
                             .then(act[a].cmp(&act[b])).then(a.cmp(&b))
                     })
                     .unwrap();
-                let least = (0..np)
+                let (inst, agent) = {
+                    let rq = &self.reqs[r as usize];
+                    (self.tasks[rq.task as usize].inst, self.agents[rq.agent_state as usize].agent)
+                };
+                let ckey = (inst, agent);
+                let pkey = match self.c.cs_pair.as_str() {
+                    "key" => Some(ckey),
+                    "session" => Some((inst, u32::MAX)),
+                    _ => None,
+                };
+                let allowed: Vec<usize> = match pkey.and_then(|k| self.pair_set.get(&k)) {
+                    Some(v) if v.len() >= 2 => v.iter().map(|&x| x as usize).collect(),
+                    _ => (0..np).collect(),
+                };
+                let least = allowed
+                    .iter()
+                    .copied()
                     .min_by(|&a, &b| {
                         after[a].cmp(&after[b]).then(gpu[b].cmp(&gpu[a])).then(local[b].cmp(&local[a]))
                             .then(act[a].cmp(&act[b])).then(a.cmp(&b))
@@ -1349,11 +1395,32 @@ impl<'a> Sim<'a> {
                     .unwrap();
                 let saved = after[own].saturating_sub(after[least]);
                 let mut thr = self.c.cs_margin_tokens as f64;
+                if self.c.cs_hyst_n > 0 || self.c.cs_hyst_t > 0.0 {
+                    if let Some(&(_, tm, ns)) = self.rr_last.get(&ckey) {
+                        let hold = (self.c.cs_hyst_n > 0 && ns < self.c.cs_hyst_n)
+                            || (self.c.cs_hyst_t > 0.0 && t - tm < self.c.cs_hyst_t);
+                        if hold {
+                            thr *= self.c.cs_hyst_k;
+                        }
+                    }
+                }
                 if self.c.cs_r3_lambda >= 0.0 {
                     let pulled_est = local[own].saturating_sub(local[least]) as f64;
                     thr += pulled_est * (self.c.cs_r3_rho + self.c.cs_r3_lambda);
                 }
-                tgt = if saved as f64 > thr { least } else { own };
+                tgt = if least != own && saved as f64 > thr { least } else { own };
+                if let Some(k) = pkey {
+                    let v = self.pair_set.entry(k).or_default();
+                    if !v.contains(&(tgt as u16)) {
+                        v.push(tgt as u16);
+                    }
+                }
+                let nl = match self.rr_last.get(&ckey).copied() {
+                    None => (tgt as u16, t, u32::MAX),
+                    Some((lp, _, _)) if lp != tgt as u16 => (tgt as u16, t, 0),
+                    Some((lp, tm, ns)) => (lp, tm, ns.saturating_add(1)),
+                };
+                self.rr_last.insert(ckey, nl);
                 let cost = l - exp[tgt];
                 self.p[tgt].cs_pending += cost;
                 self.p[tgt].cs_active += 1;
@@ -2452,6 +2519,68 @@ impl<'a> Sim<'a> {
             rep.p_queue_pct = [pct7(&mut pq, 0.50), pct7(&mut pq, 0.95)];
             let mut dw: Vec<f64> = cmp.iter().map(|r| r.t_alloc.unwrap_or(r.d_recv) - r.d_recv).collect();
             rep.d_wait_pct = [pct7(&mut dw, 0.50), pct7(&mut dw, 0.95)];
+            let mut te: Vec<f64> = cmp.iter().map(|r| r.first.unwrap() - r.p_recv).collect();
+            rep.ttft_engine = [pct7(&mut te, 0.25), pct7(&mut te, 0.50), pct7(&mut te, 0.90), pct7(&mut te, 0.99)];
+            for (wi, wsec) in [120.0f64, 300.0].iter().enumerate() {
+                let mut bins: FxHashMap<(u32, i64), u64> = FxHashMap::default();
+                for r in &cmp {
+                    let b = ((r.admit - lo) / wsec).floor() as i64;
+                    *bins.entry((r.task, b)).or_insert(0) |= 1u64 << (r.p as u64 % 64);
+                }
+                let v: Vec<u32> = bins.values().map(|m| m.count_ones()).collect();
+                let nb = v.len().max(1) as f64;
+                let out = [v.iter().map(|&x| x as f64).sum::<f64>() / nb, 100.0 * v.iter().filter(|&&x| x >= 3).count() as f64 / nb];
+                if wi == 0 {
+                    rep.dp_bins_w120 = out;
+                } else {
+                    rep.dp_bins_w300 = out;
+                }
+            }
+            let is_rr = |r: &Req| r.detour && r.route_tgt < r.route_best;
+            let mut per: FxHashMap<u32, (u32, u32)> = FxHashMap::default();
+            for r in &cmp {
+                let e = per.entry(r.task).or_insert((0, 0));
+                e.0 += 1;
+                if is_rr(r) {
+                    e.1 += 1;
+                }
+            }
+            let mut v: Vec<f64> = per.values().filter(|x| x.0 >= 10).map(|&(a, b)| 10.0 * b as f64 / a as f64).collect();
+            let mean = if v.is_empty() { 0.0 } else { v.iter().sum::<f64>() / v.len() as f64 };
+            rep.rr_per10_ge10 = [pct7(&mut v, 0.25), pct7(&mut v, 0.50), pct7(&mut v, 0.75), pct7(&mut v, 0.90), mean];
+            let mut chains: FxHashMap<(u32, u32), Vec<(f64, u16, u16, bool)>> = FxHashMap::default();
+            for r in &cmp {
+                let ag = self.agents[r.agent_state as usize].agent;
+                chains.entry((r.task, ag)).or_default().push((r.admit, r.p, r.owner, is_rr(r)));
+            }
+            let (mut nrr, mut ret, mut aba, mut abc) = (0u64, [0u64; 4], 0u64, 0u64);
+            for xs in chains.values_mut() {
+                xs.sort_by(|a, b| a.0.total_cmp(&b.0));
+                for i in 0..xs.len() {
+                    if !xs[i].3 {
+                        continue;
+                    }
+                    nrr += 1;
+                    let (a_, b_) = (xs[i].2, xs[i].1);
+                    for m in 1..=3usize {
+                        if xs[i + 1..(i + 1 + m).min(xs.len())].iter().any(|y| y.1 == a_) {
+                            ret[m] += 1;
+                        }
+                    }
+                    for y in &xs[i + 1..] {
+                        if y.1 != b_ {
+                            if y.1 == a_ {
+                                aba += 1;
+                            } else {
+                                abc += 1;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            let d = nrr.max(1) as f64;
+            rep.aba = [100.0 * ret[1] as f64 / d, 100.0 * ret[2] as f64 / d, 100.0 * ret[3] as f64 / d, 100.0 * abc as f64 / (aba + abc).max(1) as f64];
         }
         rep.d_wait_mean = sum(&|r| r.t_alloc.unwrap_or(r.d_recv) - r.d_recv) / n;
         rep.prefill_mean = sum(&|r| r.t_pd.unwrap() - r.t_fwd.unwrap()) / n;
