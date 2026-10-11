@@ -317,6 +317,9 @@ struct Req {
     pull_upto: u32,
     pull_issue_blocks: u64,
     pull_first_issue_t: Option<f64>,
+    /// Age of the owner's copy at the first pull issue: time since the owner last used this
+    /// session's prefix locally (first chunk or prefill done), if it ever did.
+    pull_src_age: Option<f64>,
     pull_outcome: u8,
     jit_pending: bool,
     pull_attempts: u32,
@@ -546,6 +549,13 @@ pub struct SimReport {
     /// delay bucket [<5, 5-15, 15-30, >=30 s] as (n, misses).
     pub pull_issue_delay: [f64; 2],
     pub miss_by_delay: [[u64; 2]; 4],
+    /// Hinted window requests by the owner-copy age at the first issue (s): [<45, 45-90, 90-150,
+    /// 150-175, 175-200, 200-250, >=250, unknown] as (n, lookup misses).
+    pub miss_by_src_age: [[u64; 2]; 8],
+    /// p50 of [send -> first issue, P intake -> waiting queue (D allocation + handshake),
+    /// waiting queue -> first issue (JIT deferral)] for full pulls and for lookup misses (s).
+    pub pull_decomp_full_p50: [f64; 3],
+    pub pull_decomp_miss_p50: [f64; 3],
     pub overcommit_events: u64,
     pub overcommit_tokens_mean: f64,
     pub guard_released_pressure: u64,
@@ -1600,6 +1610,8 @@ impl<'a> Sim<'a> {
         self.reqs[r as usize].pull_attempts += 1;
         if self.reqs[r as usize].pull_first_issue_t.is_none() {
             self.reqs[r as usize].pull_first_issue_t = Some(t);
+            let ns = self.tasks[self.reqs[r as usize].task as usize].inst;
+            self.reqs[r as usize].pull_src_age = self.last_local.get(&(src as u16, ns)).map(|&x| t - x);
         }
         self.pulls_all += 1;
         let sm: MatchResult = self.p[src].radix.match_peek(&runs);
@@ -2402,6 +2414,7 @@ impl<'a> Sim<'a> {
         }
         {
             let mut delays: Vec<f64> = Vec::new();
+            let mut dec: [[Vec<f64>; 3]; 2] = Default::default();
             for r in &w {
                 if r.pull_src.is_none() || r.hint_expected == 0 {
                     continue;
@@ -2414,6 +2427,26 @@ impl<'a> Sim<'a> {
                     _ => rep.hint_outcomes[4] += 1,
                 }
                 if let Some(ti) = r.pull_first_issue_t {
+                    let ab = match r.pull_src_age {
+                        None => 7,
+                        Some(a) if a < 45.0 => 0,
+                        Some(a) if a < 90.0 => 1,
+                        Some(a) if a < 150.0 => 2,
+                        Some(a) if a < 175.0 => 3,
+                        Some(a) if a < 200.0 => 4,
+                        Some(a) if a < 250.0 => 5,
+                        Some(_) => 6,
+                    };
+                    rep.miss_by_src_age[ab][0] += 1;
+                    if r.pull_outcome == 3 {
+                        rep.miss_by_src_age[ab][1] += 1;
+                    }
+                    let k = if r.pull_outcome == 1 { Some(0) } else if r.pull_outcome == 3 { Some(1) } else { None };
+                    if let (Some(k), Some(pr)) = (k, r.p_ready) {
+                        dec[k][0].push(ti - r.start);
+                        dec[k][1].push(pr - r.p_recv);
+                        dec[k][2].push((ti - pr).max(0.0));
+                    }
                     let dl = ti - r.start;
                     delays.push(dl);
                     let b = if dl < 5.0 { 0 } else if dl < 15.0 { 1 } else if dl < 30.0 { 2 } else { 3 };
@@ -2425,6 +2458,17 @@ impl<'a> Sim<'a> {
             }
             if !delays.is_empty() {
                 rep.pull_issue_delay = [percentile_in_place(&mut delays, 50.0), percentile_in_place(&mut delays, 90.0)];
+            }
+            for k in 0..2 {
+                for j in 0..3 {
+                    let v = &mut dec[k][j];
+                    let x = if v.is_empty() { 0.0 } else { percentile_in_place(v, 50.0) };
+                    if k == 0 {
+                        rep.pull_decomp_full_p50[j] = x;
+                    } else {
+                        rep.pull_decomp_miss_p50[j] = x;
+                    }
+                }
             }
         }
         rep.tasks_started = self.tasks_started;

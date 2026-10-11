@@ -439,11 +439,14 @@ impl TwoTierRadix {
     fn pin_kind(&mut self, mut node: NodeId, d: i64, kind: u8) {
         while node != NONE && node != ROOT {
             let n = &mut self.nodes[node as usize];
-            match kind {
-                1 => n.lease = (n.lease as i64 + d) as u32,
-                2 => n.hlock = (n.hlock as i64 + d) as u32,
-                _ => n.lock = (n.lock as i64 + d) as u32,
-            }
+            let cnt = match kind {
+                1 => &mut n.lease,
+                2 => &mut n.hlock,
+                _ => &mut n.lock,
+            };
+            let v = *cnt as i64 + d;
+            debug_assert!(v >= 0, "pin count underflow (kind {kind})");
+            *cnt = v.max(0) as u32;
             let unpinned = !n.pinned();
             let par = n.par;
             if unpinned {
@@ -650,9 +653,9 @@ impl TwoTierRadix {
     /// Split `ch` (child of `parent` under `key`) after `m` blocks; returns the upper node.
     fn split(&mut self, parent: NodeId, key: u64, ch: NodeId, m: u32) -> NodeId {
         let (a, b) = split_runs(&self.nodes[ch as usize].runs, m);
-        let (cdev, chost, clast, clock, clease, cdem, chost_t) = {
+        let (cdev, chost, clast, clock, clease, chlock, cdem, chost_t) = {
             let c = &self.nodes[ch as usize];
-            (c.dev, c.host, c.last, c.lock, c.lease, c.demoted, c.host_t)
+            (c.dev, c.host, c.last, c.lock, c.lease, c.hlock, c.demoted, c.host_t)
         };
         let mut mid = Node::new(a, m, parent);
         mid.dev = cdev;
@@ -660,6 +663,9 @@ impl TwoTierRadix {
         mid.last = clast;
         mid.lock = clock;
         mid.lease = clease;
+        // Path-wide pin counts: the new upper fragment lies on every pinned path through `ch`, so it
+        // carries all three counts; else a later release would underflow it (permanent pin).
+        mid.hlock = chlock;
         mid.demoted = cdem;
         mid.host_t = chost_t;
         mid.ndev = if cdev { 1 } else { 0 };
@@ -1018,6 +1024,22 @@ mod tests {
         c.insert(&runs(30, 4), 4.0, false);
         c.check().unwrap();
         assert_eq!(c.match_peek(&runs(0, 4)).total(), 0);
+    }
+
+    #[test]
+    fn split_keeps_pin_counts_and_release_leaves_no_pin() {
+        let mut c = TwoTierRadix::new(100, 100);
+        let p = c.insert(&runs(0, 8), 1.0, false);
+        let deep = p.last().copied();
+        c.host_lock(deep, 1);
+        c.lock(deep, 1);
+        // A diverging insert splits the locked node at block 4.
+        c.insert(&[(0, 4), (500, 4)], 2.0, false);
+        c.check().unwrap();
+        c.host_lock(deep, -1);
+        c.lock(deep, -1);
+        let cen = c.census();
+        assert_eq!(cen.pinned_host, 0, "no pin may survive the release after a split");
     }
 
     #[test]
