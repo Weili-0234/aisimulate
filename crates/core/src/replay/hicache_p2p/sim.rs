@@ -257,6 +257,8 @@ enum Ev {
     DLoadTick,
     SmgEvict,
     Census,
+    /// Score-window start / end: snapshot the demote counters (output only).
+    WinMark(bool),
 }
 
 struct Item {
@@ -534,6 +536,10 @@ pub struct SimReport {
     pub demote_evicted_tokens: u64,
     pub demote_cleared_nodes: u64,
     pub demote_cleared_tokens: u64,
+    /// Same counters over the score window only: flagged nodes / tokens, evicted-demoted nodes /
+    /// tokens, cleared nodes / tokens; and the demote-walk stop reasons in the window.
+    pub demote_window: [u64; 6],
+    pub demote_stop_window: [u64; 6],
     /// Hinted requests admitted in the window: [hinted, full, partial, lookup miss, never issued].
     pub hint_outcomes: [u64; 5],
     /// First pull issue delay after routing (s) for hinted window requests: p50 / p90; miss share by
@@ -628,6 +634,9 @@ pub struct Sim<'a> {
     pstate: Vec<(f64, u16, u64, u32, u32, u32)>,
     /// Per 30-s sample and D: (t, D, used tokens, FIFO length).
     dstate: Vec<(f64, u16, u64, u32)>,
+    /// Demote counters (flagged/evicted/cleared nodes and blocks, then the six stop reasons) at
+    /// the score-window start [0] and end [1].
+    dm_mark: [[u64; 12]; 2],
     lookup_miss: u64,
     lease_refused: u64,
     repulls: u64,
@@ -740,6 +749,7 @@ impl<'a> Sim<'a> {
             census: Vec::new(),
             pstate: Vec::new(),
             dstate: Vec::new(),
+            dm_mark: [[0; 12]; 2],
             lookup_miss: 0,
             lease_refused: 0,
             repulls: 0,
@@ -792,6 +802,8 @@ impl<'a> Sim<'a> {
             self.at(0.0, Ev::DLoadTick);
         }
         self.at(self.lo, Ev::Census);
+        self.at(self.lo, Ev::WinMark(false));
+        self.at(self.hi, Ev::WinMark(true));
         if self.c.p_policy == "smgca" && self.c.smg_evict_interval_s > 0.0 {
             self.at(self.c.smg_evict_interval_s, Ev::SmgEvict);
         }
@@ -848,6 +860,22 @@ impl<'a> Sim<'a> {
                         let dt = self.c.d_load_refresh_s;
                         self.at(t + dt, Ev::DLoadTick);
                     }
+                }
+                Ev::WinMark(end) => {
+                    let mut v = [0u64; 12];
+                    for p in &self.p {
+                        let s = &p.radix.stats;
+                        v[0] += s.demote_flagged_nodes;
+                        v[1] += s.demote_flagged_blocks;
+                        v[2] += s.demote_evicted_nodes;
+                        v[3] += s.demote_evicted_blocks;
+                        v[4] += s.demote_cleared_nodes;
+                        v[5] += s.demote_cleared_blocks;
+                    }
+                    for k in 0..6 {
+                        v[6 + k] = self.demote_stop[k];
+                    }
+                    self.dm_mark[end as usize] = v;
                 }
                 Ev::Census => {
                     let bt = self.c.block_tokens;
@@ -2366,6 +2394,11 @@ impl<'a> Sim<'a> {
             rep.demote_evicted_tokens += s.demote_evicted_blocks * bt;
             rep.demote_cleared_nodes += s.demote_cleared_nodes;
             rep.demote_cleared_tokens += s.demote_cleared_blocks * bt;
+        }
+        for k in 0..6 {
+            let d = self.dm_mark[1][k].saturating_sub(self.dm_mark[0][k]);
+            rep.demote_window[k] = if k % 2 == 1 { d * bt } else { d };
+            rep.demote_stop_window[k] = self.dm_mark[1][6 + k].saturating_sub(self.dm_mark[0][6 + k]);
         }
         {
             let mut delays: Vec<f64> = Vec::new();
