@@ -154,6 +154,14 @@ pub struct SimConfig {
     /// (unified_tree_core.py :871, :911-918, :1312-1370 @f8a08865b1); request-local matches use
     /// the engine key (prompt minus its last token, page aligned). false = v1-v3.
     pub split_on_match: bool,
+    /// E1 deferred demote (an engine VARIANT, not current engine behaviour; definitions of the RETURNS
+    /// workflow model srcN<k> / srcT<s>, wf-complete/returns/returns-20261011.txt section 3): at the
+    /// complete release the source copy is NOT flagged; a pending demote per (agent chain, source P)
+    /// runs the release-time demote walk (same lookup time and stop rules) when the chain has served
+    /// demote_defer_n later requests on other P, or demote_defer_t seconds after the move; a later
+    /// request of the chain on the source P cancels it. 0 = off (immediate demote).
+    pub demote_defer_n: u32,
+    pub demote_defer_t: f64,
     /// co_schedule workload signal: "ledger" (cs4 as run on GPU: charge = prompt - expected hit,
     /// kept in full from dispatch to the P response) or "true" (idealized live backlog: charges of
     /// requests in the P waiting queue + not-yet-computed uncached tokens of admitted prefills;
@@ -258,6 +266,8 @@ impl Default for SimConfig {
             demote_relocate: true,
             split_refresh: true,
             split_on_match: false,
+            demote_defer_n: 0,
+            demote_defer_t: 0.0,
             cs_workload: "ledger".into(),
             cs_r3_lambda: -1.0,
             cs_r3_rho: 0.10,
@@ -297,6 +307,8 @@ enum Ev {
     Census,
     /// Score-window start / end: snapshot the demote counters (output only).
     WinMark(bool),
+    /// E1 deferred demote due (pending-demote id).
+    DemoteDue(u64),
 }
 
 struct Item {
@@ -659,6 +671,8 @@ pub struct SimReport {
     pub partial_local_matches: u64,
     pub partial_rest_tokens: u64,
     pub match_splits: u64,
+    /// E1 whole run: deferred demotes run, cancelled by a return to the source, still pending at the end.
+    pub demote_deferred: [u64; 3],
     pub lease_refused_all: u64,
     pub repulls_all: u64,
     /// Demote walk stop reasons: no_node, no_host, children, branch, access, root.
@@ -720,6 +734,12 @@ pub struct Sim<'a> {
     /// agent chain.
     pair_set: FxHashMap<(u64, u32), Vec<u16>>,
     rr_last: FxHashMap<(u64, u32), (u16, f64, u32)>,
+    /// E1: pending source demotes per agent chain: (id, source P, leased runs, lookup time, chain
+    /// requests served elsewhere since the move, moving request); id -> chain for timed ones.
+    dem_pend: FxHashMap<(u64, u32), Vec<(u64, u16, Vec<(u64, u32)>, f64, u32, u32)>>,
+    dem_due: FxHashMap<u64, (u64, u32)>,
+    dem_seq: u64,
+    dem_deferred: [u64; 3],
     rr: usize,
     drr: usize,
     pulls_all: u64,
@@ -850,6 +870,10 @@ impl<'a> Sim<'a> {
             sticky: FxHashMap::default(),
             pair_set: FxHashMap::default(),
             rr_last: FxHashMap::default(),
+            dem_pend: FxHashMap::default(),
+            dem_due: FxHashMap::default(),
+            dem_seq: 0,
+            dem_deferred: [0; 3],
             rr: 0,
             drr: 0,
             pulls_all: 0,
@@ -944,6 +968,7 @@ impl<'a> Sim<'a> {
                 }
                 Ev::PReady(r) => self.p_ready(t, r),
                 Ev::PullDone(r) => self.pull_done(t, r),
+                Ev::DemoteDue(id) => self.demote_due(id),
                 Ev::EndIter(p) => self.end_iter(t, p as usize),
                 Ev::PrefillDone(p, r) => self.prefill_done(t, p as usize, r),
                 Ev::KvArrived(r) => self.kv_arrived(t, r),
@@ -1877,7 +1902,21 @@ impl<'a> Sim<'a> {
             self.p[src].radix.lease(lease, -1);
         }
         self.p[src].leased_tok = self.p[src].leased_tok.saturating_sub(pulled_now);
-        if self.c.demote_source {
+        let defer = self.c.demote_defer_n > 0 || self.c.demote_defer_t > 0.0;
+        if self.c.demote_source && defer {
+            // E1: keep a pending demote for (chain, source); a newer move from the same source replaces it.
+            let key = self.chain_key(r);
+            let leased = runs_prefix(&self.reqs[r as usize].runs, upto);
+            self.dem_seq += 1;
+            let id = self.dem_seq;
+            let v = self.dem_pend.entry(key).or_default();
+            v.retain(|e| e.1 != src as u16);
+            v.push((id, src as u16, leased, lookup_t, 0, r));
+            if self.c.demote_defer_t > 0.0 {
+                self.dem_due.insert(id, key);
+                self.at(t + self.c.demote_defer_t, Ev::DemoteDue(id));
+            }
+        } else if self.c.demote_source {
             let sp = std::mem::take(&mut self.reqs[r as usize].pull_src_path);
             let (_, _, why) = if self.c.demote_relocate {
                 let leased = runs_prefix(&self.reqs[r as usize].runs, upto);
@@ -1897,6 +1936,61 @@ impl<'a> Sim<'a> {
             }
         }
         self.p_idle_update(t, dst);
+    }
+
+    fn chain_key(&self, r: u32) -> (u64, u32) {
+        let rq = &self.reqs[r as usize];
+        (self.tasks[rq.task as usize].inst, self.agents[rq.agent_state as usize].agent)
+    }
+
+    /// E1: run a pending demote (release-time walk with the stored lookup time).
+    fn dem_run(&mut self, src: usize, runs: &[(u64, u32)], lookup_t: f64) {
+        let (_, _, why) = self.p[src].radix.demote_from(runs, lookup_t);
+        self.demote_stop[why as usize] += 1;
+        self.dem_deferred[0] += 1;
+    }
+
+    /// E1 timed demote (srcT): flag unless the chain came back to the source first (entry gone).
+    fn demote_due(&mut self, id: u64) {
+        let Some(key) = self.dem_due.remove(&id) else { return };
+        let Some(v) = self.dem_pend.get_mut(&key) else { return };
+        let Some(i) = v.iter().position(|e| e.0 == id) else { return };
+        let e = v.swap_remove(i);
+        self.dem_run(e.1 as usize, &e.2, e.3);
+    }
+
+    /// E1 at a chain request's first chunk on P: a request on the source cancels its pending demote
+    /// (the chain came back); a request elsewhere counts toward srcN (the moving request excluded).
+    fn dem_on_serve(&mut self, p: usize, r: u32) {
+        if !(self.c.demote_defer_n > 0 || self.c.demote_defer_t > 0.0) {
+            return;
+        }
+        let key = self.chain_key(r);
+        let Some(v) = self.dem_pend.get_mut(&key) else { return };
+        let mut run: Vec<(usize, Vec<(u64, u32)>, f64)> = Vec::new();
+        let mut cancelled = 0u64;
+        let n_need = self.c.demote_defer_n;
+        v.retain_mut(|e| {
+            if e.1 as usize == p {
+                cancelled += 1;
+                return false;
+            }
+            if e.5 != r {
+                e.4 += 1;
+                if n_need > 0 && e.4 >= n_need {
+                    run.push((e.1 as usize, std::mem::take(&mut e.2), e.3));
+                    return false;
+                }
+            }
+            true
+        });
+        if v.is_empty() {
+            self.dem_pend.remove(&key);
+        }
+        self.dem_deferred[1] += cancelled;
+        for (src, runs, lt) in run {
+            self.dem_run(src, &runs, lt);
+        }
     }
 
     fn boot_done(&mut self, t: f64, r: u32) {
@@ -1987,6 +2081,7 @@ impl<'a> Sim<'a> {
             rq.local_age = ll.map(|x| t - x);
         }
         self.last_local.insert((p as u16, ns), t);
+        self.dem_on_serve(p, r);
         let lk = self.lkey(r);
         let m = self.p[p].radix.match_local(&lk, t);
         let mut dev = m.dev as u64 * bt;
@@ -2895,6 +2990,7 @@ impl<'a> Sim<'a> {
         rep.lease_refused_all = self.lease_refused;
         rep.repulls_all = self.repulls;
         rep.demote_stop = self.demote_stop;
+        rep.demote_deferred = [self.dem_deferred[0], self.dem_deferred[1], self.dem_pend.values().map(|v| v.len() as u64).sum()];
         rep.requests_sent = self.reqs.len() as u64;
         rep.wall_s = wall_s;
         let mut rows = Vec::new();
