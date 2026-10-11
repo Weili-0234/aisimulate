@@ -137,6 +137,11 @@ pub struct CacheStats {
     /// evict_host calls that ended still over capacity, and the summed shortfall (blocks).
     pub overcommit_events: u64,
     pub overcommit_blocks: u64,
+    /// Local matches that end inside a node (partial node match) and the unmatched rest of that
+    /// node (blocks); match-time splits done (split_on_match).
+    pub partial_local_matches: u64,
+    pub partial_rest_blocks: u64,
+    pub match_splits: u64,
 }
 
 /// Window-filtered host eviction samples: (evict time, blocks, age since last use, age since write).
@@ -195,6 +200,11 @@ pub struct TwoTierRadix {
     pub record_evictions: bool,
     /// Split refreshes both fragments' access time (engine behavior); false = v2 behavior.
     pub split_refresh: bool,
+    /// A local match that ends inside a node splits it there (engine: unified_tree_core.py
+    /// _match_prefix_helper :871 @f8a08865b1): only the matched upper fragment is refreshed and
+    /// un-demoted by this and later matches (:911-918); the rest keeps its own access time and
+    /// demote flag (_split_node :1358-1362). false = v1-v3 behavior (whole node touched).
+    pub split_on_match: bool,
 }
 
 /// Longest common prefix of node runs `eruns` and prompt runs `pruns[ri..]` (offset `off` into
@@ -276,6 +286,7 @@ impl TwoTierRadix {
             evictions: Vec::new(),
             record_evictions: false,
             split_refresh: true,
+            split_on_match: false,
         }
     }
 
@@ -368,6 +379,19 @@ impl TwoTierRadix {
             let (m, ri2, off2) = lcp(&self.nodes[ch as usize].runs, runs, ri, off);
             ri = ri2;
             off = off2;
+            let mut ch = ch;
+            if let Some(t) = touch {
+                let nb0 = self.nodes[ch as usize].nb;
+                if m < nb0 {
+                    self.stats.partial_local_matches += 1;
+                    self.stats.partial_rest_blocks += (nb0 - m) as u64;
+                    if self.split_on_match {
+                        // Engine: split at the match end; the upper fragment is the matched node.
+                        ch = self.split(node, key, ch, m, t);
+                        self.stats.match_splits += 1;
+                    }
+                }
+            }
             let (cdev, chost, cnb) = {
                 let c = &self.nodes[ch as usize];
                 (c.dev, c.host, c.nb)
@@ -1058,6 +1082,38 @@ mod tests {
         c.check().unwrap();
         assert_eq!(c.match_peek(&runs(0, 4)).total(), 0, "LRU chain evicted");
         assert_eq!(c.match_peek(&runs(10, 4)).total(), 4, "cleared chain kept");
+    }
+
+    #[test]
+    fn match_split_leaves_the_unmatched_rest_aging_and_demoted() {
+        for split in [false, true] {
+            let mut c = TwoTierRadix::new(0, 100);
+            c.split_on_match = split;
+            c.insert(&runs(0, 10), 1.0, false);
+            let m = c.match_peek(&runs(0, 10));
+            c.demote_below_branch(&m.path);
+            // A local match of the first 4 blocks only (diverges at block 4).
+            let m = c.match_local(&[(0, 4), (500, 2)], 2.0);
+            assert_eq!(m.total(), 4);
+            assert_eq!(c.stats.partial_local_matches, 1);
+            assert_eq!(c.stats.partial_rest_blocks, 6);
+            c.match_local(&[(0, 4), (600, 2)], 3.0);
+            c.check().unwrap();
+            let p = c.match_peek(&runs(0, 10)).path;
+            if split {
+                assert_eq!(p.len(), 2, "split at the match end");
+                assert_eq!((c.node(p[0].0).nb, c.node(p[1].0).nb), (4, 6));
+                assert_eq!(c.node(p[0].0).last, 3.0);
+                assert!(!c.node(p[0].0).demoted, "matched fragment cleared");
+                assert_eq!(c.node(p[1].0).last, 2.0, "rest refreshed only at the split");
+                assert!(c.node(p[1].0).demoted, "rest keeps the demote flag");
+                assert_eq!(c.stats.match_splits, 1);
+            } else {
+                assert_eq!(p.len(), 1);
+                assert_eq!(c.node(p[0].0).last, 3.0);
+                assert!(!c.node(p[0].0).demoted);
+            }
+        }
     }
 
     #[test]

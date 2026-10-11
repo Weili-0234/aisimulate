@@ -150,6 +150,10 @@ pub struct SimConfig {
     /// false = v2. Flags only for A/B diagnosis; defaults = engine behavior.
     pub demote_relocate: bool,
     pub split_refresh: bool,
+    /// Post-readout v4 (engine alignment): a local match that ends inside a node splits it
+    /// (unified_tree_core.py :871, :911-918, :1312-1370 @f8a08865b1); request-local matches use
+    /// the engine key (prompt minus its last token, page aligned). false = v1-v3.
+    pub split_on_match: bool,
     /// co_schedule workload signal: "ledger" (cs4 as run on GPU: charge = prompt - expected hit,
     /// kept in full from dispatch to the P response) or "true" (idealized live backlog: charges of
     /// requests in the P waiting queue + not-yet-computed uncached tokens of admitted prefills;
@@ -253,6 +257,7 @@ impl Default for SimConfig {
             guard_examine: true,
             demote_relocate: true,
             split_refresh: true,
+            split_on_match: false,
             cs_workload: "ledger".into(),
             cs_r3_lambda: -1.0,
             cs_r3_rho: 0.10,
@@ -649,6 +654,11 @@ pub struct SimReport {
     pub rr_per10_ge10: [f64; 5],
     pub aba: [f64; 4],
     pub lookup_miss_all: u64,
+    /// Whole run, all P: local matches ending inside a node, the unmatched rest of those nodes
+    /// (tokens), and match-time splits (split_on_match).
+    pub partial_local_matches: u64,
+    pub partial_rest_tokens: u64,
+    pub match_splits: u64,
     pub lease_refused_all: u64,
     pub repulls_all: u64,
     /// Demote walk stop reasons: no_node, no_host, children, branch, access, root.
@@ -753,6 +763,7 @@ impl<'a> Sim<'a> {
                 if c.demote_scope_device { DemoteScope::DeviceAndHost } else { DemoteScope::Host };
             radix.record_evictions = true;
             radix.split_refresh = c.split_refresh;
+            radix.split_on_match = c.split_on_match;
             p.push(PW {
                 beta,
                 radix,
@@ -1550,7 +1561,7 @@ impl<'a> Sim<'a> {
         self.p[p].qp_next += 1;
         self.reqs[r as usize].qp_seq = self.p[p].qp_next;
         // Arrival match / bootstrap-prefetch re-match refresh the local LRU (H5) [approx: at intake].
-        let runs = self.reqs[r as usize].runs.clone();
+        let runs = self.lkey(r);
         if self.c.touch_at_intake {
             self.p[p].radix.match_local(&runs, t);
         }
@@ -1604,7 +1615,7 @@ impl<'a> Sim<'a> {
             return;
         }
         let bt = self.c.block_tokens;
-        let runs = self.reqs[r as usize].runs.clone();
+        let runs = self.lkey(r);
         let m = if do_match { self.p[p].radix.match_local(&runs, t) } else { self.p[p].radix.match_peek(&runs) };
         let depth = m.total() as u64 * bt;
         let Some(deep) = m.path.last().map(|&(n, _)| n) else { return };
@@ -1764,7 +1775,8 @@ impl<'a> Sim<'a> {
         let runs = self.reqs[r as usize].runs.clone();
         let pt = self.reqs[r as usize].pt;
         // Issue-time local match (refreshes the destination path).
-        let have = self.p[dst].radix.match_local(&runs, t).total() as u64;
+        let lk = self.lkey(r);
+        let have = self.p[dst].radix.match_local(&lk, t).total() as u64;
         let cap_blocks = pt.saturating_sub(1) / bt;
         if (cap_blocks.saturating_sub(have)) * bt < self.c.pull_min_tokens {
             return; // span < 256 tokens: no pull
@@ -1944,6 +1956,19 @@ impl<'a> Sim<'a> {
         }
     }
 
+    /// Key of a request-local radix match: the engine matches the prompt minus its last token,
+    /// page aligned (max_prefix_len = input_len - 1); only used with split_on_match (v4), where
+    /// the split point depends on it. v1-v3: the full prompt runs.
+    fn lkey(&self, r: u32) -> Vec<(u64, u32)> {
+        let rq = &self.reqs[r as usize];
+        if self.c.split_on_match {
+            let cap = (rq.pt.saturating_sub(1) / self.c.block_tokens) as u32;
+            runs_prefix(&rq.runs, cap)
+        } else {
+            rq.runs.clone()
+        }
+    }
+
     // ------------------------------------------------------------------------------ P engine
     fn first_chunk(&mut self, t: f64, p: usize, r: u32) {
         let bt = self.c.block_tokens;
@@ -1962,7 +1987,8 @@ impl<'a> Sim<'a> {
             rq.local_age = ll.map(|x| t - x);
         }
         self.last_local.insert((p as u16, ns), t);
-        let m = self.p[p].radix.match_local(&runs, t);
+        let lk = self.lkey(r);
+        let m = self.p[p].radix.match_local(&lk, t);
         let mut dev = m.dev as u64 * bt;
         let mut host = m.host as u64 * bt;
         let pt = self.reqs[r as usize].pt;
@@ -2812,6 +2838,11 @@ impl<'a> Sim<'a> {
         }
         rep.tasks_started = self.tasks_started;
         rep.lookup_miss_all = self.lookup_miss;
+        for w in &self.p {
+            rep.partial_local_matches += w.radix.stats.partial_local_matches;
+            rep.partial_rest_tokens += w.radix.stats.partial_rest_blocks * self.c.block_tokens;
+            rep.match_splits += w.radix.stats.match_splits;
+        }
         let oe: u64 = self.p.iter().map(|w| w.radix.stats.overcommit_events).sum();
         let ob: u64 = self.p.iter().map(|w| w.radix.stats.overcommit_blocks).sum();
         rep.overcommit_events = oe;
