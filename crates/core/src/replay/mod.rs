@@ -20,6 +20,7 @@ mod error;
 pub(crate) mod event;
 mod evidence;
 mod handoff;
+pub mod hicache_p2p;
 pub(crate) mod events {
     pub(crate) use crate::replay::event::*;
 }

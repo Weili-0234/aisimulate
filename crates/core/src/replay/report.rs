@@ -2263,7 +2263,7 @@ fn empty_distribution_stats() -> TraceDistributionStats {
     }
 }
 
-fn percentile_in_place(values: &mut [f64], percentile: f64) -> f64 {
+pub(crate) fn percentile_in_place(values: &mut [f64], percentile: f64) -> f64 {
     let rank = percentile_rank(values.len(), percentile);
     let (_, selected, _) = values.select_nth_unstable_by(rank, |left, right| left.total_cmp(right));
     *selected
