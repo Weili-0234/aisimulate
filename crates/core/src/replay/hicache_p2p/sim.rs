@@ -162,6 +162,20 @@ pub struct SimConfig {
     /// request of the chain on the source P cancels it. 0 = off (immediate demote).
     pub demote_defer_n: u32,
     pub demote_defer_t: f64,
+    /// ORACLE bounds (post-readout counterfactuals, NOT engine behaviour; all false = engine path):
+    /// O1 oracle_pull: every hinted pull delivers max(owner's current host run, hint) up to len - 1
+    /// at the normal transfer time: no lease-budget refusal (SV:996-1017), no lookup miss / short
+    /// grant after source eviction (SV:931-937, SV:17-27, SLOT:4-35), no < 256 revocation
+    /// (URC:2852-2858, 3639-3645). O2 oracle_move: at transfer the source copy is freed at once
+    /// (TwoTierRadix::move_free) instead of the demote flag (DM:117-148). O3 pull_at_route: the
+    /// pull starts at the routing decision, no JIT deferral (JIT:269-335, SCH:3971-3978, 4129-4134)
+    /// and no P-intake start (SCH:3353-3383).
+    pub oracle_pull: bool,
+    pub oracle_move: bool,
+    pub pull_at_route: bool,
+    /// O3b: a landed pull stays host-locked until admission: the F3 landing lock is exempt from the
+    /// budget trim (QPG :275-276) and from the pressure release (URC:2069-2097; QPG :282-316).
+    pub oracle_protect_landed: bool,
     /// co_schedule workload signal: "ledger" (cs4 as run on GPU: charge = prompt - expected hit,
     /// kept in full from dispatch to the P response) or "true" (idealized live backlog: charges of
     /// requests in the P waiting queue + not-yet-computed uncached tokens of admitted prefills;
@@ -268,6 +282,10 @@ impl Default for SimConfig {
             split_on_match: false,
             demote_defer_n: 0,
             demote_defer_t: 0.0,
+            oracle_pull: false,
+            oracle_move: false,
+            pull_at_route: false,
+            oracle_protect_landed: false,
             cs_workload: "ledger".into(),
             cs_r3_lambda: -1.0,
             cs_r3_rho: 0.10,
@@ -395,6 +413,7 @@ struct Req {
     lbcost: f64,
     locked: Option<NodeId>,
     qlock: Option<(NodeId, u64)>,
+    qlock_landed: bool,
     /// F3: arrival number at the P (qp_seq), pass from which an unlocked request may be examined
     /// again (_retry; 0 = no entry), pass until which no arrival lock is taken (_no_arrive).
     qp_seq: u64,
@@ -673,6 +692,9 @@ pub struct SimReport {
     pub match_splits: u64,
     /// E1 whole run: deferred demotes run, cancelled by a return to the source, still pending at the end.
     pub demote_deferred: [u64; 3],
+    /// Oracle O2: source tokens freed at transfer / only flagged (pinned at that moment), whole run.
+    pub moved_freed_tokens: u64,
+    pub moved_flagged_tokens: u64,
     pub lease_refused_all: u64,
     pub repulls_all: u64,
     /// Demote walk stop reasons: no_node, no_host, children, branch, access, root.
@@ -1304,6 +1326,10 @@ impl<'a> Sim<'a> {
     fn route(&mut self, t: f64, r: u32) {
         self.pick_p(t, r);
         self.pick_d(r);
+        if self.c.pull_at_route && self.c.pull_enabled && self.reqs[r as usize].pull_src.is_some() {
+            // O3: the pull starts at the routing decision (oracle, no JIT deferral).
+            self.start_pull(t, r);
+        }
         let pt = self.reqs[r as usize].pt;
         let ip = self.qdraw(2);
         let id = self.qdraw(3);
@@ -1590,7 +1616,7 @@ impl<'a> Sim<'a> {
         if self.c.touch_at_intake {
             self.p[p].radix.match_local(&runs, t);
         }
-        if self.reqs[r as usize].pull_src.is_some() && self.c.pull_enabled {
+        if self.reqs[r as usize].pull_src.is_some() && self.c.pull_enabled && !self.c.pull_at_route {
             let jit = self.c.pull_start == "queue";
             let now_ok = if jit {
                 // F1: pull now only if bootstrap + waiting <= 8 requests and queued input <= 1.1 M tokens.
@@ -1681,6 +1707,7 @@ impl<'a> Sim<'a> {
         self.p[p].guard_order.push(r);
         self.p[p].guard_grants[source] += 1;
         self.reqs[r as usize].qlock = Some((node, depth));
+        self.reqs[r as usize].qlock_landed = source == 2;
     }
 
     /// F3 per-pass step after batch formation (QPG step :254-280; prefill.py:750-753): release the
@@ -1696,7 +1723,16 @@ impl<'a> Sim<'a> {
         let pass = self.p[p].pass_n;
         if self.c.guard_trim {
             while self.p[p].guard_used > self.c.guard_budget_tokens && !self.p[p].guard_order.is_empty() {
-                let r = *self.p[p].guard_order.iter().max_by_key(|&&x| self.reqs[x as usize].qp_seq).unwrap();
+                let prot = self.c.oracle_protect_landed;
+                let Some(r) = self.p[p]
+                    .guard_order
+                    .iter()
+                    .copied()
+                    .filter(|&x| !(prot && self.reqs[x as usize].qlock_landed))
+                    .max_by_key(|&x| self.reqs[x as usize].qp_seq)
+                else {
+                    break;
+                };
                 self.guard_release(p, r);
                 self.reqs[r as usize].qp_retry = pass + QPG_RETRY_AFTER_PASSES;
                 self.p[p].guard_released_budget += 1;
@@ -1749,6 +1785,9 @@ impl<'a> Sim<'a> {
             if Some(r) == head || Some(r) == requester {
                 continue;
             }
+            if self.c.oracle_protect_landed && self.reqs[r as usize].qlock_landed {
+                continue;
+            }
             let d = self.reqs[r as usize].qlock.map(|x| x.1).unwrap_or(0);
             self.guard_release(p, r);
             self.reqs[r as usize].qp_noarrive = pass + QPG_PRESSURE_NO_ARRIVE_PASSES;
@@ -1760,6 +1799,7 @@ impl<'a> Sim<'a> {
 
     fn guard_release(&mut self, p: usize, r: u32) {
         if let Some((n, d)) = self.reqs[r as usize].qlock.take() {
+            self.reqs[r as usize].qlock_landed = false;
             self.p[p].radix.host_lock(Some(n), -1);
             self.p[p].guard_used -= d;
             self.p[p].guard_order.retain(|&x| x != r);
@@ -1814,10 +1854,24 @@ impl<'a> Sim<'a> {
         }
         self.pulls_all += 1;
         let sm: MatchResult = self.p[src].radix.match_peek(&runs);
-        let avail = (sm.total() as u64).min(cap_blocks);
+        let mut avail = (sm.total() as u64).min(cap_blocks);
+        if self.c.oracle_pull {
+            // O1: the hinted range is always there (oracle).
+            let hb = (self.reqs[r as usize].hint_expected / bt).min(cap_blocks);
+            avail = avail.max(hb);
+        }
         let mut pulled_blocks = avail.saturating_sub(have);
+        if self.c.oracle_pull && pulled_blocks * bt < self.c.pull_min_tokens {
+            // Destination already holds (nearly) all of the hinted range: nothing to pull, no failure.
+            let rq = &mut self.reqs[r as usize];
+            rq.pull_start_t = Some(t);
+            if rq.pull_outcome == 0 {
+                rq.pull_outcome = 1;
+            }
+            return;
+        }
         // Owner lease budget (64 GiB = 1.51 M tokens): the whole lookup is refused over budget.
-        if pulled_blocks > 0 && self.p[src].leased_tok + pulled_blocks * bt > self.c.lease_budget_tokens {
+        if !self.c.oracle_pull && pulled_blocks > 0 && self.p[src].leased_tok + pulled_blocks * bt > self.c.lease_budget_tokens {
             pulled_blocks = 0;
             self.lease_refused += 1;
         }
@@ -1903,7 +1957,11 @@ impl<'a> Sim<'a> {
         }
         self.p[src].leased_tok = self.p[src].leased_tok.saturating_sub(pulled_now);
         let defer = self.c.demote_defer_n > 0 || self.c.demote_defer_t > 0.0;
-        if self.c.demote_source && defer {
+        if self.c.oracle_move {
+            // O2: free the source copy of the transferred prefix now (oracle, not the engine path).
+            let leased = runs_prefix(&self.reqs[r as usize].runs, upto);
+            self.p[src].radix.move_free(&leased, lookup_t);
+        } else if self.c.demote_source && defer {
             // E1: keep a pending demote for (chain, source); a newer move from the same source replaces it.
             let key = self.chain_key(r);
             let leased = runs_prefix(&self.reqs[r as usize].runs, upto);
@@ -2934,6 +2992,8 @@ impl<'a> Sim<'a> {
         rep.tasks_started = self.tasks_started;
         rep.lookup_miss_all = self.lookup_miss;
         for w in &self.p {
+            rep.moved_freed_tokens += w.radix.stats.moved_freed_blocks * self.c.block_tokens;
+            rep.moved_flagged_tokens += w.radix.stats.moved_flagged_blocks * self.c.block_tokens;
             rep.partial_local_matches += w.radix.stats.partial_local_matches;
             rep.partial_rest_tokens += w.radix.stats.partial_rest_blocks * self.c.block_tokens;
             rep.match_splits += w.radix.stats.match_splits;

@@ -142,6 +142,10 @@ pub struct CacheStats {
     pub partial_local_matches: u64,
     pub partial_rest_blocks: u64,
     pub match_splits: u64,
+    /// Oracle O2 (perfect move): source blocks freed at transfer, and blocks only flagged because a
+    /// node was pinned at that moment.
+    pub moved_freed_blocks: u64,
+    pub moved_flagged_blocks: u64,
 }
 
 /// Window-filtered host eviction samples: (evict time, blocks, age since last use, age since write).
@@ -661,6 +665,80 @@ impl TwoTierRadix {
         (fn_, fb, reason)
     }
 
+    /// ORACLE O2 "perfect move" (NOT engine behaviour; bypasses the flag-then-evict-first path of
+    /// peer_kv_demote.py :117-148 and the eviction order of unified_tree_core.py :1833-1835 @f8a08865b1):
+    /// free the source copy of a transferred prefix at once. Read-only match of `runs` (the prefix the
+    /// source still holds); the deepest matched node is taken whole if the prefix ends inside it and it
+    /// has no children (the engine walk would stop with no_node). Walk parent links and stop like the
+    /// engine walk where a node is shared or in use: another child (branch / children), a local access
+    /// at or after `lookup_t`, no host copy, the root. Free every collected node deepest first (device
+    /// and host copy); a pinned node (lock / lease / host lock) is flagged as demoted instead and ends
+    /// the freeing. Returns (freed blocks, flagged-instead blocks).
+    pub fn move_free(&mut self, runs: &[(u64, u32)], lookup_t: f64) -> (u64, u64) {
+        let m = self.walk(runs, None, false);
+        let Some(&(last_id, _)) = m.path.last() else { return (0, 0) };
+        let mut node = last_id;
+        let mut path_child = NONE;
+        let mut col: Vec<NodeId> = Vec::new();
+        while node != NONE && node != ROOT {
+            let n = &self.nodes[node as usize];
+            if !n.alive || !n.host {
+                break;
+            }
+            let allowed = if path_child == NONE { 0 } else { 1 };
+            if n.ch.len() > allowed || n.last >= lookup_t {
+                break;
+            }
+            col.push(node);
+            path_child = node;
+            node = n.par;
+        }
+        let (mut freed, mut flagged) = (0u64, 0u64);
+        for id in col {
+            let n = &self.nodes[id as usize];
+            if !n.alive || !n.ch.is_empty() {
+                break;
+            }
+            if n.pinned() || n.host_pinned() {
+                if !n.demoted {
+                    let nb = n.nb as u64;
+                    self.nodes[id as usize].demoted = true;
+                    self.stats.demote_flagged_nodes += 1;
+                    self.stats.demote_flagged_blocks += nb;
+                    flagged += nb;
+                }
+                break;
+            }
+            freed += self.drop_node(id);
+        }
+        self.stats.moved_freed_blocks += freed;
+        self.stats.moved_flagged_blocks += flagged;
+        (freed, flagged)
+    }
+
+    /// Remove an unpinned leaf node from both tiers (oracle O2 only).
+    fn drop_node(&mut self, id: NodeId) -> u64 {
+        let (nb, par, key, dev, host) = {
+            let n = &self.nodes[id as usize];
+            (n.nb, n.par, n.runs[0].0, n.dev, n.host)
+        };
+        if dev {
+            self.set_dev(id, false);
+        }
+        if host {
+            self.host_used -= nb as u64;
+        }
+        if self.nodes[par as usize].ch.get(&key) == Some(&id) {
+            self.nodes[par as usize].ch.remove(&key);
+        }
+        self.release(id);
+        let p = &self.nodes[par as usize];
+        if par != ROOT && p.ch.is_empty() && !p.pinned() {
+            self.push(par);
+        }
+        nb as u64
+    }
+
     /// Insert a run list (write-through: device + host) and touch its path. With
     /// `host_only` the new and existing-host-only nodes stay host-only (pull landing on host).
     /// Returns the path nodes.
@@ -1114,6 +1192,35 @@ mod tests {
                 assert!(!c.node(p[0].0).demoted);
             }
         }
+    }
+
+    #[test]
+    fn oracle_move_frees_the_private_suffix_and_keeps_shared_or_pinned_nodes() {
+        let mut c = TwoTierRadix::new(100, 100);
+        c.insert(&[(0, 4), (100, 4)], 1.0, false);
+        c.insert(&[(0, 4), (200, 6)], 2.0, false); // [0..4] is a branch point
+        let used = c.host_used;
+        // Move the [0..4]+[200..206] prefix: only the private suffix goes, the shared head stays.
+        let (freed, flagged) = c.move_free(&[(0, 4), (200, 6)], 3.0);
+        assert_eq!((freed, flagged), (6, 0));
+        assert_eq!(c.host_used, used - 6);
+        c.check().unwrap();
+        assert_eq!(c.match_peek(&[(0, 4), (200, 6)]).total(), 4);
+        assert_eq!(c.match_peek(&[(0, 4), (100, 4)]).total(), 8);
+        // A prefix ending inside a childless node takes the whole node (no_node in the engine walk).
+        let (freed, _) = c.move_free(&[(0, 4), (100, 2)], 3.0);
+        assert_eq!(freed, 4 + 4, "suffix node whole, then the head (now a leaf)");
+        c.check().unwrap();
+        // Pinned node: flagged, not freed; accessed after the lookup: kept.
+        c.insert(&runs(300, 4), 4.0, false);
+        let m = c.match_peek(&runs(300, 4));
+        let deep = TwoTierRadix::path_node_covering(&m.path, 4);
+        c.lock(deep, 1);
+        assert_eq!(c.move_free(&runs(300, 4), 5.0), (0, 4));
+        c.lock(deep, -1);
+        c.insert(&runs(400, 4), 6.0, false);
+        assert_eq!(c.move_free(&runs(400, 4), 5.0), (0, 0), "used at or after the lookup");
+        c.check().unwrap();
     }
 
     #[test]
