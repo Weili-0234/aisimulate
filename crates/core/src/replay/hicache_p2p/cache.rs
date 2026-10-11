@@ -809,6 +809,39 @@ impl TwoTierRadix {
         c
     }
 
+    /// Pin audit: expected path-wide lock / host-lock counts from the holders' anchor nodes vs the
+    /// counts stored on every live node. Returns (lock mismatches, host-lock mismatches, nodes).
+    pub fn pin_audit(&self, locks: &[NodeId], hlocks: &[NodeId]) -> (u64, u64, u64) {
+        let mut el: FxHashMap<NodeId, u32> = FxHashMap::default();
+        let mut eh: FxHashMap<NodeId, u32> = FxHashMap::default();
+        for (anchors, map) in [(locks, &mut el), (hlocks, &mut eh)] {
+            for &a in anchors {
+                let mut n = a;
+                while n != NONE && n != ROOT {
+                    *map.entry(n).or_insert(0) += 1;
+                    n = self.nodes[n as usize].par;
+                }
+            }
+        }
+        let (mut ml, mut mh, mut nodes) = (0u64, 0u64, 0u64);
+        let mut st = vec![ROOT];
+        while let Some(n) = st.pop() {
+            let node = &self.nodes[n as usize];
+            st.extend(node.ch.values().copied());
+            if n == ROOT {
+                continue;
+            }
+            nodes += 1;
+            if node.lock != el.get(&n).copied().unwrap_or(0) {
+                ml += 1;
+            }
+            if node.hlock != eh.get(&n).copied().unwrap_or(0) {
+                mh += 1;
+            }
+        }
+        (ml, mh, nodes)
+    }
+
     /// Debug invariant check (tests).
     pub fn check(&self) -> Result<(), String> {
         let mut dev = 0u64;

@@ -575,6 +575,9 @@ pub struct SimReport {
     /// Per P idle fraction of the score window: [nothing queued, only bootstrap work (D alloc
     /// pending), waiting work all held].
     pub per_p_idle_frac: Vec<[f64; 3]>,
+    /// End-of-run invariant audit per P: [radix check errors, nodes whose lock count differs from
+    /// the live holders, nodes whose host-lock count differs, live nodes].
+    pub per_p_audit: Vec<[u64; 4]>,
     pub lookup_miss_all: u64,
     pub lease_refused_all: u64,
     pub repulls_all: u64,
@@ -2478,6 +2481,15 @@ impl<'a> Sim<'a> {
         rep.overcommit_events = oe;
         rep.overcommit_tokens_mean = if oe > 0 { ob as f64 * self.c.block_tokens as f64 / oe as f64 } else { 0.0 };
         rep.guard_released_pressure = self.p.iter().map(|w| w.guard_released_pressure).sum();
+        for (i, w) in self.p.iter().enumerate() {
+            let locks: Vec<NodeId> =
+                self.reqs.iter().filter(|r| r.p as usize == i).filter_map(|r| r.locked).collect();
+            let hlocks: Vec<NodeId> =
+                self.reqs.iter().filter(|r| r.p as usize == i).filter_map(|r| r.qlock.map(|x| x.0)).collect();
+            let (ml, mh, nodes) = w.radix.pin_audit(&locks, &hlocks);
+            let chk = if w.radix.check().is_err() { 1 } else { 0 };
+            rep.per_p_audit.push([chk, ml, mh, nodes]);
+        }
         {
             let win = (self.hi - self.lo).max(1e-9);
             for (i, w) in self.p.iter().enumerate() {
