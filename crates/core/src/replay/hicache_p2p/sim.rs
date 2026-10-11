@@ -19,6 +19,14 @@ use super::cache::{DemoteScope, MatchResult, NodeId, TwoTierRadix, run_blocks, r
 use super::trie::{Event, PyRandom, Workload};
 use crate::replay::report::percentile_in_place;
 
+/// Fix-3 guard pass constants (queued_prefix_guard.py@831bac2694): candidates examined per pass
+/// (:76), passes before an unlocked request is examined again (:78), passes without an arrival
+/// lock after a pressure release (:80), release limit as a multiple of the shortfall (:82).
+const QPG_MAX_EXAMINE_PER_PASS: usize = 16;
+const QPG_RETRY_AFTER_PASSES: u64 = 64;
+const QPG_PRESSURE_NO_ARRIVE_PASSES: u64 = 256;
+const QPG_PRESSURE_RELEASE_FACTOR: u64 = 2;
+
 /// Linear fit `a + b * tokens / 1e5` (seconds).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct LinFit {
@@ -59,6 +67,18 @@ pub struct SimConfig {
     pub p_beta: Vec<[f64; 5]>,
     /// Multiplicative per-iteration noise: lognormal sigma (0 = none).
     pub p_noise_sigma: f64,
+    /// Per-P empirical service-time ratio quantiles (201 points, psim res_q); used when non-empty.
+    pub p_res_q: Vec<Vec<f64>>,
+    /// Empirical distributions (201 quantiles): handshake, D first step, ingress residuals.
+    pub hs_q: Vec<f64>,
+    pub dfirst_q: Vec<f64>,
+    pub ing_p_res_q: Vec<f64>,
+    pub ing_d_res_q: Vec<f64>,
+    pub kv_tail_res_q: Vec<f64>,
+    /// Ideal-hit registry granularity (client prefix_block_size) in tokens.
+    pub ideal_gran_tokens: u64,
+    /// Multiplier from simulated host write-through tokens to the measured D->H counter.
+    pub dh_counter_scale: f64,
     /// Fixed non-GPU latency per request before prefill done (s).
     pub p_lat_s: f64,
     /// Fraction of host load-back cost hidden behind the bootstrap wait (bootstrap prefetch).
@@ -115,6 +135,24 @@ pub struct SimConfig {
     pub queued_prefix_protect: bool,
     pub demote_source: bool,
     pub record_rows: bool,
+    /// Refresh the local LRU at P intake and waiting-queue entry (arrival match / BWP re-match).
+    pub touch_at_intake: bool,
+    /// F3 guard: minimum depth and token budget (min(3.0 M, 0.3 x usable)).
+    pub guard_min_tokens: u64,
+    pub guard_budget_tokens: u64,
+    /// F3 guard per-pass step (QPG step(), :254-280): trim the budget newest-first (:275-276) and
+    /// re-examine unlocked queued requests (:277-278, :404-421). Flags only for A/B diagnosis.
+    pub guard_trim: bool,
+    pub guard_examine: bool,
+    /// Owner lease budget (64 GiB at 2,912,256 B per 64-token page = 1.51 M tokens).
+    pub lease_budget_tokens: u64,
+    /// Leases pin the source tree nodes (false = engine behavior: eviction is lease-blind).
+    pub lease_pins: bool,
+    /// F1 lead tokens (131,072) and F2 minimum deficit (8,192).
+    pub jit_lead_tokens: u64,
+    pub repull_min_tokens: u64,
+    /// Pool size used in the turnover metric (12,405,568; eviction capacity is p_host_tokens).
+    pub turnover_pool_tokens: u64,
 }
 
 impl Default for SimConfig {
@@ -132,12 +170,20 @@ impl Default for SimConfig {
             wait_cap_s: 120.0,
             block_tokens: 64,
             chunk_tokens: 8192,
-            client_lag_s: 0.0,
+            client_lag_s: 0.0042,
             p_dev_tokens: 2_067_584,
-            p_host_tokens: 12_405_504,
+            p_host_tokens: 11_164_992,
             demote_scope_device: false,
             p_beta: vec![[0.08, 0.06, 0.0, 0.05, 0.05]],
             p_noise_sigma: 0.0,
+            p_res_q: Vec::new(),
+            hs_q: Vec::new(),
+            dfirst_q: Vec::new(),
+            ing_p_res_q: Vec::new(),
+            ing_d_res_q: Vec::new(),
+            kv_tail_res_q: Vec::new(),
+            ideal_gran_tokens: 256,
+            dh_counter_scale: 1.0,
             p_lat_s: 0.3,
             lb_hidden: 0.0,
             prefetch_max_tokens: 262_144,
@@ -156,17 +202,17 @@ impl Default for SimConfig {
             smg_threshold: 0.3,
             smg_abs: 64,
             smg_rel: 1.5,
-            smg_tree_tokens: 99_244_544,
+            smg_tree_tokens: 12_405_568,
             smg_evict_interval_s: 120.0,
-            smg_low_match: "smallest_tenant".into(),
-            smg_load_release: "prefill_done".into(),
+            smg_low_match: "min_load".into(),
+            smg_load_release: "kv_arrived".into(),
             cs_margin_tokens: 32768,
             cs_load_poll_s: 0.1,
             pull_min_tokens: 256,
             pull_min_incremental_tokens: 256,
             pull_enabled: true,
             d_policy: "po2".into(),
-            d_load_mode: "requests".into(),
+            d_load_mode: "tokens_snapshot".into(),
             d_load_refresh_s: 5.0,
             pull_fit: LinFit { a: 0.257, b_per_100k: 0.244 },
             pull_check_s: 0.1,
@@ -176,6 +222,16 @@ impl Default for SimConfig {
             queued_prefix_protect: false,
             demote_source: false,
             record_rows: true,
+            touch_at_intake: true,
+            guard_min_tokens: 8192,
+            guard_budget_tokens: 3_000_000,
+            guard_trim: true,
+            guard_examine: true,
+            lease_budget_tokens: 1_510_000,
+            lease_pins: false,
+            jit_lead_tokens: 131_072,
+            repull_min_tokens: 8192,
+            turnover_pool_tokens: 12_405_568,
         }
     }
 }
@@ -200,6 +256,7 @@ enum Ev {
     PollTick,
     DLoadTick,
     SmgEvict,
+    Census,
 }
 
 struct Item {
@@ -255,7 +312,14 @@ struct Req {
     pull_start_t: Option<f64>,
     pull_end: Option<f64>,
     pull_lease: Option<NodeId>,
-    pull_dst_lock: Option<NodeId>,
+    pull_upto: u32,
+    pull_issue_blocks: u64,
+    pull_first_issue_t: Option<f64>,
+    pull_outcome: u8,
+    jit_pending: bool,
+    pull_attempts: u32,
+    repulled: bool,
+    hint_expected: u64,
     pull_src_path: Vec<(NodeId, u32)>,
     pull_dst_have: u64,
     boot_ready: Option<f64>,
@@ -275,7 +339,12 @@ struct Req {
     computed: u64,
     lbcost: f64,
     locked: Option<NodeId>,
-    qlock: Option<NodeId>,
+    qlock: Option<(NodeId, u64)>,
+    /// F3: arrival number at the P (qp_seq), pass from which an unlocked request may be examined
+    /// again (_retry; 0 = no entry), pass until which no arrival lock is taken (_no_arrive).
+    qp_seq: u64,
+    qp_retry: u64,
+    qp_noarrive: u64,
     unc_est: u64,
     ideal: u64,
     // routing / gap cause
@@ -285,6 +354,10 @@ struct Req {
     route_tgt: u64,
     fc_best: u64,
     nin_held: bool,
+    prev_p: Option<u16>,
+    prev_gap: Option<f64>,
+    local_age: Option<f64>,
+    cs_cost: Option<u64>,
     d_counted: bool,
     pa_on: bool,
 }
@@ -331,6 +404,27 @@ struct PW {
     busy_s: f64,
     win_busy: f64,
     host_ins_win: u64,
+    pull_ins_win: u64,
+    cs_pending: u64,
+    cs_active: u64,
+    bq_n: u64,
+    bq_tok: u64,
+    guard_used: u64,
+    leased_tok: u64,
+    guard_order: Vec<u32>,
+    guard_released_pressure: u64,
+    guard_released_budget: u64,
+    guard_examined: u64,
+    guard_skip_budget: u64,
+    guard_grants: [u64; 3],
+    /// Scheduler passes (one per batch formation), arrival numbering, bootstrap-queue members.
+    pass_n: u64,
+    qp_next: u64,
+    bq: Vec<u32>,
+    /// Open idle segment (start, class) and idle seconds in the window by class
+    /// [no queued work, only bootstrap-queue work (D allocation pending), waiting work all held].
+    idle_since: Option<(f64, u8)>,
+    idle_win: [f64; 3],
 }
 
 struct DW {
@@ -347,6 +441,8 @@ struct DW {
     dh: BinaryHeap<std::cmp::Reverse<(u64, u64, u32)>>,
     ver: u64,
     hseq: u64,
+    ib: f64,
+    ib_inv: f64,
 }
 
 /// Aggregate output.
@@ -387,6 +483,43 @@ pub struct SimReport {
     pub pull_short_all: u64,
     pub detour_share: f64,
     pub per_p_host_retention_cap_over_inflow_s: Vec<f64>,
+    pub per_p_turnover_counter_s: Vec<f64>,
+    pub dec_step_tokw_ms: f64,
+    pub dec_b_mean: f64,
+    pub p_boot_mean: f64,
+    pub tail_mean: f64,
+    pub d_alloc_to_kv_mean: f64,
+    pub same_p_as_prev_share: f64,
+    /// Zero-hit rows (I>0, A=0) by mechanism: [never on chosen P, chosen P != previous P (spread),
+    /// same P as previous (LRU horizon on the owner), no previous prefill (concurrent / first)].
+    pub zero_hit_mech: [u64; 4],
+    /// Zero-hit rows by prev gap: [<0 or none, 0-60, 60-100, 100-140, >=140] s.
+    pub zero_hit_gap_bins: [u64; 5],
+    /// Age (s) of the chosen P's local copy at the zero-hit request (since last local use): p25/p50/p75.
+    pub zero_hit_local_age: [f64; 3],
+    /// Zero-hit rows: mechanism (rows as zero_hit_mech) x gap bin (columns as zero_hit_gap_bins),
+    /// and hinted (pull hint given) rows per gap bin.
+    pub zero_hit_mech_by_gap: [[u64; 5]; 4],
+    pub zero_hit_hinted_by_gap: [u64; 5],
+    /// D census over the score window: per D mean used fraction of the KV pool and mean FIFO
+    /// (pre-allocation queue) length.
+    pub per_d_used_frac_mean: Vec<f64>,
+    pub per_d_fifo_mean: Vec<f64>,
+    pub per_p_host_age_last_pct_s: Vec<[f64; 5]>,
+    /// Census over the score window: mean fractions of the host pool (pinned, device-resident, demoted)
+    /// and mean / p10 usable fraction (= 1 - pinned - device-resident).
+    pub pool_pinned_frac: f64,
+    pub pool_device_resident_frac: f64,
+    pub pool_demoted_frac: f64,
+    pub pool_usable_frac_mean: f64,
+    pub pool_usable_frac_p10: f64,
+    /// GCWS (gapcause v1.3): per 30-s sample and P, sum over sessions with a prefill on that P in
+    /// the last w s of the session's largest prompt there, / 12,405,568. [p50, p90] pooled over
+    /// samples x P, for w = 120 s and w = 300 s.
+    pub gcws_w120: [f64; 2],
+    pub gcws_w300: [f64; 2],
+    pub per_p_turnover_dh_only_s: Vec<f64>,
+    pub per_p_pull_landed_tokens_win: Vec<u64>,
     pub per_p_host_age_last_s: Vec<f64>,
     pub per_p_host_age_write_s: Vec<f64>,
     pub per_p_host_age_last_p50_s: Vec<f64>,
@@ -401,6 +534,36 @@ pub struct SimReport {
     pub demote_evicted_tokens: u64,
     pub demote_cleared_nodes: u64,
     pub demote_cleared_tokens: u64,
+    /// Hinted requests admitted in the window: [hinted, full, partial, lookup miss, never issued].
+    pub hint_outcomes: [u64; 5],
+    /// First pull issue delay after routing (s) for hinted window requests: p50 / p90; miss share by
+    /// delay bucket [<5, 5-15, 15-30, >=30 s] as (n, misses).
+    pub pull_issue_delay: [f64; 2],
+    pub miss_by_delay: [[u64; 2]; 4],
+    pub overcommit_events: u64,
+    pub overcommit_tokens_mean: f64,
+    pub guard_released_pressure: u64,
+    /// F3 guard over the score window, per P: mean / p90 locked tokens (cost = path depth per
+    /// lock, as the QPG summary's locked_tokens), mean locks; bootstrap / waiting queue means.
+    pub per_p_guard_locked_mean: Vec<f64>,
+    pub per_p_guard_locked_p90: Vec<f64>,
+    pub per_p_guard_locks_mean: Vec<f64>,
+    pub per_p_bq_mean: Vec<f64>,
+    pub per_p_wq_mean: Vec<f64>,
+    /// Whole-run guard counters (all P): grants [arrive, examine, landing], budget skips,
+    /// budget releases, examined candidates.
+    pub guard_grants: [u64; 3],
+    pub guard_skip_budget: u64,
+    pub guard_released_budget: u64,
+    pub guard_examined: u64,
+    /// Per P idle fraction of the score window: [nothing queued, only bootstrap work (D alloc
+    /// pending), waiting work all held].
+    pub per_p_idle_frac: Vec<[f64; 3]>,
+    pub lookup_miss_all: u64,
+    pub lease_refused_all: u64,
+    pub repulls_all: u64,
+    /// Demote walk stop reasons: no_node, no_host, children, branch, access, root.
+    pub demote_stop: [u64; 6],
     pub tasks_started: u64,
     pub requests_sent: u64,
     pub host_fill: Vec<f64>,
@@ -459,6 +622,20 @@ pub struct Sim<'a> {
     pulls_all: u64,
     pulled_all: u64,
     pull_short_all: u64,
+    census: Vec<(f64, u16, u64, u64, u64, u64)>,
+    /// Per 30-s sample and P: (t, P, guard locked tokens (cost), guard locks, bootstrap queue,
+    /// waiting queue).
+    pstate: Vec<(f64, u16, u64, u32, u32, u32)>,
+    /// Per 30-s sample and D: (t, D, used tokens, FIFO length).
+    dstate: Vec<(f64, u16, u64, u32)>,
+    lookup_miss: u64,
+    lease_refused: u64,
+    repulls: u64,
+    demote_stop: [u64; 6],
+    /// Per (P, task admission): last local use time (first chunk or prefill done).
+    last_local: FxHashMap<(u16, u64), f64>,
+    /// Per task admission: (P, prefill-done time) of the latest prefill done.
+    sess_last_pd: FxHashMap<u64, (u16, f64)>,
     lo: f64,
     hi: f64,
 }
@@ -493,6 +670,24 @@ impl<'a> Sim<'a> {
                 busy_s: 0.0,
                 win_busy: 0.0,
                 host_ins_win: 0,
+                pull_ins_win: 0,
+                cs_pending: 0,
+                cs_active: 0,
+                bq_n: 0,
+                bq_tok: 0,
+                guard_used: 0,
+                leased_tok: 0,
+                guard_order: Vec::new(),
+                guard_released_pressure: 0,
+                guard_released_budget: 0,
+                guard_examined: 0,
+                guard_skip_budget: 0,
+                guard_grants: [0; 3],
+                pass_n: 0,
+                qp_next: 0,
+                bq: Vec::new(),
+                idle_since: None,
+                idle_win: [0.0; 3],
             });
         }
         let d = (0..c.n_d)
@@ -510,6 +705,8 @@ impl<'a> Sim<'a> {
                 dh: BinaryHeap::new(),
                 ver: 0,
                 hseq: 0,
+                ib: 0.0,
+                ib_inv: 0.0,
             })
             .collect();
         let smg = (0..c.n_p).map(|_| TwoTierRadix::new(u64::MAX / 4, u64::MAX / 4)).collect();
@@ -540,6 +737,15 @@ impl<'a> Sim<'a> {
             pulls_all: 0,
             pulled_all: 0,
             pull_short_all: 0,
+            census: Vec::new(),
+            pstate: Vec::new(),
+            dstate: Vec::new(),
+            lookup_miss: 0,
+            lease_refused: 0,
+            repulls: 0,
+            demote_stop: [0; 6],
+            last_local: FxHashMap::default(),
+            sess_last_pd: FxHashMap::default(),
             lo,
             hi,
         }
@@ -558,16 +764,34 @@ impl<'a> Sim<'a> {
         self.rng.randbelow(n as u32) as usize
     }
 
+    /// Draw from a 201-point quantile table (linear interpolation), psim `qdraw`.
+    fn qdraw(&mut self, which: u8) -> f64 {
+        let u = self.urand() * 200.0;
+        let q: &Vec<f64> = match which {
+            0 => &self.c.hs_q,
+            1 => &self.c.dfirst_q,
+            2 => &self.c.ing_p_res_q,
+            3 => &self.c.ing_d_res_q,
+            _ => &self.c.kv_tail_res_q,
+        };
+        if q.len() < 201 {
+            return f64::NAN;
+        }
+        let k = (u as usize).min(199);
+        q[k] + (q[k + 1] - q[k]) * (u - k as f64)
+    }
+
     pub fn run(&mut self) {
         for _ in 0..self.c.concurrency {
             self.start_task(0.0);
         }
-        if self.c.p_policy == "cosched" {
+        if self.c.p_policy == "cosched_live" {
             self.at(0.0, Ev::PollTick);
         }
-        if self.c.d_load_mode == "snapshot" {
+        if self.c.d_load_mode == "tokens_snapshot" {
             self.at(0.0, Ev::DLoadTick);
         }
+        self.at(self.lo, Ev::Census);
         if self.c.p_policy == "smgca" && self.c.smg_evict_interval_s > 0.0 {
             self.at(self.c.smg_evict_interval_s, Ev::SmgEvict);
         }
@@ -617,11 +841,26 @@ impl<'a> Sim<'a> {
                 }
                 Ev::DLoadTick => {
                     for d in &mut self.d {
-                        d.load_snap = d.nreq;
+                        let q: u64 = d.fifo.iter().map(|&r| self.reqs[r as usize].need).sum();
+                        d.load_snap = (d.used + q) as i64;
                     }
                     if t < self.c.duration_s {
                         let dt = self.c.d_load_refresh_s;
                         self.at(t + dt, Ev::DLoadTick);
+                    }
+                }
+                Ev::Census => {
+                    let bt = self.c.block_tokens;
+                    for (i, p) in self.p.iter().enumerate() {
+                        let c = p.radix.census();
+                        self.census.push((t, i as u16, c.host_used * bt, c.pinned_host * bt, c.device_resident * bt, c.demoted_host * bt));
+                        self.pstate.push((t, i as u16, p.guard_used, p.guard_order.len() as u32, p.bq_n as u32, p.wq.len() as u32));
+                    }
+                    for (i, d) in self.d.iter().enumerate() {
+                        self.dstate.push((t, i as u16, d.used, d.fifo.len() as u32));
+                    }
+                    if t + 30.0 < self.hi {
+                        self.at(t + 30.0, Ev::Census);
                     }
                 }
                 Ev::SmgEvict => {
@@ -835,6 +1074,10 @@ impl<'a> Sim<'a> {
             start: t + self.c.client_lag_s,
             ..Default::default()
         };
+        let mut r = r;
+        let gran = self.c.ideal_gran_tokens.max(1);
+        let m = self.ideal.match_peek(&r.runs).total() as u64 * self.c.block_tokens;
+        r.ideal = (m.min(pt.saturating_sub(1)) / gran) * gran;
         let id = self.reqs.len() as u32;
         let start = r.start;
         self.reqs.push(r);
@@ -857,6 +1100,7 @@ impl<'a> Sim<'a> {
         s
     }
 
+    #[allow(dead_code)]
     fn live(&mut self, i: usize, t: f64) -> u64 {
         let poll = self.c.cs_load_poll_s;
         let p = &mut self.p[i];
@@ -875,12 +1119,22 @@ impl<'a> Sim<'a> {
         self.pick_p(t, r);
         self.pick_d(r);
         let pt = self.reqs[r as usize].pt;
-        let pr = t + self.c.ing_p.at(pt);
-        let dr = t + self.c.ing_d.at(pt);
+        let ip = self.qdraw(2);
+        let id = self.qdraw(3);
+        let base_p = self.c.ing_p.a + self.c.ing_p.b_per_100k * pt as f64 / 1e5;
+        let base_d = self.c.ing_d.a + self.c.ing_d.b_per_100k * pt as f64 / 1e5;
+        let pr = t + (base_p + if ip.is_nan() { 0.0 } else { ip }).max(0.0);
+        let dr = t + (base_d + if id.is_nan() { 0.0 } else { id }).max(0.0);
         self.reqs[r as usize].p_recv = pr;
         self.reqs[r as usize].d_recv = dr;
         self.at(pr, Ev::PRecv(r));
         self.at(dr, Ev::DRecv(r));
+    }
+
+    fn gpu_hits(&mut self, r: u32) -> Vec<u64> {
+        let bt = self.c.block_tokens;
+        let runs = self.reqs[r as usize].runs.clone();
+        self.p.iter_mut().map(|p| p.radix.match_peek(&runs).dev as u64 * bt).collect()
     }
 
     fn actual_hits(&mut self, r: u32) -> Vec<u64> {
@@ -933,21 +1187,55 @@ impl<'a> Sim<'a> {
                 self.reqs[r as usize].nin_held = true;
             }
             "cosched" => {
-                let live: Vec<u64> = (0..np).map(|i| self.live(i, t)).collect();
+                // Experimental sgl-router co_schedule, reserved locality-margin mode on the router
+                // ledger (dataplane.txt R3: co_schedule.rs:675-707, cost_balance.rs:294-321, 803-843).
+                let l = pt;
+                let gpu = self.gpu_hits(r);
+                let local: Vec<u64> = hits.iter().map(|&h| h.min(l)).collect();
+                let mut hint: Vec<Option<(usize, u64)>> = vec![None; np];
+                let mut exp: Vec<u64> = vec![0; np];
+                for w in 0..np {
+                    let s_ = (0..np)
+                        .filter(|&k| k != w && hits[k] > 0)
+                        .min_by(|&a, &b| hits[b].cmp(&hits[a]).then(a.cmp(&b)));
+                    if let Some(s_) = s_ {
+                        if hits[s_] >= self.c.pull_min_tokens
+                            && hits[s_].saturating_sub(hits[w]) >= self.c.pull_min_incremental_tokens
+                        {
+                            hint[w] = Some((s_, hits[s_]));
+                        }
+                    }
+                    let hs = hint[w].map(|(_, h)| h).unwrap_or(0);
+                    exp[w] = local[w].max(hs).min(l);
+                }
+                let pend: Vec<u64> = self.p.iter().map(|p| p.cs_pending).collect();
+                let act: Vec<u64> = self.p.iter().map(|p| p.cs_active).collect();
+                let after: Vec<u64> = (0..np).map(|w| pend[w] + (l - exp[w])).collect();
                 own = (0..np)
-                    .min_by(|&a, &b| hits[b].cmp(&hits[a]).then(live[a].cmp(&live[b])).then(a.cmp(&b)))
+                    .min_by(|&a, &b| {
+                        local[b].cmp(&local[a]).then(gpu[b].cmp(&gpu[a])).then(pend[a].cmp(&pend[b]))
+                            .then(act[a].cmp(&act[b])).then(a.cmp(&b))
+                    })
                     .unwrap();
                 let least = (0..np)
-                    .min_by(|&a, &b| live[a].cmp(&live[b]).then(hits[b].cmp(&hits[a])).then(a.cmp(&b)))
+                    .min_by(|&a, &b| {
+                        after[a].cmp(&after[b]).then(gpu[b].cmp(&gpu[a])).then(local[b].cmp(&local[a]))
+                            .then(act[a].cmp(&act[b])).then(a.cmp(&b))
+                    })
                     .unwrap();
-                let mut tt = own;
-                if hits[own] > 0 && live[own].saturating_sub(live[least]) > self.c.cs_margin_tokens {
-                    tt = least;
+                let saved = after[own].saturating_sub(after[least]);
+                tgt = if saved > self.c.cs_margin_tokens { least } else { own };
+                let cost = l - exp[tgt];
+                self.p[tgt].cs_pending += cost;
+                self.p[tgt].cs_active += 1;
+                self.reqs[r as usize].cs_cost = Some(cost);
+                if self.c.pull_enabled {
+                    if let Some((src, hs)) = hint[tgt] {
+                        self.reqs[r as usize].pull_src = Some(src as u16);
+                        self.reqs[r as usize].pull_hint = hs.saturating_sub(hits[tgt]);
+                        self.reqs[r as usize].hint_expected = hs;
+                    }
                 }
-                if hits[own] == 0 {
-                    tt = least;
-                }
-                tgt = tt;
             }
             "sticky" => {
                 let (task, agent) = {
@@ -990,20 +1278,6 @@ impl<'a> Sim<'a> {
         rq.detour = tgt != own && hits[own] > 0;
         rq.route_best = best;
         rq.route_tgt = hits[tgt];
-        // Pull hint (co-schedule router: scope any, best holder, min tokens / min incremental).
-        if pol == "cosched" && self.c.pull_enabled {
-            let gain = best.saturating_sub(hits[tgt]);
-            if best >= self.c.pull_min_tokens && gain >= self.c.pull_min_incremental_tokens {
-                let src = (0..np)
-                    .filter(|&k| k != tgt)
-                    .min_by(|&a, &b| hits[b].cmp(&hits[a]).then(a.cmp(&b)))
-                    .unwrap();
-                if hits[src] == best {
-                    rq.pull_src = Some(src as u16);
-                    rq.pull_hint = gain;
-                }
-            }
-        }
         // Router-side estimate of the uncached work (live backlog ledger).
         let est = hits[tgt] + rq.pull_hint;
         rq.unc_est = pt.saturating_sub(est).max(1);
@@ -1026,7 +1300,7 @@ impl<'a> Sim<'a> {
                 if j >= i {
                     j += 1;
                 }
-                let snap = self.c.d_load_mode == "snapshot";
+                let snap = self.c.d_load_mode == "tokens_snapshot";
                 let load = |k: usize| if snap { self.d[k].load_snap } else { self.d[k].nreq };
                 if load(i) <= load(j) { i } else { j }
             }
@@ -1069,46 +1343,293 @@ impl<'a> Sim<'a> {
     // ------------------------------------------------------------------------------ P bootstrap / pulls
     fn on_p_recv(&mut self, t: f64, r: u32) {
         self.reqs[r as usize].p_in = true;
-        if self.reqs[r as usize].pull_src.is_some() && self.c.pull_start == "p_recv" {
-            self.start_pull(t, r);
+        let p = self.reqs[r as usize].p as usize;
+        self.p[p].bq_n += 1;
+        self.p[p].bq_tok += self.reqs[r as usize].pt;
+        self.p[p].bq.push(r);
+        self.p[p].qp_next += 1;
+        self.reqs[r as usize].qp_seq = self.p[p].qp_next;
+        // Arrival match / bootstrap-prefetch re-match refresh the local LRU (H5) [approx: at intake].
+        let runs = self.reqs[r as usize].runs.clone();
+        if self.c.touch_at_intake {
+            self.p[p].radix.match_local(&runs, t);
+        }
+        if self.reqs[r as usize].pull_src.is_some() && self.c.pull_enabled {
+            let jit = self.c.pull_start == "queue";
+            let now_ok = if jit {
+                // F1: pull now only if bootstrap + waiting <= 8 requests and queued input <= 1.1 M tokens.
+                let n = self.p[p].bq_n + self.p[p].wq.len() as u64;
+                let qt = self.p[p].bq_tok + self.queued_tokens(p);
+                n <= 8 && qt <= 1_100_000
+            } else {
+                true
+            };
+            if now_ok {
+                self.start_pull(t, r);
+            } else {
+                self.reqs[r as usize].jit_pending = true;
+            }
+        }
+        // F3: S-ARRIVE lock after the arrival pull or its deferral (QPG on_arrival :219-229 ->
+        // _try_arrive :378-402; skipped if a pull is in flight, depth < 8192, budget full). The
+        // arrival match was the intake touch above.
+        if self.c.queued_prefix_protect {
+            self.guard_try_arrive(t, p, r, false);
         }
         if self.reqs[r as usize].t_alloc.is_some() {
             self.boot_done(t, r);
         }
+        self.p_idle_update(t, p);
     }
 
+    fn queued_tokens(&self, p: usize) -> u64 {
+        let mut s: u64 = self.p[p].wq.iter().map(|&r| self.reqs[r as usize].pt).sum();
+        if let Some(c) = self.p[p].chunked {
+            let rq = &self.reqs[c as usize];
+            s += rq.unc.saturating_sub(rq.sched);
+        }
+        s
+    }
+
+    /// F3 _try_arrive (QPG :378-402): set the retry pass; skip while pressure-suppressed or while a
+    /// pull is in flight; match (the guard scan refreshes the LRU when `do_match`, H5); lock the
+    /// deepest node with a host copy if depth >= 8192 and the budget allows.
+    fn guard_try_arrive(&mut self, t: f64, p: usize, r: u32, do_match: bool) {
+        if self.reqs[r as usize].qlock.is_some() {
+            return;
+        }
+        let pass = self.p[p].pass_n;
+        self.reqs[r as usize].qp_retry = pass + QPG_RETRY_AFTER_PASSES;
+        if self.reqs[r as usize].qp_noarrive > pass || self.reqs[r as usize].pull_pending {
+            return;
+        }
+        let bt = self.c.block_tokens;
+        let runs = self.reqs[r as usize].runs.clone();
+        let m = if do_match { self.p[p].radix.match_local(&runs, t) } else { self.p[p].radix.match_peek(&runs) };
+        let depth = m.total() as u64 * bt;
+        let Some(deep) = m.path.last().map(|&(n, _)| n) else { return };
+        if depth < self.c.guard_min_tokens {
+            return;
+        }
+        if self.p[p].guard_used + depth > self.c.guard_budget_tokens {
+            self.p[p].guard_skip_budget += 1;
+            return;
+        }
+        self.guard_grant(p, r, deep, depth, if do_match { 1 } else { 0 });
+        self.reqs[r as usize].qp_retry = 0;
+    }
+
+    /// F3 on_landed (QPG :231-252): lock the landed node (the deepest one with a host copy),
+    /// replacing the request's older lock; may exceed the budget (the next pass trims).
+    fn guard_landed(&mut self, p: usize, r: u32) {
+        let bt = self.c.block_tokens;
+        let runs = self.reqs[r as usize].runs.clone();
+        let m = self.p[p].radix.match_peek(&runs);
+        let depth = m.total() as u64 * bt;
+        let Some(deep) = m.path.last().map(|&(n, _)| n) else { return };
+        if depth < self.c.guard_min_tokens {
+            return;
+        }
+        if let Some((old, _)) = self.reqs[r as usize].qlock {
+            if old == deep {
+                return;
+            }
+            self.guard_release(p, r);
+        }
+        self.guard_grant(p, r, deep, depth, 2);
+    }
+
+    fn guard_grant(&mut self, p: usize, r: u32, node: NodeId, depth: u64, source: usize) {
+        self.p[p].radix.host_lock(Some(node), 1);
+        self.p[p].guard_used += depth;
+        self.p[p].guard_order.push(r);
+        self.p[p].guard_grants[source] += 1;
+        self.reqs[r as usize].qlock = Some((node, depth));
+    }
+
+    /// F3 per-pass step after batch formation (QPG step :254-280; prefill.py:750-753): release the
+    /// newest locks (highest arrival number) while over budget, with a retry after 64 passes
+    /// (:275-276, :454-455); then examine up to 16 unlocked queued requests (waiting + bootstrap,
+    /// oldest first) whose retry pass has come, while >= 8192 tokens of budget remain (:277-278,
+    /// :404-421).
+    fn guard_step(&mut self, t: f64, p: usize) {
+        if !self.c.queued_prefix_protect {
+            return;
+        }
+        self.p[p].pass_n += 1;
+        let pass = self.p[p].pass_n;
+        if self.c.guard_trim {
+            while self.p[p].guard_used > self.c.guard_budget_tokens && !self.p[p].guard_order.is_empty() {
+                let r = *self.p[p].guard_order.iter().max_by_key(|&&x| self.reqs[x as usize].qp_seq).unwrap();
+                self.guard_release(p, r);
+                self.reqs[r as usize].qp_retry = pass + QPG_RETRY_AFTER_PASSES;
+                self.p[p].guard_released_budget += 1;
+            }
+        }
+        let room = |s: &Self| s.c.guard_budget_tokens.saturating_sub(s.p[p].guard_used);
+        if self.c.guard_examine && room(self) >= self.c.guard_min_tokens {
+            let mut cands: Vec<u32> = self.p[p]
+                .wq
+                .iter()
+                .chain(self.p[p].bq.iter())
+                .copied()
+                .filter(|&x| {
+                    let rq = &self.reqs[x as usize];
+                    rq.qlock.is_none() && rq.qp_retry <= pass && !rq.cancel
+                })
+                .collect();
+            cands.sort_by_key(|&x| self.reqs[x as usize].qp_seq);
+            let mut examined = 0usize;
+            for r in cands {
+                if examined >= QPG_MAX_EXAMINE_PER_PASS || room(self) < self.c.guard_min_tokens {
+                    break;
+                }
+                examined += 1;
+                self.p[p].guard_examined += 1;
+                self.guard_try_arrive(t, p, r, true);
+            }
+        }
+    }
+
+    /// F3 pressure: if host eviction left a shortfall, release the guard's NEWEST locks (highest
+    /// arrival number; never the waiting-queue head's or the requester's) one at a time and evict
+    /// again, up to 2x the shortfall (URC:2069-2097; QPG relieve_host_pressure :282-304,
+    /// release_newest :306-317); a released request takes no arrival lock for 256 passes (:456-457).
+    fn guard_pressure(&mut self, t: f64, p: usize, requester: Option<u32>) {
+        let short = self.p[p].radix.host_used.saturating_sub(self.p[p].radix.host_cap);
+        if short == 0 || !self.c.queued_prefix_protect {
+            return;
+        }
+        let limit = QPG_PRESSURE_RELEASE_FACTOR * short * self.c.block_tokens;
+        let head = self.p[p].wq.front().copied();
+        let pass = self.p[p].pass_n;
+        let mut order = self.p[p].guard_order.clone();
+        order.sort_by_key(|&x| std::cmp::Reverse(self.reqs[x as usize].qp_seq));
+        let mut released = 0u64;
+        for r in order {
+            if released >= limit || self.p[p].radix.host_used <= self.p[p].radix.host_cap {
+                break;
+            }
+            if Some(r) == head || Some(r) == requester {
+                continue;
+            }
+            let d = self.reqs[r as usize].qlock.map(|x| x.1).unwrap_or(0);
+            self.guard_release(p, r);
+            self.reqs[r as usize].qp_noarrive = pass + QPG_PRESSURE_NO_ARRIVE_PASSES;
+            released += d;
+            self.p[p].guard_released_pressure += 1;
+            self.p[p].radix.evict_host(t);
+        }
+    }
+
+    fn guard_release(&mut self, p: usize, r: u32) {
+        if let Some((n, d)) = self.reqs[r as usize].qlock.take() {
+            self.p[p].radix.host_lock(Some(n), -1);
+            self.p[p].guard_used -= d;
+            self.p[p].guard_order.retain(|&x| x != r);
+        }
+    }
+
+    /// Close the open idle segment of P `p` and, if P is idle now, open one classified by its
+    /// queues: 0 nothing queued, 1 only bootstrap-queue work, 2 waiting work but none admissible.
+    fn p_idle_update(&mut self, t: f64, p: usize) {
+        if let Some((t0, cls)) = self.p[p].idle_since.take() {
+            let a = t0.max(self.lo);
+            let b = t.min(self.hi);
+            if b > a {
+                self.p[p].idle_win[cls as usize] += b - a;
+            }
+        }
+        if self.p[p].run_items.is_none() {
+            let cls = if !self.p[p].wq.is_empty() || self.p[p].chunked.is_some() {
+                2
+            } else if self.p[p].bq_n > 0 {
+                1
+            } else {
+                0
+            };
+            self.p[p].idle_since = Some((t, cls));
+        }
+    }
+
+    /// Issue a peer pull for request `r` (P1/P2): span from the destination's current match end
+    /// to len-1 (page aligned); the owner grants the longest run it holds on host.
     fn start_pull(&mut self, t: f64, r: u32) {
         let bt = self.c.block_tokens;
+        self.reqs[r as usize].jit_pending = false;
         let (src, dst) = {
             let rq = &self.reqs[r as usize];
             (rq.pull_src.unwrap() as usize, rq.p as usize)
         };
         let runs = self.reqs[r as usize].runs.clone();
-        let have = self.p[dst].radix.match_peek(&runs).total() as u64;
-        let sm: MatchResult = self.p[src].radix.match_peek(&runs);
-        let avail = sm.total() as u64;
-        let want_blocks = (self.reqs[r as usize].pull_hint / bt) + have;
-        let upto = avail.min(want_blocks);
-        let pulled_blocks = upto.saturating_sub(have);
+        let pt = self.reqs[r as usize].pt;
+        // Issue-time local match (refreshes the destination path).
+        let have = self.p[dst].radix.match_local(&runs, t).total() as u64;
+        let cap_blocks = pt.saturating_sub(1) / bt;
+        if (cap_blocks.saturating_sub(have)) * bt < self.c.pull_min_tokens {
+            return; // span < 256 tokens: no pull
+        }
+        self.reqs[r as usize].pull_attempts += 1;
+        if self.reqs[r as usize].pull_first_issue_t.is_none() {
+            self.reqs[r as usize].pull_first_issue_t = Some(t);
+        }
         self.pulls_all += 1;
-        if pulled_blocks * bt < self.reqs[r as usize].pull_hint {
+        let sm: MatchResult = self.p[src].radix.match_peek(&runs);
+        let avail = (sm.total() as u64).min(cap_blocks);
+        let mut pulled_blocks = avail.saturating_sub(have);
+        // Owner lease budget (64 GiB = 1.51 M tokens): the whole lookup is refused over budget.
+        if pulled_blocks > 0 && self.p[src].leased_tok + pulled_blocks * bt > self.c.lease_budget_tokens {
+            pulled_blocks = 0;
+            self.lease_refused += 1;
+        }
+        if pulled_blocks * bt < self.c.pull_min_tokens {
+            pulled_blocks = 0; // hit < 256 tokens is revoked
+        }
+        let hint_target = self.reqs[r as usize].hint_expected.min(pt.saturating_sub(1));
+        if (have + pulled_blocks) * bt + bt <= hint_target {
             self.pull_short_all += 1;
         }
         let rq = &mut self.reqs[r as usize];
         rq.pull_start_t = Some(t);
-        rq.pull_dst_have = have * bt;
+        if rq.pull_attempts == 1 {
+            rq.pull_dst_have = have * bt;
+        }
         if pulled_blocks == 0 {
-            rq.pulled = 0;
-            rq.pull_end = Some(t);
-            rq.pull_pending = false;
+            self.lookup_miss += 1;
+            if self.reqs[r as usize].pull_outcome == 0 {
+                self.reqs[r as usize].pull_outcome = 3;
+            }
             return;
         }
-        let lease = TwoTierRadix::path_node_covering(&sm.path, upto as u32);
-        self.p[src].radix.lease(lease, 1);
+        {
+            let full = (have + pulled_blocks) * bt + bt > hint_target;
+            let rq = &mut self.reqs[r as usize];
+            if rq.pull_outcome == 0 || rq.pull_outcome == 3 {
+                rq.pull_outcome = if full { 1 } else { 2 };
+            }
+        }
+        let upto = (have + pulled_blocks) as u32;
+        let lease = TwoTierRadix::path_node_covering(&sm.path, upto);
+        if self.c.lease_pins {
+            self.p[src].radix.lease(lease, 1);
+        }
+        self.p[src].leased_tok += pulled_blocks * bt;
+        // Leased path (root .. deepest leased node) for the demote walk.
+        let mut acc = 0u32;
+        let mut leased = Vec::new();
+        for &(n, m) in &sm.path {
+            if acc >= upto {
+                break;
+            }
+            leased.push((n, m));
+            acc += m;
+        }
         let rq = &mut self.reqs[r as usize];
         rq.pull_lease = lease;
-        rq.pull_src_path = sm.path.clone();
-        rq.pulled = pulled_blocks * bt;
+        rq.pull_src_path = leased;
+        rq.pull_upto = upto;
+        rq.pull_issue_blocks = pulled_blocks;
+        rq.pulled += pulled_blocks * bt;
         self.pulled_all += pulled_blocks * bt;
         let dur = self.c.pull_fit.at(pulled_blocks * bt);
         rq.pull_end = Some(t + dur);
@@ -1118,67 +1639,54 @@ impl<'a> Sim<'a> {
 
     fn pull_done(&mut self, t: f64, r: u32) {
         let bt = self.c.block_tokens;
-        let (src, dst, lease, pulled, have) = {
+        let (src, dst, lease, upto, lookup_t) = {
             let rq = &self.reqs[r as usize];
-            (rq.pull_src.unwrap() as usize, rq.p as usize, rq.pull_lease, rq.pulled, rq.pull_dst_have)
+            (rq.pull_src.unwrap() as usize, rq.p as usize, rq.pull_lease, rq.pull_upto, rq.pull_start_t.unwrap_or(t))
         };
-        // Land the pulled range on the destination, then lock it until the first chunk.
-        let upto_blocks = ((have + pulled) / bt) as u32;
-        let runs = runs_prefix(&self.reqs[r as usize].runs, upto_blocks);
+        let pulled_now = self.reqs[r as usize].pull_issue_blocks * bt;
+        // P3: one host-only node with a fresh access time on the destination (anchor touched).
+        let runs = runs_prefix(&self.reqs[r as usize].runs, upto);
         let host_only = self.c.pull_landing == "host";
-        let path = self.p[dst].radix.insert(&runs, t, host_only);
-        let deep = path.last().copied();
-        self.p[dst].radix.lock(deep, 1);
-        self.reqs[r as usize].pull_dst_lock = deep;
-        // Release the source lease; demote the source copy below the deepest branch point.
+        let before = self.p[dst].radix.stats.host_inserted_blocks;
+        self.p[dst].radix.insert(&runs, t, host_only);
+        self.guard_pressure(t, dst, Some(r));
+        let ins = (self.p[dst].radix.stats.host_inserted_blocks - before) * bt;
+        if t >= self.lo && t < self.hi {
+            self.p[dst].pull_ins_win += ins;
+        }
+        // F3: lock at pull landing replaces the older lock (may exceed the budget).
+        if self.c.queued_prefix_protect && self.reqs[r as usize].t_fwd.is_none() {
+            self.guard_landed(dst, r);
+        }
+        // Complete release at the owner; demote walk (X) with the lookup time.
+        if self.c.lease_pins {
+            self.p[src].radix.lease(lease, -1);
+        }
+        self.p[src].leased_tok = self.p[src].leased_tok.saturating_sub(pulled_now);
         if self.c.demote_source {
-            let sp = self.reqs[r as usize].pull_src_path.clone();
-            // Only the leased part of the path (up to the pulled end).
-            let mut acc = 0u32;
-            let mut leased = Vec::new();
-            for &(n, m) in &sp {
-                if acc >= upto_blocks {
-                    break;
-                }
-                leased.push((n, m));
-                acc += m;
-            }
-            self.p[src].radix.lease(lease, -1);
-            self.p[src].radix.demote_below_branch(&leased);
-        } else {
-            self.p[src].radix.lease(lease, -1);
+            let sp = std::mem::take(&mut self.reqs[r as usize].pull_src_path);
+            let (_, _, why) = self.p[src].radix.demote_walk(&sp, lookup_t);
+            self.demote_stop[why as usize] += 1;
         }
         self.reqs[r as usize].pull_lease = None;
         self.reqs[r as usize].pull_pending = false;
         self.p[src].radix.evict_dev(t);
-        // If the request was already bootstrap-ready, it was waiting for the pull.
-        if let Some(rdy) = self.reqs[r as usize].boot_ready {
-            let at = rdy.max(t + self.c.pull_check_s);
-            if self.reqs[r as usize].p_ready.is_none() {
-                self.at(at, Ev::PReady(r));
+        // A held request becomes admissible again: wake an idle P.
+        if self.p[dst].run_items.is_none() && !self.p[dst].wq.is_empty() {
+            if let Some(items) = self.form(t, dst) {
+                self.start_iter(t, dst, items);
             }
         }
+        self.p_idle_update(t, dst);
     }
 
     fn boot_done(&mut self, t: f64, r: u32) {
         let rq = &self.reqs[r as usize];
-        let rdy = rq.p_recv.max(rq.t_alloc.unwrap_or(t)) + self.c.handshake_s;
+        let base = rq.p_recv.max(rq.t_alloc.unwrap_or(t));
+        let hs = self.qdraw(0);
+        let rdy = base + if hs.is_nan() { self.c.handshake_s } else { hs.max(0.0) };
         let rdy = rdy.max(t);
         self.reqs[r as usize].boot_ready = Some(rdy);
-        if self.reqs[r as usize].pull_src.is_some() {
-            if self.c.pull_start == "queue" && self.reqs[r as usize].pull_start_t.is_none() {
-                // JIT pull: issued when the request is ready to enter the queue.
-                self.start_pull(rdy.max(t), r);
-            }
-            if self.reqs[r as usize].pull_pending {
-                return; // PReady is scheduled at pull completion.
-            }
-            if let Some(pe) = self.reqs[r as usize].pull_end {
-                let at = rdy.max(pe + if self.reqs[r as usize].pulled > 0 { self.c.pull_check_s } else { 0.0 });
-                self.at(at, Ev::PReady(r));
-                return;
-            }
-        }
         self.at(rdy, Ev::PReady(r));
     }
 
@@ -1188,16 +1696,14 @@ impl<'a> Sim<'a> {
         }
         self.reqs[r as usize].p_ready = Some(t);
         let p = self.reqs[r as usize].p as usize;
-        // Queued-prefix protect (fix 3): lock the currently matched prefix while queued.
-        if self.c.queued_prefix_protect {
-            let runs = self.reqs[r as usize].runs.clone();
-            let m = self.p[p].radix.match_peek(&runs);
-            let deep = m.path.last().map(|&(n, _)| n);
-            self.p[p].radix.lock(deep, 1);
-            self.reqs[r as usize].qlock = deep;
+        self.p[p].bq_n -= 1;
+        self.p[p].bq_tok -= self.reqs[r as usize].pt;
+        if let Some(i) = self.p[p].bq.iter().position(|&x| x == r) {
+            self.p[p].bq.swap_remove(i);
         }
         let bt = self.c.block_tokens;
         let runs = self.reqs[r as usize].runs.clone();
+        // Waiting-queue entry is not a match point in the engine (H5): no LRU refresh here.
         let est = self.p[p].radix.match_peek(&runs).total() as u64 * bt;
         self.reqs[r as usize].unc_est = self.reqs[r as usize].pt.saturating_sub(est).max(1);
         self.p[p].wq.push_back(r);
@@ -1206,25 +1712,57 @@ impl<'a> Sim<'a> {
                 self.start_iter(t, p, items);
             }
         }
+        self.p_idle_update(t, p);
+    }
+
+    /// F1 JIT scan (each scheduler pass): issue pending pulls of the first 8 waiting entries at
+    /// position p <= 4 or with <= 131,072 full-input tokens ahead.
+    fn jit_scan(&mut self, t: f64, p: usize) {
+        let mut ahead: u64 = self.p[p].chunked.map(|c| {
+            let rq = &self.reqs[c as usize];
+            rq.unc.saturating_sub(rq.sched)
+        }).unwrap_or(0);
+        let n = self.p[p].wq.len().min(8);
+        let mut issue = Vec::new();
+        for pos in 0..n {
+            let r = self.p[p].wq[pos];
+            let rq = &self.reqs[r as usize];
+            if rq.jit_pending && (pos <= 4 || ahead <= self.c.jit_lead_tokens) {
+                issue.push(r);
+            }
+            ahead += rq.pt;
+        }
+        for r in issue {
+            self.start_pull(t, r);
+        }
     }
 
     // ------------------------------------------------------------------------------ P engine
     fn first_chunk(&mut self, t: f64, p: usize, r: u32) {
         let bt = self.c.block_tokens;
         let runs = self.reqs[r as usize].runs.clone();
-        let id = self.ideal.match_peek(&runs).total() as u64 * bt;
         self.reqs[r as usize].t_fwd = Some(t);
-        self.reqs[r as usize].ideal = id;
         // Best actual prefix anywhere at first chunk (gap-cause input).
         let fcb = self.p.iter_mut().map(|w| w.radix.match_peek(&runs).total() as u64 * bt).max().unwrap_or(0);
         self.reqs[r as usize].fc_best = fcb;
+        let ns = self.tasks[self.reqs[r as usize].task as usize].inst;
+        {
+            let prev = self.sess_last_pd.get(&ns).copied();
+            let ll = self.last_local.get(&(p as u16, ns)).copied();
+            let rq = &mut self.reqs[r as usize];
+            rq.prev_p = prev.map(|x| x.0);
+            rq.prev_gap = prev.map(|x| rq.admit - x.1);
+            rq.local_age = ll.map(|x| t - x);
+        }
+        self.last_local.insert((p as u16, ns), t);
         let m = self.p[p].radix.match_local(&runs, t);
         let mut dev = m.dev as u64 * bt;
         let mut host = m.host as u64 * bt;
         let pt = self.reqs[r as usize].pt;
-        // Cap like SGLang: at least one token is computed.
-        if dev + host >= pt {
-            let over = dev + host + 1 - pt;
+        // Cap like SGLang: match at most len-1 tokens, page aligned -> the last page is recomputed.
+        let capm = (pt.saturating_sub(1) / bt) * bt;
+        if dev + host > capm {
+            let over = dev + host - capm;
             if host >= over {
                 host -= over;
             } else {
@@ -1244,13 +1782,8 @@ impl<'a> Sim<'a> {
         self.p[p].radix.load_back(&m.path, t);
         let deep = m.path.last().map(|&(n, _)| n);
         self.p[p].radix.lock(deep, 1);
-        // Release queue-protect and pull-landing locks now that the request holds its own.
-        if let Some(q) = self.reqs[r as usize].qlock.take() {
-            self.p[p].radix.lock(Some(q), -1);
-        }
-        if let Some(q) = self.reqs[r as usize].pull_dst_lock.take() {
-            self.p[p].radix.lock(Some(q), -1);
-        }
+        // F3: the queued-prefix host lock is released at admission.
+        self.guard_release(p, r);
         let beta = self.p[p].beta;
         let mut lb = beta[3] * host as f64 / 1e5 + beta[4] * stor as f64 / 1e5;
         if self.c.lb_hidden > 0.0 {
@@ -1269,7 +1802,14 @@ impl<'a> Sim<'a> {
         rq.lbcost = lb.max(0.0);
     }
 
+    /// One scheduler pass: form a batch, then the F3 guard step (after batch formation).
     fn form(&mut self, t: f64, p: usize) -> Option<Vec<BItem>> {
+        let res = self.form_batch(t, p);
+        self.guard_step(t, p);
+        res
+    }
+
+    fn form_batch(&mut self, t: f64, p: usize) -> Option<Vec<BItem>> {
         let mut budget = self.c.chunk_tokens;
         let mut items = Vec::new();
         if let Some(r) = self.p[p].chunked {
@@ -1286,11 +1826,49 @@ impl<'a> Sim<'a> {
             }
             self.p[p].chunked = None;
         }
-        while budget > 0 {
-            let Some(r) = self.p[p].wq.pop_front() else { break };
+        if self.c.pull_start == "queue" {
+            self.jit_scan(t, p);
+        }
+        let mut idx = 0usize;
+        while budget > 0 && idx < self.p[p].wq.len() {
+            let r = self.p[p].wq[idx];
             if self.reqs[r as usize].cancel {
+                self.p[p].wq.remove(idx);
                 continue;
             }
+            // Hold: a request whose pull is in flight is skipped; later requests pass it.
+            if self.reqs[r as usize].pull_pending {
+                idx += 1;
+                continue;
+            }
+            if self.reqs[r as usize].jit_pending {
+                self.start_pull(t, r);
+                if self.reqs[r as usize].pull_pending {
+                    idx += 1;
+                    continue;
+                }
+            }
+            // F2: re-pull at admission from the same owner when the local match is short of the
+            // hint by >= 8192 tokens (one attempt).
+            if self.c.repull_on_admission && self.reqs[r as usize].pull_src.is_some()
+                && self.reqs[r as usize].pull_attempts < 2 && !self.reqs[r as usize].repulled
+            {
+                let bt = self.c.block_tokens;
+                let runs = self.reqs[r as usize].runs.clone();
+                let local = self.p[p].radix.match_peek(&runs).total() as u64 * bt;
+                let pt = self.reqs[r as usize].pt;
+                let expected = self.reqs[r as usize].hint_expected.min(pt.saturating_sub(1));
+                if expected > 0 && expected.saturating_sub(local) >= self.c.repull_min_tokens {
+                    self.reqs[r as usize].repulled = true;
+                    self.repulls += 1;
+                    self.start_pull(t, r);
+                    if self.reqs[r as usize].pull_pending {
+                        idx += 1;
+                        continue;
+                    }
+                }
+            }
+            self.p[p].wq.remove(idx);
             self.first_chunk(t, p, r);
             let (unc, pt) = {
                 let rq = &self.reqs[r as usize];
@@ -1322,7 +1900,15 @@ impl<'a> Sim<'a> {
             }
         }
         let mut svc = (b[0] + b[1] * nk as f64 / 1e3 + b[2] * pairs / 1e9 + lb).max(0.02);
-        if self.c.p_noise_sigma > 0.0 {
+        if !self.c.p_res_q.is_empty() {
+            let u = self.urand() * 200.0;
+            let q = &self.c.p_res_q[p % self.c.p_res_q.len()];
+            if q.len() >= 201 {
+                let norm = q.iter().sum::<f64>() / q.len() as f64;
+                let k = (u as usize).min(199);
+                svc *= (q[k] + (q[k + 1] - q[k]) * (u - k as f64)) / norm;
+            }
+        } else if self.c.p_noise_sigma > 0.0 {
             // Box-Muller lognormal with mean 1.
             let u1 = self.urand().max(1e-12);
             let u2 = self.urand();
@@ -1341,6 +1927,7 @@ impl<'a> Sim<'a> {
             pw.win_busy += svc;
         }
         pw.run_items = Some(items);
+        self.p_idle_update(t, p);
         self.at(t + svc, Ev::EndIter(p as u16));
         let nxt = self.form(t, p);
         self.p[p].next_items = nxt;
@@ -1364,6 +1951,7 @@ impl<'a> Sim<'a> {
         if let Some(n) = nxt {
             self.start_iter(t, p, n);
         }
+        self.p_idle_update(t, p);
     }
 
     fn prefill_done(&mut self, t: f64, p: usize, r: u32) {
@@ -1373,9 +1961,14 @@ impl<'a> Sim<'a> {
             self.p[p].nin -= 1;
         }
         let runs = self.reqs[r as usize].runs.clone();
-        self.ideal.insert(&runs, t, false);
+        let ns = self.tasks[self.reqs[r as usize].task as usize].inst;
+        self.last_local.insert((p as u16, ns), t);
+        if !self.reqs[r as usize].warm {
+            self.sess_last_pd.insert(ns, (p as u16, t));
+        }
         let before = self.p[p].radix.stats.host_inserted_blocks;
         let path = self.p[p].radix.insert(&runs, t, false);
+        self.guard_pressure(t, p, Some(r));
         let ins = (self.p[p].radix.stats.host_inserted_blocks - before) * self.c.block_tokens;
         if t >= self.lo && t < self.hi {
             self.p[p].host_ins_win += ins;
@@ -1385,17 +1978,32 @@ impl<'a> Sim<'a> {
         let old = self.reqs[r as usize].locked;
         self.p[p].radix.lock(old, -1);
         self.reqs[r as usize].locked = nd;
-        let tail = self.c.kv_tail.at(self.reqs[r as usize].pt);
+        let pt = self.reqs[r as usize].pt;
+        let tr = self.qdraw(4);
+        let tail = if tr.is_nan() {
+            self.c.kv_tail.at(pt)
+        } else {
+            (self.c.kv_tail.a + self.c.kv_tail.b_per_100k * pt as f64 / 1e5 + tr).max(0.0)
+        };
         self.at(t + tail, Ev::KvArrived(r));
     }
 
     fn kv_arrived(&mut self, t: f64, r: u32) {
         let p = self.reqs[r as usize].p as usize;
+        if self.reqs[r as usize].nin_held && self.c.smg_load_release == "kv_arrived" {
+            self.reqs[r as usize].nin_held = false;
+            self.p[p].nin -= 1;
+        }
+        if let Some(cost) = self.reqs[r as usize].cs_cost.take() {
+            self.p[p].cs_pending -= cost;
+            self.p[p].cs_active -= 1;
+        }
         self.reqs[r as usize].t_kv = Some(t);
         let lk = self.reqs[r as usize].locked.take();
         self.p[p].radix.lock(lk, -1);
         self.p[p].radix.evict_dev(t);
-        let first = t + self.c.d_first_s;
+        let df = self.qdraw(1);
+        let first = t + if df.is_nan() { self.c.d_first_s } else { df.max(0.0) };
         self.reqs[r as usize].first = Some(first);
         let ct = self.reqs[r as usize].ct;
         if self.c.tpot_fb {
@@ -1413,9 +2021,17 @@ impl<'a> Sim<'a> {
     }
 
     fn d_adv(&mut self, t: f64, d: usize) {
+        let (lo, hi) = (self.lo, self.hi);
         let dw = &mut self.d[d];
         if dw.b > 0 {
             dw.v += (t - dw.vt) * dw.rate;
+            let a = dw.vt.max(lo);
+            let b = t.min(hi);
+            if b > a {
+                let st = step_ms(dw.b, dw.s);
+                dw.ib += dw.b as f64 * (b - a);
+                dw.ib_inv += dw.b as f64 * (b - a) / st;
+            }
         }
         dw.vt = t;
     }
@@ -1474,6 +2090,9 @@ impl<'a> Sim<'a> {
             self.reqs[r as usize].cancel = true;
             return;
         }
+        let runs = std::mem::take(&mut self.reqs[r as usize].runs);
+        self.ideal.insert(&runs, t, false);
+        self.reqs[r as usize].runs = runs;
         let d = self.reqs[r as usize].d as usize;
         self.d_release(t, r);
         if self.reqs[r as usize].d_counted {
@@ -1587,6 +2206,121 @@ impl<'a> Sim<'a> {
         rep.d_wait_mean = sum(&|r| r.t_alloc.unwrap_or(r.d_recv) - r.d_recv) / n;
         rep.prefill_mean = sum(&|r| r.t_pd.unwrap() - r.t_fwd.unwrap()) / n;
         rep.decode_mean = sum(&|r| r.done.unwrap() - r.first.unwrap()) / n;
+        rep.p_boot_mean = sum(&|r| r.p_ready.unwrap_or(r.p_recv) - r.p_recv) / n;
+        rep.tail_mean = sum(&|r| r.t_kv.unwrap() - r.t_pd.unwrap()) / n;
+        rep.d_alloc_to_kv_mean = sum(&|r| r.t_kv.unwrap() - r.t_alloc.unwrap_or(r.t_kv.unwrap())) / n;
+        let ib: f64 = self.d.iter().map(|d| d.ib).sum();
+        let ibi: f64 = self.d.iter().map(|d| d.ib_inv).sum();
+        rep.dec_step_tokw_ms = if ibi > 0.0 { ib / ibi } else { 0.0 };
+        rep.dec_b_mean = ib / (self.c.score_s * self.d.len().max(1) as f64);
+        // Same P as the previous request of the same task admission (by admit order, all non-warm requests).
+        let mut last: FxHashMap<u32, u16> = FxHashMap::default();
+        let mut same = 0usize;
+        let mut tot = 0usize;
+        let mut order: Vec<&Req> = self.reqs.iter().filter(|r| !r.warm).collect();
+        order.sort_by(|a, b| a.admit.total_cmp(&b.admit));
+        for r in order {
+            if let Some(&pp) = last.get(&r.task) {
+                if r.admit >= lo && r.admit < hi && !r.cancel && r.done.is_some_and(|d| d <= dur) {
+                    tot += 1;
+                    if pp == r.p {
+                        same += 1;
+                    }
+                }
+            }
+            last.insert(r.task, r.p);
+        }
+        rep.same_p_as_prev_share = same as f64 / tot.max(1) as f64;
+        let mut ages: Vec<f64> = Vec::new();
+        for r in &cmp {
+            if !(r.ideal > 0 && actual(r) == 0.0) {
+                continue;
+            }
+            let mech = match (r.local_age, r.prev_p) {
+                (_, None) => 3,
+                (None, Some(_)) => 0,
+                (Some(_), Some(pp)) if pp != r.p => 1,
+                _ => 2,
+            };
+            rep.zero_hit_mech[mech] += 1;
+            let gb = match r.prev_gap {
+                None => 0,
+                Some(g) if g < 0.0 => 0,
+                Some(g) if g < 60.0 => 1,
+                Some(g) if g < 100.0 => 2,
+                Some(g) if g < 140.0 => 3,
+                _ => 4,
+            };
+            rep.zero_hit_gap_bins[gb] += 1;
+            rep.zero_hit_mech_by_gap[mech][gb] += 1;
+            if r.pull_hint > 0 {
+                rep.zero_hit_hinted_by_gap[gb] += 1;
+            }
+            if let Some(a) = r.local_age {
+                ages.push(a);
+            }
+        }
+        if !ages.is_empty() {
+            rep.zero_hit_local_age = [
+                percentile_in_place(&mut ages, 25.0),
+                percentile_in_place(&mut ages, 50.0),
+                percentile_in_place(&mut ages, 75.0),
+            ];
+        }
+        // GCWS footprint.
+        {
+            let pool = self.c.turnover_pool_tokens as f64;
+            let np = self.p.len();
+            let mut ev: Vec<Vec<(f64, u64, u64)>> = vec![Vec::new(); np];
+            for r in &self.reqs {
+                if let Some(tp) = r.t_pd {
+                    if tp >= 0.0 {
+                        ev[r.p as usize].push((tp, self.tasks[r.task as usize].inst, r.pt));
+                    }
+                }
+            }
+            for e in &mut ev {
+                e.sort_by(|a, b| a.0.total_cmp(&b.0));
+            }
+            for (wi, w) in [120.0f64, 300.0].iter().enumerate() {
+                let mut vals: Vec<f64> = Vec::new();
+                let mut tt = lo;
+                while tt < hi {
+                    for e in &ev {
+                        let a = e.partition_point(|x| x.0 <= tt - w);
+                        let b = e.partition_point(|x| x.0 <= tt);
+                        let mut mx: FxHashMap<u64, u64> = FxHashMap::default();
+                        for x in &e[a..b] {
+                            let v = mx.entry(x.1).or_insert(0);
+                            if x.2 > *v {
+                                *v = x.2;
+                            }
+                        }
+                        vals.push(mx.values().sum::<u64>() as f64 / pool);
+                    }
+                    tt += 30.0;
+                }
+                if !vals.is_empty() {
+                    let out = [percentile_in_place(&mut vals, 50.0), percentile_in_place(&mut vals, 90.0)];
+                    if wi == 0 {
+                        rep.gcws_w120 = out;
+                    } else {
+                        rep.gcws_w300 = out;
+                    }
+                }
+            }
+        }
+        let cs: Vec<_> = self.census.iter().filter(|c| c.0 >= lo && c.0 < hi).collect();
+        if !cs.is_empty() {
+            let cap = self.c.p_host_tokens as f64;
+            let k = cs.len() as f64;
+            rep.pool_pinned_frac = cs.iter().map(|c| c.3 as f64 / cap).sum::<f64>() / k;
+            rep.pool_device_resident_frac = cs.iter().map(|c| c.4 as f64 / cap).sum::<f64>() / k;
+            rep.pool_demoted_frac = cs.iter().map(|c| c.5 as f64 / cap).sum::<f64>() / k;
+            let mut us: Vec<f64> = cs.iter().map(|c| 1.0 - (c.3 + c.4) as f64 / cap).collect();
+            rep.pool_usable_frac_mean = us.iter().sum::<f64>() / k;
+            rep.pool_usable_frac_p10 = percentile_in_place(&mut us, 10.0);
+        }
         rep.pulls_scored = w.iter().filter(|r| r.pulled > 0).count() as u64;
         rep.pulled_tokens_scored = w.iter().map(|r| r.pulled).sum();
         rep.pulls_all = self.pulls_all;
@@ -1595,9 +2329,14 @@ impl<'a> Sim<'a> {
         rep.detour_share = w.iter().filter(|r| r.detour).count() as f64 / w.len().max(1) as f64;
         let bt = self.c.block_tokens;
         for (i, pw) in self.p.iter().enumerate() {
-            let cap = pw.radix.host_cap as f64 * bt as f64;
-            let inflow = pw.host_ins_win as f64 / self.c.score_s;
+            let cap = self.c.turnover_pool_tokens as f64;
+            let inflow = (pw.host_ins_win + pw.pull_ins_win) as f64 / self.c.score_s;
             rep.per_p_host_retention_cap_over_inflow_s.push(if inflow > 0.0 { cap / inflow } else { 0.0 });
+            let dh = self.c.dh_counter_scale * pw.host_ins_win as f64 / self.c.score_s;
+            let pl = pw.pull_ins_win as f64 / self.c.score_s;
+            rep.per_p_turnover_counter_s.push(if dh + pl > 0.0 { cap / (dh + pl) } else { 0.0 });
+            rep.per_p_turnover_dh_only_s.push(if dh > 0.0 { cap / dh } else { 0.0 });
+            rep.per_p_pull_landed_tokens_win.push(pw.pull_ins_win);
             let ev: Vec<_> = pw.radix.evictions.iter().filter(|e| e.t >= lo && e.t < hi).collect();
             let blk: f64 = ev.iter().map(|e| e.blocks as f64).sum();
             let al: f64 = ev.iter().map(|e| e.age_last * e.blocks as f64).sum();
@@ -1606,6 +2345,13 @@ impl<'a> Sim<'a> {
             rep.per_p_host_age_write_s.push(if blk > 0.0 { aw / blk } else { 0.0 });
             let mut ages: Vec<f64> = ev.iter().map(|e| e.age_last).collect();
             rep.per_p_host_age_last_p50_s.push(if ages.is_empty() { 0.0 } else { percentile_in_place(&mut ages, 50.0) });
+            let mut pc = [0.0; 5];
+            if !ages.is_empty() {
+                for (k, q) in [10.0, 25.0, 50.0, 75.0, 90.0].iter().enumerate() {
+                    pc[k] = percentile_in_place(&mut ages, *q);
+                }
+            }
+            rep.per_p_host_age_last_pct_s.push(pc);
             rep.per_p_busy.push(pw.win_busy / self.c.score_s);
             rep.per_p_share.push(cmp.iter().filter(|r| r.p as usize == i).count() as f64 / n);
             rep.per_p_host_inserted_tokens_win.push(pw.host_ins_win);
@@ -1621,7 +2367,78 @@ impl<'a> Sim<'a> {
             rep.demote_cleared_nodes += s.demote_cleared_nodes;
             rep.demote_cleared_tokens += s.demote_cleared_blocks * bt;
         }
+        {
+            let mut delays: Vec<f64> = Vec::new();
+            for r in &w {
+                if r.pull_src.is_none() || r.hint_expected == 0 {
+                    continue;
+                }
+                rep.hint_outcomes[0] += 1;
+                match r.pull_outcome {
+                    1 => rep.hint_outcomes[1] += 1,
+                    2 => rep.hint_outcomes[2] += 1,
+                    3 => rep.hint_outcomes[3] += 1,
+                    _ => rep.hint_outcomes[4] += 1,
+                }
+                if let Some(ti) = r.pull_first_issue_t {
+                    let dl = ti - r.start;
+                    delays.push(dl);
+                    let b = if dl < 5.0 { 0 } else if dl < 15.0 { 1 } else if dl < 30.0 { 2 } else { 3 };
+                    rep.miss_by_delay[b][0] += 1;
+                    if r.pull_outcome == 3 {
+                        rep.miss_by_delay[b][1] += 1;
+                    }
+                }
+            }
+            if !delays.is_empty() {
+                rep.pull_issue_delay = [percentile_in_place(&mut delays, 50.0), percentile_in_place(&mut delays, 90.0)];
+            }
+        }
         rep.tasks_started = self.tasks_started;
+        rep.lookup_miss_all = self.lookup_miss;
+        let oe: u64 = self.p.iter().map(|w| w.radix.stats.overcommit_events).sum();
+        let ob: u64 = self.p.iter().map(|w| w.radix.stats.overcommit_blocks).sum();
+        rep.overcommit_events = oe;
+        rep.overcommit_tokens_mean = if oe > 0 { ob as f64 * self.c.block_tokens as f64 / oe as f64 } else { 0.0 };
+        rep.guard_released_pressure = self.p.iter().map(|w| w.guard_released_pressure).sum();
+        {
+            let win = (self.hi - self.lo).max(1e-9);
+            for (i, w) in self.p.iter().enumerate() {
+                let mut idle = w.idle_win;
+                if let Some((t0, cls)) = w.idle_since {
+                    let a = t0.max(self.lo);
+                    if self.hi > a {
+                        idle[cls as usize] += self.hi - a;
+                    }
+                }
+                rep.per_p_idle_frac.push([idle[0] / win, idle[1] / win, idle[2] / win]);
+                let xs: Vec<_> =
+                    self.pstate.iter().filter(|x| x.1 as usize == i && x.0 >= self.lo && x.0 < self.hi).collect();
+                let n = xs.len().max(1) as f64;
+                let mut lk: Vec<f64> = xs.iter().map(|x| x.2 as f64).collect();
+                rep.per_p_guard_locked_mean.push(lk.iter().sum::<f64>() / n);
+                rep.per_p_guard_locked_p90.push(if lk.is_empty() { 0.0 } else { percentile_in_place(&mut lk, 90.0) });
+                rep.per_p_guard_locks_mean.push(xs.iter().map(|x| x.3 as f64).sum::<f64>() / n);
+                rep.per_p_bq_mean.push(xs.iter().map(|x| x.4 as f64).sum::<f64>() / n);
+                rep.per_p_wq_mean.push(xs.iter().map(|x| x.5 as f64).sum::<f64>() / n);
+                for k in 0..3 {
+                    rep.guard_grants[k] += w.guard_grants[k];
+                }
+                rep.guard_skip_budget += w.guard_skip_budget;
+                rep.guard_released_budget += w.guard_released_budget;
+                rep.guard_examined += w.guard_examined;
+            }
+            for (i, d) in self.d.iter().enumerate() {
+                let xs: Vec<_> =
+                    self.dstate.iter().filter(|x| x.1 as usize == i && x.0 >= self.lo && x.0 < self.hi).collect();
+                let n = xs.len().max(1) as f64;
+                rep.per_d_used_frac_mean.push(xs.iter().map(|x| x.2 as f64).sum::<f64>() / n / d.cap.max(1) as f64);
+                rep.per_d_fifo_mean.push(xs.iter().map(|x| x.3 as f64).sum::<f64>() / n);
+            }
+        }
+        rep.lease_refused_all = self.lease_refused;
+        rep.repulls_all = self.repulls;
+        rep.demote_stop = self.demote_stop;
         rep.requests_sent = self.reqs.len() as u64;
         rep.wall_s = wall_s;
         let mut rows = Vec::new();

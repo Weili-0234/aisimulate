@@ -38,6 +38,8 @@ pub struct Node {
     pub lock: u32,
     /// Peer-pull source leases passing through this node.
     pub lease: u32,
+    /// Host locks (fix-3 queued-prefix guard, pull landing): block host eviction only.
+    pub hlock: u32,
     /// Children resident on the device tier.
     pub ndev: u32,
     /// Demoted source copy: evicted first.
@@ -59,6 +61,7 @@ impl Node {
             last: 0.0,
             lock: 0,
             lease: 0,
+            hlock: 0,
             ndev: 0,
             demoted: false,
             host_t: 0.0,
@@ -66,8 +69,14 @@ impl Node {
         }
     }
 
+    /// Pinned against device eviction (in-flight request locks; leases if lease_pins).
     fn pinned(&self) -> bool {
         self.lock > 0 || self.lease > 0
+    }
+
+    /// Pinned against host eviction.
+    fn host_pinned(&self) -> bool {
+        self.lock > 0 || self.lease > 0 || self.hlock > 0
     }
 }
 
@@ -125,6 +134,9 @@ pub struct CacheStats {
     pub demote_evicted_blocks: u64,
     pub demote_cleared_nodes: u64,
     pub demote_cleared_blocks: u64,
+    /// evict_host calls that ended still over capacity, and the summed shortfall (blocks).
+    pub overcommit_events: u64,
+    pub overcommit_blocks: u64,
 }
 
 /// Window-filtered host eviction samples: (evict time, blocks, age since last use, age since write).
@@ -135,6 +147,17 @@ pub struct HostEviction {
     pub age_last: f64,
     pub age_write: f64,
     pub demoted: bool,
+    /// Namespace of the evicted node's first block (block id >> 32 = task admission).
+    pub ns: u64,
+}
+
+/// Host-pool census at one instant (tokens are blocks here; the caller scales).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PoolCensus {
+    pub host_used: u64,
+    pub pinned_host: u64,
+    pub device_resident: u64,
+    pub demoted_host: u64,
 }
 
 /// Result of a prefix match.
@@ -413,13 +436,13 @@ impl TwoTierRadix {
         loaded
     }
 
-    fn pin(&mut self, mut node: NodeId, d: i64, lease: bool) {
+    fn pin_kind(&mut self, mut node: NodeId, d: i64, kind: u8) {
         while node != NONE && node != ROOT {
             let n = &mut self.nodes[node as usize];
-            if lease {
-                n.lease = (n.lease as i64 + d) as u32;
-            } else {
-                n.lock = (n.lock as i64 + d) as u32;
+            match kind {
+                1 => n.lease = (n.lease as i64 + d) as u32,
+                2 => n.hlock = (n.hlock as i64 + d) as u32,
+                _ => n.lock = (n.lock as i64 + d) as u32,
             }
             let unpinned = !n.pinned();
             let par = n.par;
@@ -433,14 +456,21 @@ impl TwoTierRadix {
     /// Lock (d=+1) or unlock (d=-1) the path from `node` to the root (in-flight request).
     pub fn lock(&mut self, node: Option<NodeId>, d: i64) {
         if let Some(n) = node {
-            self.pin(n, d, false);
+            self.pin_kind(n, d, 0);
+        }
+    }
+
+    /// Host lock (d=+1/-1) on the path from `node` to the root: host eviction skips it.
+    pub fn host_lock(&mut self, node: Option<NodeId>, d: i64) {
+        if let Some(n) = node {
+            self.pin_kind(n, d, 2);
         }
     }
 
     /// Lease (d=+1) or release (d=-1) the path from `node` to the root (peer-pull source).
     pub fn lease(&mut self, node: Option<NodeId>, d: i64) {
         if let Some(n) = node {
-            self.pin(n, d, true);
+            self.pin_kind(n, d, 1);
         }
     }
 
@@ -488,6 +518,63 @@ impl TwoTierRadix {
             }
         }
         (fn_, fb)
+    }
+
+    /// Demote-source walk (peer_kv_demote.py:117-148): from the deepest leased node toward the
+    /// root. Stop: no host copy; the deepest node has children; an ancestor with another child
+    /// (branch); accessed at or after the lookup time; root. Already flagged nodes pass through.
+    /// Returns (flagged nodes, flagged blocks, stop reason 0 no_node 1 no_host 2 children 3 branch 4 access 5 root).
+    pub fn demote_walk(&mut self, path: &[(NodeId, u32)], lookup_t: f64) -> (u64, u64, u8) {
+        if path.is_empty() {
+            return (0, 0, 0);
+        }
+        // A lease ending inside a node, or a gone node -> "no_node", nothing flagged.
+        let (last_id, last_m) = path[path.len() - 1];
+        let ln = &self.nodes[last_id as usize];
+        if !ln.alive || last_m < ln.nb {
+            return (0, 0, 0);
+        }
+        let mut fn_ = 0u64;
+        let mut fb = 0u64;
+        let deepest = path.len() - 1;
+        let mut reason = 5u8;
+        let mut flagged: Vec<NodeId> = Vec::new();
+        for i in (0..=deepest).rev() {
+            let id = path[i].0;
+            let n = &self.nodes[id as usize];
+            if !n.alive || !n.host {
+                reason = 1;
+                break;
+            }
+            if i == deepest && !n.ch.is_empty() {
+                reason = 2;
+                break;
+            }
+            if i < deepest && n.ch.len() >= 2 {
+                reason = 3;
+                break;
+            }
+            if n.last >= lookup_t {
+                reason = 4;
+                break;
+            }
+            if n.demoted {
+                continue;
+            }
+            flagged.push(id);
+        }
+        for id in flagged {
+            let n = &mut self.nodes[id as usize];
+            n.demoted = true;
+            fn_ += 1;
+            fb += n.nb as u64;
+            if !n.host_pinned() {
+                self.push(id);
+            }
+        }
+        self.stats.demote_flagged_nodes += fn_;
+        self.stats.demote_flagged_blocks += fb;
+        (fn_, fb, reason)
     }
 
     /// Insert a run list (write-through: device + host) and touch its path. With
@@ -539,7 +626,15 @@ impl TwoTierRadix {
                     self.set_dev(ch, true);
                 }
             }
-            self.nodes[ch as usize].last = t;
+            {
+                let c = &mut self.nodes[ch as usize];
+                c.last = t;
+                if c.demoted {
+                    c.demoted = false;
+                    self.stats.demote_cleared_nodes += 1;
+                    self.stats.demote_cleared_blocks += c.nb as u64;
+                }
+            }
             path.push(ch);
             node = ch;
             ri = ri2;
@@ -549,7 +644,6 @@ impl TwoTierRadix {
             self.push(n);
         }
         self.evict_dev(t);
-        self.evict_host(t);
         path
     }
 
@@ -615,7 +709,8 @@ impl TwoTierRadix {
     }
 
     /// Host eviction until within capacity: host-only, unpinned leaves; demoted first, then LRU.
-    pub fn evict_host(&mut self, t: f64) {
+    /// Host eviction; returns the remaining shortfall in blocks (0 when within capacity).
+    pub fn evict_host(&mut self, t: f64) -> u64 {
         while self.host_used > self.host_cap {
             let Some(k) = self.hh.pop() else { break };
             let id = k.node;
@@ -624,7 +719,7 @@ impl TwoTierRadix {
                 || n.dev
                 || !n.host
                 || !n.ch.is_empty()
-                || n.pinned()
+                || n.host_pinned()
                 || n.last != k.last
                 || n.par == NONE
             {
@@ -648,7 +743,7 @@ impl TwoTierRadix {
                 self.stats.demote_evicted_blocks += nb as u64;
             }
             if self.record_evictions {
-                self.evictions.push(HostEviction { t, blocks: nb, age_last, age_write, demoted });
+                self.evictions.push(HostEviction { t, blocks: nb, age_last, age_write, demoted, ns: key >> 32 });
             }
             if self.nodes[par as usize].ch.get(&key) == Some(&id) {
                 self.nodes[par as usize].ch.remove(&key);
@@ -656,13 +751,19 @@ impl TwoTierRadix {
             self.host_used -= nb as u64;
             self.release(id);
             let p = &self.nodes[par as usize];
-            if par != ROOT && p.ch.is_empty() && !p.dev && !p.pinned() {
+            if par != ROOT && p.ch.is_empty() && !p.dev && !p.host_pinned() {
                 self.push(par);
             }
         }
         if self.hh.len() as u64 > 8 * self.live + 10000 {
             self.rebuild();
         }
+        let short = self.host_used.saturating_sub(self.host_cap);
+        if short > 0 {
+            self.stats.overcommit_events += 1;
+            self.stats.overcommit_blocks += short;
+        }
+        short
     }
 
     fn rebuild(&mut self) {
@@ -676,6 +777,30 @@ impl TwoTierRadix {
                 self.push(n);
             }
         }
+    }
+
+    /// Host-pool census: used, pinned (locked or leased), device-resident (not host-evictable)
+    /// and demoted blocks.
+    pub fn census(&self) -> PoolCensus {
+        let mut c = PoolCensus { host_used: self.host_used, ..Default::default() };
+        let mut st = vec![ROOT];
+        while let Some(n) = st.pop() {
+            let node = &self.nodes[n as usize];
+            st.extend(node.ch.values().copied());
+            if n == ROOT || !node.host {
+                continue;
+            }
+            let nb = node.nb as u64;
+            if node.host_pinned() {
+                c.pinned_host += nb;
+            } else if node.dev {
+                c.device_resident += nb;
+            }
+            if node.demoted {
+                c.demoted_host += nb;
+            }
+        }
+        c
     }
 
     /// Debug invariant check (tests).
@@ -840,6 +965,59 @@ mod tests {
         assert_eq!((n, b), (1, 4), "only the private suffix is flagged");
         assert!(!c.node(m.path[0].0).demoted);
         assert!(c.node(m.path[1].0).demoted);
+    }
+
+    #[test]
+    fn demote_walk_follows_the_engine_stop_rules() {
+        let mut c = TwoTierRadix::new(0, 1000);
+        // Session A: [0..4] -> [4..8]; session B shares nothing.
+        c.insert(&[(0, 8)], 1.0, false);
+        c.insert(&[(0, 4), (50, 4)], 2.0, false); // branch at [0..4]
+        // Lease of A's full path, lookup at t=3: the leaf [4..8] is flagged, the walk stops at the branch.
+        let m = c.match_peek(&[(0, 8)]);
+        let (n, b, why) = c.demote_walk(&m.path, 3.0);
+        assert_eq!((n, b, why), (1, 4, 3));
+        // Accessed after the lookup -> stop "access", nothing flagged.
+        let mut c2 = TwoTierRadix::new(0, 1000);
+        c2.insert(&[(0, 8)], 1.0, false);
+        let m = c2.match_peek(&[(0, 8)]);
+        c2.match_local(&[(0, 8)], 5.0);
+        assert_eq!(c2.demote_walk(&m.path, 4.0).2, 4);
+        // Deepest leased node with children -> stop "children".
+        let mut c3 = TwoTierRadix::new(0, 1000);
+        c3.insert(&[(0, 8)], 1.0, false);
+        c3.insert(&[(0, 8), (100, 4)], 1.5, false);
+        let m = c3.match_peek(&[(0, 8)]);
+        assert_eq!(c3.demote_walk(&m.path, 2.0).2, 2);
+        // A lease ending inside a node -> "no_node".
+        let m = c3.match_peek(&[(0, 8), (100, 2)]);
+        assert_eq!(c3.demote_walk(&m.path, 2.0).2, 0);
+        // No branch: the whole chain up to the root is flagged.
+        let mut c4 = TwoTierRadix::new(0, 1000);
+        c4.insert(&[(0, 8)], 1.0, false);
+        let m = c4.match_peek(&[(0, 8)]);
+        let (n, b, why) = c4.demote_walk(&m.path, 2.0);
+        assert_eq!((n, b, why), (1, 8, 5));
+        // A later insert walk (touch) clears the flag.
+        c4.insert(&[(0, 8)], 3.0, false);
+        assert_eq!(c4.stats.demote_cleared_blocks, 8);
+    }
+
+    #[test]
+    fn host_lock_blocks_host_eviction_but_not_device_eviction() {
+        let mut c = TwoTierRadix::new(4, 8);
+        let p = c.insert(&runs(0, 4), 1.0, false);
+        c.host_lock(p.last().copied(), 1);
+        c.insert(&runs(10, 4), 2.0, false); // device over cap -> chain 0 demoted to host-only
+        c.check().unwrap();
+        assert_eq!(c.match_peek(&runs(0, 4)).dev, 0, "host lock does not pin the device copy");
+        c.insert(&runs(20, 4), 3.0, false); // host over cap -> chain 10 (unlocked) goes, chain 0 stays
+        c.check().unwrap();
+        assert_eq!(c.match_peek(&runs(0, 4)).total(), 4);
+        c.host_lock(p.last().copied(), -1);
+        c.insert(&runs(30, 4), 4.0, false);
+        c.check().unwrap();
+        assert_eq!(c.match_peek(&runs(0, 4)).total(), 0);
     }
 
     #[test]
