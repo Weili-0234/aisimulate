@@ -150,6 +150,15 @@ pub struct SimConfig {
     /// false = v2. Flags only for A/B diagnosis; defaults = engine behavior.
     pub demote_relocate: bool,
     pub split_refresh: bool,
+    /// co_schedule workload signal: "ledger" (cs4 as run on GPU: charge = prompt - expected hit,
+    /// kept in full from dispatch to the P response) or "true" (idealized live backlog: charges of
+    /// requests in the P waiting queue + not-yet-computed uncached tokens of admitted prefills;
+    /// bootstrap queue, computed chunk tokens and the KV-transfer tail excluded; no poll lag).
+    pub cs_workload: String,
+    /// R3 pull penalty: detour iff saved > margin + pulled_est x (rho + lambda), pulled_est = owner
+    /// hit - alternative's own hit. lambda < 0 = off.
+    pub cs_r3_lambda: f64,
+    pub cs_r3_rho: f64,
     /// Owner lease budget (64 GiB at 2,912,256 B per 64-token page = 1.51 M tokens).
     pub lease_budget_tokens: u64,
     /// Leases pin the source tree nodes (false = engine behavior: eviction is lease-blind).
@@ -235,6 +244,9 @@ impl Default for SimConfig {
             guard_examine: true,
             demote_relocate: true,
             split_refresh: true,
+            cs_workload: "ledger".into(),
+            cs_r3_lambda: -1.0,
+            cs_r3_rho: 0.10,
             lease_budget_tokens: 1_510_000,
             lease_pins: false,
             jit_lead_tokens: 131_072,
@@ -358,6 +370,9 @@ struct Req {
     qp_seq: u64,
     qp_retry: u64,
     qp_noarrive: u64,
+    /// P holding >= 50 % / >= 90 % of the prompt at the routing decision (device + host).
+    copies50: u8,
+    copies90: u8,
     unc_est: u64,
     ideal: u64,
     // routing / gap cause
@@ -434,6 +449,8 @@ struct PW {
     pass_n: u64,
     qp_next: u64,
     bq: Vec<u32>,
+    /// Admitted requests whose prefill is not done (first chunk .. prefill done).
+    pf_set: Vec<u32>,
     /// Open idle segment (start, class) and idle seconds in the window by class
     /// [no queued work, only bootstrap-queue work (D allocation pending), waiting work all held].
     idle_since: Option<(f64, u8)>,
@@ -586,6 +603,27 @@ pub struct SimReport {
     /// End-of-run invariant audit per P: [radix check errors, nodes whose lock count differs from
     /// the live holders, nodes whose host-lock count differs, live nodes].
     pub per_p_audit: Vec<[u64; 4]>,
+    /// User-matrix metrics (scored rows). TPOT = (E2E - TTFT) / (output - 1), output > 1: p50 / p99.
+    pub tpot: [f64; 2],
+    pub uncached_per_req: f64,
+    /// Hit distributions [mean, weighted mean, p5, p10, p15, p20, p25, p30, p50, p75] (type-7
+    /// percentiles): actual = A / prompt (weighted = sumA / sum prompt), ideal = I / prompt,
+    /// ratio = A / I over rows with I > 0 (weighted by prompt).
+    pub hit_dist_actual: [f64; 10],
+    pub hit_dist_ideal: [f64; 10],
+    pub hit_dist_ratio: [f64; 10],
+    /// Rerouted (detour) share of scored rows; per session reroutes per 10 requests [p50, mean].
+    pub rerouted_share: f64,
+    pub reroutes_per10_session: [f64; 2],
+    /// Distinct P serving the session in the last 120 s / 300 s at each scored request [mean, p50].
+    pub distinct_p_w120: [f64; 2],
+    pub distinct_p_w300: [f64; 2],
+    /// P with >= 50 % / >= 90 % of the prompt at the decision: mean, share of rows with >= 2.
+    pub copies50: [f64; 2],
+    pub copies90: [f64; 2],
+    /// P queue wait (waiting queue -> first forward) p50 / p95; D wait p50 / p95.
+    pub p_queue_pct: [f64; 2],
+    pub d_wait_pct: [f64; 2],
     pub lookup_miss_all: u64,
     pub lease_refused_all: u64,
     pub repulls_all: u64,
@@ -717,6 +755,7 @@ impl<'a> Sim<'a> {
                 pass_n: 0,
                 qp_next: 0,
                 bq: Vec::new(),
+                pf_set: Vec::new(),
                 idle_since: None,
                 idle_win: [0.0; 3],
             });
@@ -1142,6 +1181,30 @@ impl<'a> Sim<'a> {
     }
 
     // ------------------------------------------------------------------------------ router
+    /// Idealized live backlog of P `w` (cs_workload = "true"): router charges of the requests in the
+    /// waiting queue (past bootstrap, prefill not started) + not-yet-computed uncached tokens of the
+    /// admitted prefills.
+    fn true_backlog(&self, w: usize) -> u64 {
+        let p = &self.p[w];
+        let wait: u64 = p
+            .wq
+            .iter()
+            .map(|&r| {
+                let rq = &self.reqs[r as usize];
+                rq.cs_cost.unwrap_or(rq.unc_est)
+            })
+            .sum();
+        let run: u64 = p
+            .pf_set
+            .iter()
+            .map(|&r| {
+                let rq = &self.reqs[r as usize];
+                rq.unc.saturating_sub(rq.computed)
+            })
+            .sum();
+        wait + run
+    }
+
     fn backlog_of(p: &PW, reqs: &[Req]) -> u64 {
         let mut s: u64 = p.wq.iter().map(|&r| reqs[r as usize].unc_est).sum();
         if let Some(r) = p.chunked {
@@ -1265,7 +1328,11 @@ impl<'a> Sim<'a> {
                     let hs = hint[w].map(|(_, h)| h).unwrap_or(0);
                     exp[w] = local[w].max(hs).min(l);
                 }
-                let pend: Vec<u64> = self.p.iter().map(|p| p.cs_pending).collect();
+                let pend: Vec<u64> = if self.c.cs_workload == "true" {
+                    (0..np).map(|w| self.true_backlog(w)).collect()
+                } else {
+                    self.p.iter().map(|p| p.cs_pending).collect()
+                };
                 let act: Vec<u64> = self.p.iter().map(|p| p.cs_active).collect();
                 let after: Vec<u64> = (0..np).map(|w| pend[w] + (l - exp[w])).collect();
                 own = (0..np)
@@ -1281,7 +1348,12 @@ impl<'a> Sim<'a> {
                     })
                     .unwrap();
                 let saved = after[own].saturating_sub(after[least]);
-                tgt = if saved > self.c.cs_margin_tokens { least } else { own };
+                let mut thr = self.c.cs_margin_tokens as f64;
+                if self.c.cs_r3_lambda >= 0.0 {
+                    let pulled_est = local[own].saturating_sub(local[least]) as f64;
+                    thr += pulled_est * (self.c.cs_r3_rho + self.c.cs_r3_lambda);
+                }
+                tgt = if saved as f64 > thr { least } else { own };
                 let cost = l - exp[tgt];
                 self.p[tgt].cs_pending += cost;
                 self.p[tgt].cs_active += 1;
@@ -1329,7 +1401,11 @@ impl<'a> Sim<'a> {
                 own = tgt;
             }
         }
+        let c50 = hits.iter().filter(|&&h| 2 * h >= pt && h > 0).count() as u8;
+        let c90 = hits.iter().filter(|&&h| 10 * h >= 9 * pt && h > 0).count() as u8;
         let rq = &mut self.reqs[r as usize];
+        rq.copies50 = c50;
+        rq.copies90 = c90;
         rq.p = tgt as u16;
         rq.owner = own as u16;
         rq.detour = tgt != own && hits[own] > 0;
@@ -1855,6 +1931,7 @@ impl<'a> Sim<'a> {
             let frac = if host + stor > 0 { (cap / (host + stor) as f64).min(1.0) } else { 0.0 };
             lb -= self.c.lb_hidden * frac * lb;
         }
+        self.p[p].pf_set.push(r);
         let rq = &mut self.reqs[r as usize];
         rq.locked = deep;
         rq.dev = dev;
@@ -2020,6 +2097,9 @@ impl<'a> Sim<'a> {
 
     fn prefill_done(&mut self, t: f64, p: usize, r: u32) {
         self.reqs[r as usize].t_pd = Some(t);
+        if let Some(i) = self.p[p].pf_set.iter().position(|&x| x == r) {
+            self.p[p].pf_set.swap_remove(i);
+        }
         if self.reqs[r as usize].nin_held && self.c.smg_load_release == "prefill_done" {
             self.reqs[r as usize].nin_held = false;
             self.p[p].nin -= 1;
@@ -2267,6 +2347,112 @@ impl<'a> Sim<'a> {
             rep.e2e[1] = percentile_in_place(&mut e2e, 99.0);
         }
         rep.p_queue_mean = sum(&|r| r.t_fwd.unwrap() - r.p_ready.unwrap_or(r.t_fwd.unwrap())) / n;
+        {
+            // ---- user-matrix metrics (output only)
+            fn pct7(v: &mut Vec<f64>, q: f64) -> f64 {
+                if v.is_empty() {
+                    return 0.0;
+                }
+                v.sort_by(|a, b| a.total_cmp(b));
+                let h = (v.len() - 1) as f64 * q;
+                let lo_i = h.floor() as usize;
+                let hi_i = (lo_i + 1).min(v.len() - 1);
+                v[lo_i] + (v[hi_i] - v[lo_i]) * (h - lo_i as f64)
+            }
+            let qs = [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.50, 0.75];
+            let mut tp: Vec<f64> = cmp
+                .iter()
+                .filter(|r| r.ct > 1)
+                .map(|r| (r.done.unwrap() - r.first.unwrap()) / (r.ct - 1) as f64)
+                .collect();
+            rep.tpot = [pct7(&mut tp, 0.50), pct7(&mut tp, 0.99)];
+            rep.uncached_per_req = sum(&|r| (r.pt as f64 - actual(r)).max(0.0)) / n;
+            let fill = |vals: Vec<(f64, f64)>, out: &mut [f64; 10]| {
+                // (value, weight)
+                if vals.is_empty() {
+                    return;
+                }
+                let m = vals.iter().map(|x| x.0).sum::<f64>() / vals.len() as f64;
+                let wsum: f64 = vals.iter().map(|x| x.1).sum();
+                let wm = if wsum > 0.0 { vals.iter().map(|x| x.0 * x.1).sum::<f64>() / wsum } else { 0.0 };
+                let mut v: Vec<f64> = vals.iter().map(|x| x.0).collect();
+                out[0] = m;
+                out[1] = wm;
+                for (k, q) in qs.iter().enumerate() {
+                    out[2 + k] = pct7(&mut v, *q);
+                }
+            };
+            let mut o = [0.0; 10];
+            fill(cmp.iter().map(|r| (actual(r) / r.pt.max(1) as f64, r.pt as f64)).collect(), &mut o);
+            rep.hit_dist_actual = o;
+            let mut o = [0.0; 10];
+            fill(cmp.iter().map(|r| (r.ideal.min(r.pt) as f64 / r.pt.max(1) as f64, r.pt as f64)).collect(), &mut o);
+            rep.hit_dist_ideal = o;
+            let mut o = [0.0; 10];
+            fill(
+                cmp.iter().filter(|r| r.ideal > 0).map(|r| (actual(r) / r.ideal.min(r.pt) as f64, r.pt as f64)).collect(),
+                &mut o,
+            );
+            rep.hit_dist_ratio = o;
+            rep.rerouted_share = cmp.iter().filter(|r| r.detour).count() as f64 / n;
+            let mut per: FxHashMap<u32, (u32, u32)> = FxHashMap::default();
+            for r in &cmp {
+                let e = per.entry(r.task).or_insert((0, 0));
+                e.0 += 1;
+                if r.detour {
+                    e.1 += 1;
+                }
+            }
+            let mut v: Vec<f64> = per.values().map(|&(a, b)| 10.0 * b as f64 / a as f64).collect();
+            let mean = if v.is_empty() { 0.0 } else { v.iter().sum::<f64>() / v.len() as f64 };
+            rep.reroutes_per10_session = [pct7(&mut v, 0.50), mean];
+            // Distinct P per session over the last w seconds (all non-warm requests of the session).
+            let mut by_task: FxHashMap<u32, Vec<(f64, u16)>> = FxHashMap::default();
+            for r in self.reqs.iter().filter(|r| !r.warm) {
+                by_task.entry(r.task).or_default().push((r.admit, r.p));
+            }
+            for v in by_task.values_mut() {
+                v.sort_by(|a, b| a.0.total_cmp(&b.0));
+            }
+            for (wi, wsec) in [120.0f64, 300.0].iter().enumerate() {
+                let mut d: Vec<f64> = Vec::new();
+                for r in &cmp {
+                    let v = &by_task[&r.task];
+                    let mut seen = [false; 64];
+                    let mut k = 0u32;
+                    for &(a, pp) in v.iter() {
+                        if a > r.admit {
+                            break;
+                        }
+                        if a > r.admit - wsec && !seen[pp as usize % 64] {
+                            seen[pp as usize % 64] = true;
+                            k += 1;
+                        }
+                    }
+                    d.push(k as f64);
+                }
+                let mean = if d.is_empty() { 0.0 } else { d.iter().sum::<f64>() / d.len() as f64 };
+                let p50 = pct7(&mut d, 0.50);
+                if wi == 0 {
+                    rep.distinct_p_w120 = [mean, p50];
+                } else {
+                    rep.distinct_p_w300 = [mean, p50];
+                }
+            }
+            rep.copies50 = [
+                sum(&|r| r.copies50 as f64) / n,
+                cmp.iter().filter(|r| r.copies50 >= 2).count() as f64 / n,
+            ];
+            rep.copies90 = [
+                sum(&|r| r.copies90 as f64) / n,
+                cmp.iter().filter(|r| r.copies90 >= 2).count() as f64 / n,
+            ];
+            let mut pq: Vec<f64> =
+                cmp.iter().map(|r| r.t_fwd.unwrap() - r.p_ready.unwrap_or(r.t_fwd.unwrap())).collect();
+            rep.p_queue_pct = [pct7(&mut pq, 0.50), pct7(&mut pq, 0.95)];
+            let mut dw: Vec<f64> = cmp.iter().map(|r| r.t_alloc.unwrap_or(r.d_recv) - r.d_recv).collect();
+            rep.d_wait_pct = [pct7(&mut dw, 0.50), pct7(&mut dw, 0.95)];
+        }
         rep.d_wait_mean = sum(&|r| r.t_alloc.unwrap_or(r.d_recv) - r.d_recv) / n;
         rep.prefill_mean = sum(&|r| r.t_pd.unwrap() - r.t_fwd.unwrap()) / n;
         rep.decode_mean = sum(&|r| r.done.unwrap() - r.first.unwrap()) / n;
