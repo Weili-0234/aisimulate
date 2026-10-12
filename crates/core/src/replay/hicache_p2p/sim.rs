@@ -217,6 +217,44 @@ pub struct SimConfig {
     /// are still skipped, the continuing chunk still goes first.
     pub p_queue_order: String,
     pub sjf_aging_tok_per_s: f64,
+    /// Late D (PR #39 data plane; SWEEP-LATED 2026-10-12). "d0" = today (D picked at arrival, D KV
+    /// reserved at bootstrap before the P waiting queue). "alloc" = D picked at arrival, its KV is
+    /// allocated at the bind (lead window) instead. "choose" = D picked at the bind by d_bind_rule
+    /// ("po2": power of two on the polled token snapshot; "d1": fewest in-flight tokens, router
+    /// counter) with the KV allocated at the bind. Defaults keep every older arm.
+    pub d_mode: String,
+    pub d_bind_rule: String,
+    /// P binder, lead mode "work" (late_d.py @e126b456d4 :1510-1593, 1700-1827, 1941-1974): late rooms
+    /// wait in P's bootstrap queue; once per P pass (and when a room turns bindable or an ADMIT turns
+    /// HELD) unbound rooms with an INTENT are scanned in arrival order and bound while the window is
+    /// open: chunk_left <= target, A < ld_lead_max_reqs, and (A < ld_lead_min_reqs or chunk_left +
+    /// T x (1 - hit) < target). A = bound requests in the waiting queue + decisions younger than
+    /// hold_s; T = their prompt tokens; target = need_iters x chunk; need_iters = clamp(ceil(T_bind /
+    /// T_iter) + margin + boost, 1, ld_need_iters_cap); T_bind = EWMA(decision -> bootstrap done,
+    /// samples clipped at 2 s) + 2 x EWMA |dev|; T_iter = EWMA of back-to-back busy passes; hit = EWMA
+    /// cached / prompt at launch; hold_s = max(ld_hold_detect_s, min(T_bind, 2 s)). Boost +1 per
+    /// starved pass (no runnable request, bindable rooms waiting), -1 after ld_starve_decay calm
+    /// passes, cap 6. Rule 4: a D with >= ld_max_outstanding_per_d outstanding binds from this P
+    /// (decided, not bound) is not eligible; a room without an eligible D is skipped.
+    pub ld_lead_margin_iters: u32,
+    pub ld_lead_min_reqs: u32,
+    pub ld_lead_max_reqs: u32,
+    pub ld_need_iters_cap: u32,
+    pub ld_max_outstanding_per_d: u32,
+    pub ld_ewma_alpha: f64,
+    pub ld_hold_detect_s: f64,
+    pub ld_starve_decay: u32,
+    /// Latencies: decision -> ADMIT processed at D (choose: + router round trip), D allocation ->
+    /// bootstrap done on P (metadata + P poll).
+    pub ld_admit_latency_s: f64,
+    pub ld_choose_latency_s: f64,
+    pub ld_meta_latency_s: f64,
+    /// D admission of late entries: first fit in ADMIT order (a failed budget check skips); the
+    /// oldest entry held >= ld_claim_passes D passes (at step_ref_ms each) becomes the claim, and
+    /// others allocate only if free - claim need >= need.
+    pub ld_claim_passes: u32,
+    /// D step overhead per held entry and per DEFERRED leg (ms per decode step; 0 = off).
+    pub ld_held_scan_ms: f64,
     /// IDEAL bound (oracle, not an engine path): one two-tier pool shared by all P (device and host
     /// capacity = n_p x the per-P sizes; every P reads it at local cost: no duplicate copies, no
     /// pulls, no transfer time). Requires p_policy "ideal_eft" (no pulls) and fix 3 off.
@@ -333,6 +371,21 @@ impl Default for SimConfig {
             cs_eft_max_pull_tokens: 0,
             p_queue_order: "fcfs".into(),
             sjf_aging_tok_per_s: 8192.0,
+            d_mode: "d0".into(),
+            d_bind_rule: "po2".into(),
+            ld_lead_margin_iters: 1,
+            ld_lead_min_reqs: 2,
+            ld_lead_max_reqs: 8,
+            ld_need_iters_cap: 8,
+            ld_max_outstanding_per_d: 4,
+            ld_ewma_alpha: 0.2,
+            ld_hold_detect_s: 0.2,
+            ld_starve_decay: 50,
+            ld_admit_latency_s: 0.02,
+            ld_choose_latency_s: 0.015,
+            ld_meta_latency_s: 0.03,
+            ld_claim_passes: 20,
+            ld_held_scan_ms: 0.0,
             shared_pool: false,
             ideal_backlog: "true".into(),
             lease_budget_tokens: 1_510_000,
@@ -369,6 +422,11 @@ enum Ev {
     WinMark(bool),
     /// E1 deferred demote due (pending-demote id).
     DemoteDue(u64),
+    /// Late D: the ADMIT reached the D (allocation attempt); the D metadata reached P (bound).
+    LdAlloc(u32),
+    LdBound(u32),
+    /// Late D: re-run P's binder (an ADMIT stops counting in the window after hold_s).
+    LdTick(u16),
 }
 
 struct Item {
@@ -479,6 +537,13 @@ struct Req {
     cs_cost: Option<u64>,
     d_counted: bool,
     pa_on: bool,
+    /// Late D: bindable (INTENT and sender ready) since, bind decision time, ADMIT at D, bootstrap
+    /// done (entered the waiting queue), router in-flight tokens charged (d1 rule).
+    ld_bindable_t: Option<f64>,
+    ld_bind_t: Option<f64>,
+    ld_held_since: Option<f64>,
+    ld_bound_t: Option<f64>,
+    ld_inflight: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -546,6 +611,17 @@ struct PW {
     /// [no queued work, only bootstrap-queue work (D allocation pending), waiting work all held].
     idle_since: Option<(f64, u8)>,
     idle_win: [f64; 3],
+    /// Late-D binder state: EWMA prefix-hit ratio, T_bind mean / |dev|, T_iter, starvation boost and
+    /// calm-pass count, rooms with a decision but not bound yet, outstanding binds per D.
+    ld_hit: f64,
+    ld_tb: f64,
+    ld_tb_dev: f64,
+    ld_ti: f64,
+    ld_boost: u32,
+    ld_calm: u32,
+    ld_sent: Vec<u32>,
+    ld_out: Vec<u32>,
+    ld_last_end: f64,
 }
 
 struct DW {
@@ -564,6 +640,11 @@ struct DW {
     hseq: u64,
     ib: f64,
     ib_inv: f64,
+    /// Late D: bound requests waiting for KV memory (bind order) with their arrival time at D (f64
+    /// bits); router in-flight tokens (d1 rule); legs registered without KV (choose: all candidates).
+    held: VecDeque<(u32, u64)>,
+    inflight_tok: u64,
+    legs: i64,
 }
 
 /// Aggregate output.
@@ -753,6 +834,12 @@ pub struct SimReport {
     pub uncached_tokens_scored: u64,
     pub output_tokens_scored: u64,
     pub eft_counts: [u64; 4],
+    /// Late D (scored rows): held at D = ADMIT at D -> allocation [mean, p50, p95, p99] s (engine
+    /// late_d_held_duration); share held > 0.1 s; means of [D receipt -> ADMIT at D (engine
+    /// late_d_deferred_duration), P bindable -> bind decision, bind decision -> bootstrap done].
+    pub ld_held: [f64; 4],
+    pub ld_held_share: f64,
+    pub ld_waits: [f64; 3],
     pub wall_s: f64,
 }
 
@@ -786,6 +873,8 @@ pub struct Row {
     pub d_wait: f64,
     pub prefill_s: f64,
     pub decode_s: f64,
+    /// Late D: held at D = ADMIT at D -> allocation (s; -1 = no bind).
+    pub d_held: f64,
 }
 
 pub struct Sim<'a> {
@@ -958,6 +1047,15 @@ impl<'a> Sim<'a> {
                 pf_set: Vec::new(),
                 idle_since: None,
                 idle_win: [0.0; 3],
+                ld_hit: 0.9,
+                ld_tb: -1.0,
+                ld_tb_dev: 0.0,
+                ld_ti: -1.0,
+                ld_boost: 0,
+                ld_calm: 0,
+                ld_sent: Vec::new(),
+                ld_out: vec![0; c.n_d],
+                ld_last_end: -1.0,
             });
         }
         if c.shared_pool {
@@ -986,6 +1084,9 @@ impl<'a> Sim<'a> {
                 hseq: 0,
                 ib: 0.0,
                 ib_inv: 0.0,
+                held: VecDeque::new(),
+                inflight_tok: 0,
+                legs: 0,
             })
             .collect();
         // Router-side trees (SMG cache_aware) keep their calibrated split behavior (no refresh).
@@ -1146,9 +1247,19 @@ impl<'a> Sim<'a> {
                 Ev::Route(r) => self.route(t, r),
                 Ev::PRecv(r) => self.on_p_recv(t, r),
                 Ev::DRecv(r) => {
-                    let d = self.reqs[r as usize].d as usize;
-                    self.d[d].fifo.push_back(r);
-                    self.d_try_admit(t, d);
+                    if self.c.d_mode == "d0" {
+                        let d = self.reqs[r as usize].d as usize;
+                        self.d[d].fifo.push_back(r);
+                        self.d_try_admit(t, d);
+                    } else {
+                        self.ld_register(r);
+                    }
+                }
+                Ev::LdAlloc(r) => self.ld_alloc(t, r),
+                Ev::LdBound(r) => self.ld_bound(t, r),
+                Ev::LdTick(p) => {
+                    self.ld_binder(t, p as usize);
+                    self.p_idle_update(t, p as usize);
                 }
                 Ev::PReady(r) => self.p_ready(t, r),
                 Ev::PullDone(r) => self.pull_done(t, r),
@@ -1172,7 +1283,8 @@ impl<'a> Sim<'a> {
                 Ev::DLoadTick => {
                     for d in &mut self.d {
                         let q: u64 = d.fifo.iter().map(|&r| self.reqs[r as usize].need).sum();
-                        d.load_snap = (d.used + q) as i64;
+                        let h: u64 = d.held.iter().map(|&(r, _)| self.reqs[r as usize].need).sum();
+                        d.load_snap = (d.used + q + h) as i64;
                     }
                     if t < self.c.duration_s {
                         let dt = self.c.d_load_refresh_s;
@@ -1487,7 +1599,9 @@ impl<'a> Sim<'a> {
 
     fn route(&mut self, t: f64, r: u32) {
         self.pick_p(t, r);
-        self.pick_d(r);
+        if self.c.d_mode != "choose" {
+            self.pick_d(r);
+        }
         if self.c.pull_at_route && self.c.pull_enabled && self.reqs[r as usize].pull_src.is_some() {
             // O3: the pull starts at the routing decision (oracle, no JIT deferral).
             self.start_pull(t, r);
@@ -1892,7 +2006,265 @@ impl<'a> Sim<'a> {
             self.reqs[r as usize].pa_on = false;
             self.d[d].used -= self.reqs[r as usize].need;
         }
-        self.d_try_admit(t, d);
+        if self.reqs[r as usize].ld_inflight > 0 {
+            self.d[d].inflight_tok = self.d[d].inflight_tok.saturating_sub(self.reqs[r as usize].ld_inflight);
+            self.reqs[r as usize].ld_inflight = 0;
+        }
+        if self.c.d_mode == "d0" {
+            self.d_try_admit(t, d);
+        } else {
+            self.ld_try_held(t, d);
+        }
+    }
+
+    // ------------------------------------------------------------------------------ late D (PR #39)
+    /// Late D: the request's leg(s) reach D without KV (alloc: the arrival D; choose: every D).
+    fn ld_register(&mut self, r: u32) {
+        if self.reqs[r as usize].ld_bind_t.is_some() {
+            return; // already bound (bind can precede the D receipt in time)
+        }
+        if self.c.d_mode == "choose" {
+            for d in &mut self.d {
+                d.legs += 1;
+            }
+        } else {
+            let d = self.reqs[r as usize].d as usize;
+            self.d[d].legs += 1;
+        }
+    }
+
+    /// D choice at the bind (choose mode) among the eligible candidates (rule 4 headroom; SMG
+    /// late_bind.rs pick_among): "po2" = two distinct uniform draws, lower polled load (bound view,
+    /// 5-s snapshot), tie -> first draw; "d1" = fewest charged in-flight tokens, ties -> fewer charged
+    /// requests, then index (min_inflight_tokens.rs :250-272).
+    fn ld_choose(&mut self, elig: &[usize]) -> usize {
+        match self.c.d_bind_rule.as_str() {
+            "d1" => *elig.iter().min_by_key(|&&k| (self.d[k].inflight_tok, self.d[k].nreq, k)).unwrap(),
+            _ => {
+                if elig.len() == 1 {
+                    return elig[0];
+                }
+                let n = elig.len();
+                let ii = self.urange(n);
+                let mut jj = self.urange(n - 1);
+                if jj >= ii {
+                    jj += 1;
+                }
+                let (i, j) = (elig[ii], elig[jj]);
+                if self.d[i].load_snap <= self.d[j].load_snap { i } else { j }
+            }
+        }
+    }
+
+    /// Eligible D for a bind from P `p`: alloc mode = the arrival D if under the outstanding cap;
+    /// choose mode = every D under the cap (all D hold an INTENT once the room is bindable).
+    fn ld_eligible(&self, p: usize, r: u32) -> Vec<usize> {
+        let cap = self.c.ld_max_outstanding_per_d;
+        if self.c.d_mode == "choose" {
+            (0..self.d.len()).filter(|&k| self.p[p].ld_out[k] < cap).collect()
+        } else {
+            let d = self.reqs[r as usize].d as usize;
+            if self.p[p].ld_out[d] < cap { vec![d] } else { Vec::new() }
+        }
+    }
+
+    /// Bind decision (binder): choose the D among `elig` (choose mode: d_bind_rule; the other legs
+    /// are released), charge the router in-flight counter (input + min(max_tokens, 8192) = need, d1
+    /// ledger), send the ADMIT (arrives after ld_admit_latency_s, + ld_choose_latency_s in choose
+    /// mode, not before the D leg), and re-run the binder when the decision stops counting (hold_s).
+    fn ld_bind(&mut self, t: f64, r: u32, elig: &[usize]) {
+        if self.reqs[r as usize].ld_bind_t.is_some() || self.c.d_mode == "d0" || elig.is_empty() {
+            return;
+        }
+        self.reqs[r as usize].ld_bind_t = Some(t);
+        let registered = self.reqs[r as usize].d_recv <= t;
+        let mut lat = self.c.ld_admit_latency_s;
+        if self.c.d_mode == "choose" {
+            lat += self.c.ld_choose_latency_s;
+            let d = self.ld_choose(elig);
+            self.reqs[r as usize].d = d as u16;
+            self.reqs[r as usize].d_counted = true;
+            self.d[d].nreq += 1;
+            if registered {
+                for dw in &mut self.d {
+                    dw.legs -= 1;
+                }
+            }
+        } else if registered {
+            let d = self.reqs[r as usize].d as usize;
+            self.d[d].legs -= 1;
+        }
+        let d = self.reqs[r as usize].d as usize;
+        let p = self.reqs[r as usize].p as usize;
+        let it = self.reqs[r as usize].need;
+        self.reqs[r as usize].ld_inflight = it;
+        self.d[d].inflight_tok += it;
+        self.p[p].ld_sent.push(r);
+        self.p[p].ld_out[d] += 1;
+        let at = (t + lat).max(self.reqs[r as usize].d_recv);
+        self.at(at, Ev::LdAlloc(r));
+        let hold = self.ld_hold_s(p);
+        self.at(t + hold + 1e-6, Ev::LdTick(p as u16));
+    }
+
+    /// Binder's T_bind estimate (EWMA + 2 |dev|; before any sample: none) and hold_s.
+    fn ld_tbind(&self, p: usize) -> Option<f64> {
+        let pw = &self.p[p];
+        if pw.ld_tb < 0.0 { None } else { Some(pw.ld_tb + 2.0 * pw.ld_tb_dev) }
+    }
+
+    fn ld_hold_s(&self, p: usize) -> f64 {
+        let tb = self.ld_tbind(p).unwrap_or(0.0);
+        self.c.ld_hold_detect_s.max(tb.min(2.0))
+    }
+
+    /// The ADMIT reaches D: queue the entry (ADMIT order) and run the late admission walk.
+    fn ld_alloc(&mut self, t: f64, r: u32) {
+        if self.reqs[r as usize].cancel {
+            return;
+        }
+        let d = self.reqs[r as usize].d as usize;
+        self.reqs[r as usize].ld_held_since = Some(t);
+        self.d[d].held.push_back((r, t.to_bits()));
+        self.ld_try_held(t, d);
+    }
+
+    /// D late admission walk (DESIGN 5.6): entries in ADMIT order; a failed budget check skips to
+    /// the next entry; the oldest entry held >= ld_claim_passes D passes is the claim, and while it
+    /// waits another entry allocates only if free - claim need >= need.
+    fn ld_try_held(&mut self, t: f64, d: usize) {
+        let claim_s = self.c.ld_claim_passes as f64 * self.c.step_ref_ms / 1e3;
+        let mut claim_need = 0u64;
+        let mut i = 0usize;
+        while i < self.d[d].held.len() {
+            let (r, t0) = self.d[d].held[i];
+            if self.reqs[r as usize].cancel {
+                self.d[d].held.remove(i);
+                continue;
+            }
+            let need = self.reqs[r as usize].need;
+            let free = self.d[d].cap.saturating_sub(self.d[d].used);
+            let fits = if claim_need > 0 {
+                free >= claim_need.saturating_add(need)
+            } else {
+                need <= free || self.d[d].used == 0
+            };
+            if fits {
+                self.d[d].held.remove(i);
+                self.d[d].used += need;
+                self.reqs[r as usize].t_alloc = Some(t);
+                self.reqs[r as usize].pa_on = true;
+                self.at(t + self.c.ld_meta_latency_s, Ev::LdBound(r));
+                continue;
+            }
+            if i == 0 && claim_s >= 0.0 && t - f64::from_bits(t0) >= claim_s {
+                claim_need = need;
+            }
+            i += 1;
+        }
+    }
+
+    /// D metadata reached P: bootstrap done, the room leaves the bootstrap queue for the waiting
+    /// queue; the binder's T_bind estimate is updated.
+    fn ld_bound(&mut self, t: f64, r: u32) {
+        let p = self.reqs[r as usize].p as usize;
+        let d = self.reqs[r as usize].d as usize;
+        self.reqs[r as usize].ld_bound_t = Some(t);
+        if let Some(i) = self.p[p].ld_sent.iter().position(|&x| x == r) {
+            self.p[p].ld_sent.swap_remove(i);
+        }
+        self.p[p].ld_out[d] = self.p[p].ld_out[d].saturating_sub(1);
+        if let Some(b) = self.reqs[r as usize].ld_bind_t {
+            let a = self.c.ld_ewma_alpha;
+            let x = (t - b).min(2.0);
+            let pw = &mut self.p[p];
+            if pw.ld_tb < 0.0 {
+                pw.ld_tb = x;
+            } else {
+                pw.ld_tb_dev = (1.0 - a) * pw.ld_tb_dev + a * (x - pw.ld_tb).abs();
+                pw.ld_tb = (1.0 - a) * pw.ld_tb + a * x;
+            }
+        }
+        self.p_enter_wq(t, r);
+    }
+
+    /// P binder, lead mode "work" (see SimConfig::ld_lead_margin_iters): runs once per P pass, when a
+    /// room becomes bindable and when a decision stops counting (LdTick); binds bindable unbound
+    /// bootstrap-queue rooms in arrival order while the window is open.
+    fn ld_binder(&mut self, t: f64, p: usize) {
+        if self.c.d_mode == "d0" {
+            return;
+        }
+        let ch = self.c.chunk_tokens;
+        let need_iters = match (self.ld_tbind(p), self.p[p].ld_ti) {
+            (Some(tb), ti) if ti > 0.0 => {
+                ((tb / ti).ceil() as u32 + self.c.ld_lead_margin_iters + self.p[p].ld_boost).clamp(1, self.c.ld_need_iters_cap)
+            }
+            _ => (2 + self.p[p].ld_boost).min(self.c.ld_need_iters_cap),
+        };
+        let target = need_iters as u64 * ch;
+        let hold = self.ld_hold_s(p);
+        let hit = self.p[p].ld_hit;
+        let chunk_left: u64 = self.p[p].chunked.map(|c| {
+            let rq = &self.reqs[c as usize];
+            rq.unc.saturating_sub(rq.sched)
+        }).unwrap_or(0);
+        if chunk_left > target {
+            return;
+        }
+        let mut a: u32 = 0;
+        let mut tt: u64 = 0;
+        for &r in self.p[p].wq.iter() {
+            a += 1;
+            tt += self.reqs[r as usize].pt;
+        }
+        for &r in self.p[p].ld_sent.iter() {
+            let rq = &self.reqs[r as usize];
+            if rq.ld_bind_t.map(|b| t - b < hold).unwrap_or(false) {
+                a += 1;
+                tt += rq.pt;
+            }
+        }
+        let mut cands: Vec<u32> = self.p[p]
+            .bq
+            .iter()
+            .copied()
+            .filter(|&r| {
+                let rq = &self.reqs[r as usize];
+                rq.ld_bindable_t.is_some() && rq.ld_bind_t.is_none() && !rq.cancel
+            })
+            .collect();
+        cands.sort_by_key(|&r| self.reqs[r as usize].qp_seq);
+        for r in cands {
+            let open = a < self.c.ld_lead_max_reqs
+                && (a < self.c.ld_lead_min_reqs || chunk_left as f64 + tt as f64 * (1.0 - hit) < target as f64);
+            if !open {
+                break;
+            }
+            let elig = self.ld_eligible(p, r);
+            if elig.is_empty() {
+                continue; // rule 4: skip the room, try the next one
+            }
+            self.ld_bind(t, r, &elig);
+            a += 1;
+            tt += self.reqs[r as usize].pt;
+        }
+    }
+
+    /// Starvation boost (per P pass): +1 when the pass found no runnable request while bindable
+    /// rooms wait unbound; -1 after ld_starve_decay passes without starvation.
+    fn ld_pass_boost(&mut self, p: usize, starved: bool) {
+        let pw = &mut self.p[p];
+        if starved {
+            pw.ld_boost = (pw.ld_boost + 1).min(6);
+            pw.ld_calm = 0;
+        } else {
+            pw.ld_calm += 1;
+            if pw.ld_calm >= self.c.ld_starve_decay {
+                pw.ld_boost = pw.ld_boost.saturating_sub(1);
+                pw.ld_calm = 0;
+            }
+        }
     }
 
     // ------------------------------------------------------------------------------ P bootstrap / pulls
@@ -1932,7 +2304,7 @@ impl<'a> Sim<'a> {
         if self.c.queued_prefix_protect {
             self.guard_try_arrive(t, p, r, false);
         }
-        if self.reqs[r as usize].t_alloc.is_some() {
+        if self.reqs[r as usize].t_alloc.is_some() || self.c.d_mode != "d0" {
             self.boot_done(t, r);
         }
         self.p_idle_update(t, p);
@@ -2348,7 +2720,8 @@ impl<'a> Sim<'a> {
 
     fn boot_done(&mut self, t: f64, r: u32) {
         let rq = &self.reqs[r as usize];
-        let base = rq.p_recv.max(rq.t_alloc.unwrap_or(t));
+        // D0: after the D allocation; late D: after the D leg (its INTENT) reached the request.
+        let base = if self.c.d_mode == "d0" { rq.p_recv.max(rq.t_alloc.unwrap_or(t)) } else { rq.p_recv.max(rq.d_recv) };
         let hs = self.qdraw(0);
         let rdy = base + if hs.is_nan() { self.c.handshake_s } else { hs.max(0.0) };
         let rdy = rdy.max(t);
@@ -2357,6 +2730,22 @@ impl<'a> Sim<'a> {
     }
 
     fn p_ready(&mut self, t: f64, r: u32) {
+        if self.c.d_mode != "d0" {
+            // Late D: the room is bindable (INTENT and sender ready); it stays in the bootstrap
+            // queue until the binder binds it and D allocates (ld_bound -> p_enter_wq).
+            if self.reqs[r as usize].ld_bindable_t.is_none() {
+                self.reqs[r as usize].ld_bindable_t = Some(t);
+                let p = self.reqs[r as usize].p as usize;
+                self.ld_binder(t, p);
+                self.p_idle_update(t, p);
+            }
+            return;
+        }
+        self.p_enter_wq(t, r);
+    }
+
+    /// Bootstrap done: the request leaves the bootstrap queue for the FCFS waiting queue.
+    fn p_enter_wq(&mut self, t: f64, r: u32) {
         if self.reqs[r as usize].p_ready.is_some() {
             return;
         }
@@ -2475,6 +2864,12 @@ impl<'a> Sim<'a> {
             lb -= self.c.lb_hidden * frac * lb;
         }
         self.p[p].pf_set.push(r);
+        {
+            let a = self.c.ld_ewma_alpha;
+            let h = (dev + host + stor) as f64 / pt.max(1) as f64;
+            let pw = &mut self.p[p];
+            pw.ld_hit = (1.0 - a) * pw.ld_hit + a * h;
+        }
         let rq = &mut self.reqs[r as usize];
         rq.locked = deep;
         rq.dev = dev;
@@ -2490,6 +2885,13 @@ impl<'a> Sim<'a> {
     fn form(&mut self, t: f64, p: usize) -> Option<Vec<BItem>> {
         let res = self.form_batch(t, p);
         self.guard_step(t, p);
+        if self.c.d_mode != "d0" {
+            let waiting = self.p[p].bq.iter().any(|&r| {
+                let rq = &self.reqs[r as usize];
+                rq.ld_bindable_t.is_some() && rq.ld_bind_t.is_none()
+            });
+            self.ld_pass_boost(p, res.is_none() && waiting);
+        }
         res
     }
 
@@ -2525,6 +2927,7 @@ impl<'a> Sim<'a> {
         if self.c.pull_start == "queue" {
             self.jit_scan(t, p);
         }
+        self.ld_binder(t, p);
         let mut idx = 0usize;
         while budget > 0 && idx < self.p[p].wq.len() {
             let r = self.p[p].wq[idx];
@@ -2617,7 +3020,12 @@ impl<'a> Sim<'a> {
 
     fn start_iter(&mut self, t: f64, p: usize, items: Vec<BItem>) {
         let svc = self.iter_secs(p, &items);
+        let a = self.c.ld_ewma_alpha;
         let pw = &mut self.p[p];
+        if pw.ld_last_end >= 0.0 && (t - pw.ld_last_end).abs() < 1e-9 {
+            pw.ld_ti = if pw.ld_ti < 0.0 { svc } else { (1.0 - a) * pw.ld_ti + a * svc };
+        }
+        pw.ld_last_end = t + svc;
         pw.busy_s += svc;
         if t >= self.lo && t < self.hi {
             pw.win_busy += svc;
@@ -2678,6 +3086,11 @@ impl<'a> Sim<'a> {
         let old = self.reqs[r as usize].locked;
         self.p[x].radix.lock(old, -1);
         self.reqs[r as usize].locked = nd;
+        self.kv_send(t, r);
+    }
+
+    /// KV transfer tail to D (LDX-OFF fit + residual table) -> KV arrived.
+    fn kv_send(&mut self, t: f64, r: u32) {
         let pt = self.reqs[r as usize].pt;
         let tr = self.qdraw(4);
         let tail = if tr.is_nan() {
@@ -2744,7 +3157,10 @@ impl<'a> Sim<'a> {
             return;
         };
         let tgt = f64::from_bits(tgt_bits);
-        let step = step_ms(self.d[d].b, self.d[d].s);
+        let mut step = step_ms(self.d[d].b, self.d[d].s);
+        if self.c.ld_held_scan_ms > 0.0 {
+            step += self.c.ld_held_scan_ms * (self.d[d].held.len() as f64 + self.d[d].legs.max(0) as f64);
+        }
         self.d[d].rate = 1.0 / (self.c.tpot_s * step / self.c.step_ref_ms);
         let dt = ((tgt - self.d[d].v) / self.d[d].rate).max(0.0);
         self.at(t + dt, Ev::DecTick(d as u16, ver));
@@ -3372,6 +3788,41 @@ impl<'a> Sim<'a> {
         rep.demote_deferred = [self.dem_deferred[0], self.dem_deferred[1], self.dem_pend.values().map(|v| v.len() as u64).sum()];
         rep.requests_sent = self.reqs.len() as u64;
         rep.eft_counts = self.eft_counts;
+        if self.c.d_mode != "d0" {
+            let mut h: Vec<f64> = cmp
+                .iter()
+                .filter_map(|r| match (r.t_alloc, r.ld_held_since) {
+                    (Some(a), Some(b)) => Some((a - b).max(0.0)),
+                    _ => None,
+                })
+                .collect();
+            if !h.is_empty() {
+                let m = h.iter().sum::<f64>() / h.len() as f64;
+                let share = h.iter().filter(|&&x| x > 0.1).count() as f64 / h.len() as f64;
+                h.sort_by(|a, b| a.total_cmp(b));
+                let q = |v: &Vec<f64>, x: f64| {
+                    let k = ((v.len() - 1) as f64 * x).round() as usize;
+                    v[k.min(v.len() - 1)]
+                };
+                rep.ld_held = [m, q(&h, 0.50), q(&h, 0.95), q(&h, 0.99)];
+                rep.ld_held_share = share;
+            }
+            let avg = |f: &dyn Fn(&Req) -> Option<f64>| {
+                let v: Vec<f64> = cmp.iter().filter_map(|r| f(r)).collect();
+                if v.is_empty() { 0.0 } else { v.iter().sum::<f64>() / v.len() as f64 }
+            };
+            rep.ld_waits = [
+                avg(&|r| r.ld_held_since.map(|a| (a - r.d_recv).max(0.0))),
+                avg(&|r| match (r.ld_bind_t, r.ld_bindable_t) {
+                    (Some(b), Some(a)) => Some((b - a).max(0.0)),
+                    _ => None,
+                }),
+                avg(&|r| match (r.ld_bound_t, r.ld_bind_t) {
+                    (Some(b), Some(a)) => Some((b - a).max(0.0)),
+                    _ => None,
+                }),
+            ];
+        }
         rep.wall_s = wall_s;
         let mut rows = Vec::new();
         if self.c.record_rows {
@@ -3410,6 +3861,10 @@ impl<'a> Sim<'a> {
                     },
                     decode_s: match (r.done, r.first) {
                         (Some(d), Some(f)) => d - f,
+                        _ => -1.0,
+                    },
+                    d_held: match (r.t_alloc, r.ld_held_since) {
+                        (Some(a), Some(b)) => (a - b).max(0.0),
                         _ => -1.0,
                     },
                 });
@@ -3562,6 +4017,156 @@ mod tests {
             assert_eq!(a[..3], [0, 0, 0], "audit {:?}", rep.per_p_audit);
         }
         assert!(rows.iter().filter(|r| r.completed).all(|r| r.p_queue >= 0.0 && r.decode_s >= 0.0));
+    }
+
+    fn ld_invariants(sim: &Sim) {
+        for (k, d) in sim.d.iter().enumerate() {
+            let want: u64 = sim.reqs.iter().filter(|r| r.pa_on && r.d as usize == k).map(|r| r.need).sum();
+            assert_eq!(d.used, want, "D{k} used");
+            let infl: u64 = sim.reqs.iter().filter(|r| r.d as usize == k).map(|r| r.ld_inflight).sum();
+            assert_eq!(d.inflight_tok, infl, "D{k} in-flight tokens");
+            let holders = sim.reqs.iter().filter(|r| r.pa_on && r.d as usize == k).count();
+            assert!(d.used <= d.cap || holders == 1, "D{k} over capacity with {holders} holders");
+        }
+    }
+
+    #[test]
+    fn late_d_modes_complete_requests_and_keep_d_accounting() {
+        let wl = synth_workload(12, 40);
+        let ct = FxHashMap::default();
+        for (mode, rule) in [("alloc", "po2"), ("choose", "po2"), ("choose", "d1")] {
+            // Small D pools so that binds wait and claims matter.
+            let c = SimConfig { d_mode: mode.into(), d_bind_rule: rule.into(), d_cap_tokens: 400_000, ..small_cfg() };
+            let mut sim = Sim::new(c, &wl, &ct);
+            sim.run();
+            ld_invariants(&sim);
+            let (rep, rows) = sim.report(0.0);
+            assert!(rep.n_scored > 100, "{mode}/{rule}: scored {}", rep.n_scored);
+            // Order of the late path: bindable -> bind -> ADMIT at D -> allocation -> bootstrap done
+            // (waiting queue) -> first chunk -> KV at D.
+            for r in sim.reqs.iter().filter(|r| r.t_kv.is_some()) {
+                let seq = [
+                    r.ld_bindable_t.unwrap(),
+                    r.ld_bind_t.unwrap(),
+                    r.ld_held_since.unwrap(),
+                    r.t_alloc.unwrap(),
+                    r.ld_bound_t.unwrap(),
+                    r.p_ready.unwrap(),
+                    r.t_fwd.unwrap(),
+                    r.t_kv.unwrap(),
+                ];
+                assert!(seq.windows(2).all(|w| w[0] <= w[1] + 1e-9), "{mode}/{rule}: {seq:?}");
+            }
+            assert!(rows.iter().filter(|r| r.completed).all(|r| r.d_held >= 0.0));
+            assert!(rep.ld_waits.iter().all(|&x| x >= 0.0));
+            // Small pools: with the arrival D (alloc mode) some binds wait at D; the late choice may
+            // avoid every wait.
+            if mode == "alloc" {
+                assert!(rep.ld_held_share > 0.0, "{mode}/{rule}: no held bind");
+            }
+        }
+        // d0 keeps the early path: no bind, allocation before the waiting queue.
+        let mut sim = Sim::new(SimConfig { d_cap_tokens: 400_000, ..small_cfg() }, &wl, &ct);
+        sim.run();
+        assert!(sim.reqs.iter().all(|r| r.ld_bind_t.is_none()));
+        for r in sim.reqs.iter().filter(|r| r.p_ready.is_some()) {
+            assert!(r.t_alloc.unwrap() <= r.p_ready.unwrap());
+        }
+        ld_invariants(&sim);
+    }
+
+    #[test]
+    fn late_d_claim_reserves_freed_memory_for_the_oldest_held_entry() {
+        let wl = synth_workload(1, 1);
+        let ct = FxHashMap::default();
+        let mut sim = Sim::new(SimConfig { d_mode: "alloc".into(), ..small_cfg() }, &wl, &ct);
+        for need in [50u64, 30, 30] {
+            sim.reqs.push(Req { need, d: 0, ..Default::default() });
+        }
+        sim.d[0].cap = 100;
+        sim.d[0].used = 60;
+        let t = 10.0;
+        // Entry 0 held for 1 s (> 20 passes x 19.46 ms): it is the claim; it does not fit (free 40).
+        sim.d[0].held.push_back((0, (t - 1.0f64).to_bits()));
+        sim.d[0].held.push_back((1, t.to_bits()));
+        sim.d[0].held.push_back((2, t.to_bits()));
+        sim.ld_try_held(t, 0);
+        // free 40 - claim 50 < 30: nobody passes the claim.
+        assert_eq!(sim.d[0].held.len(), 3);
+        // Without the claim (young head) a smaller entry passes.
+        sim.d[0].held[0].1 = t.to_bits();
+        sim.ld_try_held(t, 0);
+        assert_eq!(sim.d[0].held.iter().map(|x| x.0).collect::<Vec<_>>(), vec![0, 2]);
+        assert_eq!(sim.d[0].used, 90);
+        // Freed memory goes to the claim first, then to the next entry that fits.
+        sim.d[0].used = 20;
+        sim.d[0].held[0].1 = (t - 1.0f64).to_bits();
+        sim.ld_try_held(t, 0);
+        assert!(sim.d[0].held.is_empty());
+        assert_eq!(sim.d[0].used, 100);
+        assert!(sim.reqs[0].t_alloc.is_some() && sim.reqs[2].t_alloc.is_some());
+    }
+
+    #[test]
+    fn late_d_binder_keeps_a_short_lead_and_binds_in_arrival_order() {
+        let wl = synth_workload(24, 40);
+        let ct = FxHashMap::default();
+        // One slow P, so that rooms queue in the bootstrap queue.
+        let c = SimConfig {
+            d_mode: "alloc".into(),
+            n_p: 1,
+            n_d: 3,
+            concurrency: 24,
+            p_beta: vec![[0.08, 0.6, 0.0, 0.05, 0.05]],
+            ld_max_outstanding_per_d: 1000,
+            ..small_cfg()
+        };
+        let mut sim = Sim::new(c, &wl, &ct);
+        sim.run();
+        ld_invariants(&sim);
+        // Binds follow arrival order on the P (qp_seq): no room binds while an earlier, bindable
+        // room is still unbound.
+        let mut v: Vec<(f64, u64, f64)> = sim
+            .reqs
+            .iter()
+            .filter(|r| r.ld_bind_t.is_some())
+            .map(|r| (r.ld_bindable_t.unwrap(), r.qp_seq, r.ld_bind_t.unwrap()))
+            .collect();
+        v.sort_by_key(|x| x.1);
+        let mut out_of_order = 0;
+        for w in v.windows(2) {
+            if w[1].2 + 1e-9 < w[0].2 && w[0].0 <= w[1].2 {
+                out_of_order += 1;
+            }
+        }
+        assert_eq!(out_of_order, 0);
+        // Some rooms waited in the bootstrap queue (deferred) because the lead window was full.
+        let (rep, _) = sim.report(0.0);
+        assert!(rep.ld_waits[1] > 0.0, "no deferral: {:?}", rep.ld_waits);
+    }
+
+    #[test]
+    fn d1_bind_rule_picks_the_fewest_inflight_tokens_among_eligible() {
+        let wl = synth_workload(1, 1);
+        let ct = FxHashMap::default();
+        let mut sim = Sim::new(SimConfig { d_mode: "choose".into(), d_bind_rule: "d1".into(), ..small_cfg() }, &wl, &ct);
+        sim.d[0].inflight_tok = 500;
+        sim.d[1].inflight_tok = 100;
+        sim.d[2].inflight_tok = 100;
+        assert_eq!(sim.ld_choose(&[0, 1, 2]), 1);
+        sim.d[1].nreq = 3;
+        assert_eq!(sim.ld_choose(&[0, 1, 2]), 2, "tie on tokens -> fewer charged requests");
+        assert_eq!(sim.ld_choose(&[0, 1]), 1, "only eligible D are considered");
+        // po2 draws two distinct eligible D and takes the lower polled load.
+        sim.c.d_bind_rule = "po2".into();
+        sim.d[0].load_snap = 10;
+        sim.d[1].load_snap = 5;
+        for _ in 0..20 {
+            assert_eq!(sim.ld_choose(&[0, 1]), 1);
+        }
+        // Rule 4: a D with 4 outstanding binds from this P is not eligible.
+        sim.p[0].ld_out[1] = 4;
+        assert_eq!(sim.ld_eligible(0, 0), vec![0, 2]);
     }
 
     #[test]
