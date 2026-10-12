@@ -162,6 +162,16 @@ pub struct SimConfig {
     /// request of the chain on the source P cancels it. 0 = off (immediate demote).
     pub demote_defer_n: u32,
     pub demote_defer_t: f64,
+    /// Lever 1 action at the complete release (demote_source, not deferred): "flag" = engine
+    /// behaviour (engine @f8a08865b1 --peer-kv-demote-source: peer_kv_demote.py
+    /// select_demote_path :117-148 picks the nodes, unified_tree_core.py apply_peer_demote :2880-2901
+    /// flags them, host eviction takes flagged leaves first: full_component.py :270-293,
+    /// unified_tree_core.py :1833-1838) or "drop" = engine VARIANT (TwoTierRadix::demote_drop: the same
+    /// nodes are freed from the device and host tiers at once; a pinned node is flagged instead).
+    /// demote_moves_only: demote only after pulls of requests routed away from their owner P (target !=
+    /// owner at routing); false = every complete release (engine).
+    pub demote_action: String,
+    pub demote_moves_only: bool,
     /// ORACLE bounds (post-readout counterfactuals, NOT engine behaviour; all false = engine path):
     /// O1 oracle_pull: every hinted pull delivers max(owner's current host run, hint) up to len - 1
     /// at the normal transfer time: no lease-budget refusal (SV:996-1017), no lookup miss / short
@@ -313,6 +323,8 @@ impl Default for SimConfig {
             split_on_match: false,
             demote_defer_n: 0,
             demote_defer_t: 0.0,
+            demote_action: "flag".into(),
+            demote_moves_only: false,
             oracle_pull: false,
             oracle_move: false,
             pull_at_route: false,
@@ -737,6 +749,12 @@ pub struct SimReport {
     /// Oracle O2: source tokens freed at transfer / only flagged (pinned at that moment), whole run.
     pub moved_freed_tokens: u64,
     pub moved_flagged_tokens: u64,
+    /// Demote action "drop": source tokens freed at the complete release / only flagged (pinned at that
+    /// moment), whole run and score window; completed pulls that reached the immediate demote point
+    /// (demote_source, not deferred) by kind [target = owner, target != owner (moved)], whole run.
+    pub demote_drop_tokens: [u64; 2],
+    pub demote_drop_window: [u64; 2],
+    pub demote_pull_kind: [u64; 2],
     pub lease_refused_all: u64,
     pub repulls_all: u64,
     /// Demote walk stop reasons: no_node, no_host, children, branch, access, root.
@@ -831,7 +849,9 @@ pub struct Sim<'a> {
     dstate: Vec<(f64, u16, u64, u32)>,
     /// Demote counters (flagged/evicted/cleared nodes and blocks, then the six stop reasons) at
     /// the score-window start [0] and end [1].
-    dm_mark: [[u64; 12]; 2],
+    dm_mark: [[u64; 14]; 2],
+    /// Completed pulls at the immediate demote point: [target = owner, moved].
+    dem_kind: [u64; 2],
     lookup_miss: u64,
     lease_refused: u64,
     repulls: u64,
@@ -1032,7 +1052,8 @@ impl<'a> Sim<'a> {
             census: Vec::new(),
             pstate: Vec::new(),
             dstate: Vec::new(),
-            dm_mark: [[0; 12]; 2],
+            dm_mark: [[0; 14]; 2],
+            dem_kind: [0; 2],
             lookup_miss: 0,
             lease_refused: 0,
             repulls: 0,
@@ -1180,7 +1201,7 @@ impl<'a> Sim<'a> {
                     }
                 }
                 Ev::WinMark(end) => {
-                    let mut v = [0u64; 12];
+                    let mut v = [0u64; 14];
                     for p in &self.p {
                         let s = &p.radix.stats;
                         v[0] += s.demote_flagged_nodes;
@@ -1189,6 +1210,8 @@ impl<'a> Sim<'a> {
                         v[3] += s.demote_evicted_blocks;
                         v[4] += s.demote_cleared_nodes;
                         v[5] += s.demote_cleared_blocks;
+                        v[12] += s.drop_freed_blocks;
+                        v[13] += s.drop_flagged_blocks;
                     }
                     for k in 0..6 {
                         v[6 + k] = self.demote_stop[k];
@@ -2270,14 +2293,25 @@ impl<'a> Sim<'a> {
                 self.at(t + self.c.demote_defer_t, Ev::DemoteDue(id));
             }
         } else if self.c.demote_source {
-            let sp = std::mem::take(&mut self.reqs[r as usize].pull_src_path);
-            let (_, _, why) = if self.c.demote_relocate {
-                let leased = runs_prefix(&self.reqs[r as usize].runs, upto);
-                self.p[src].radix.demote_from(&leased, lookup_t)
-            } else {
-                self.p[src].radix.demote_walk(&sp, lookup_t)
+            let moved = {
+                let rq = &self.reqs[r as usize];
+                rq.p != rq.owner
             };
-            self.demote_stop[why as usize] += 1;
+            self.dem_kind[moved as usize] += 1;
+            if moved || !self.c.demote_moves_only {
+                let sp = std::mem::take(&mut self.reqs[r as usize].pull_src_path);
+                let (_, _, why) = if self.c.demote_action == "drop" {
+                    // Engine VARIANT: lever-1 node selection, the nodes are freed at once.
+                    let leased = runs_prefix(&self.reqs[r as usize].runs, upto);
+                    self.p[src].radix.demote_drop(&leased, lookup_t)
+                } else if self.c.demote_relocate {
+                    let leased = runs_prefix(&self.reqs[r as usize].runs, upto);
+                    self.p[src].radix.demote_from(&leased, lookup_t)
+                } else {
+                    self.p[src].radix.demote_walk(&sp, lookup_t)
+                };
+                self.demote_stop[why as usize] += 1;
+            }
         }
         self.reqs[r as usize].pull_lease = None;
         self.reqs[r as usize].pull_pending = false;
@@ -3245,6 +3279,10 @@ impl<'a> Sim<'a> {
             rep.demote_window[k] = if k % 2 == 1 { d * bt } else { d };
             rep.demote_stop_window[k] = self.dm_mark[1][6 + k].saturating_sub(self.dm_mark[0][6 + k]);
         }
+        for k in 0..2 {
+            rep.demote_drop_window[k] = self.dm_mark[1][12 + k].saturating_sub(self.dm_mark[0][12 + k]) * bt;
+        }
+        rep.demote_pull_kind = self.dem_kind;
         {
             let mut delays: Vec<f64> = Vec::new();
             let mut dec: [[Vec<f64>; 3]; 2] = Default::default();
@@ -3309,6 +3347,8 @@ impl<'a> Sim<'a> {
         for w in &self.p {
             rep.moved_freed_tokens += w.radix.stats.moved_freed_blocks * self.c.block_tokens;
             rep.moved_flagged_tokens += w.radix.stats.moved_flagged_blocks * self.c.block_tokens;
+            rep.demote_drop_tokens[0] += w.radix.stats.drop_freed_blocks * self.c.block_tokens;
+            rep.demote_drop_tokens[1] += w.radix.stats.drop_flagged_blocks * self.c.block_tokens;
             rep.partial_local_matches += w.radix.stats.partial_local_matches;
             rep.partial_rest_tokens += w.radix.stats.partial_rest_blocks * self.c.block_tokens;
             rep.match_splits += w.radix.stats.match_splits;
@@ -3586,5 +3626,44 @@ mod tests {
         }
         // Moves happen only with a strictly earlier predicted finish; every move is counted.
         assert!(rep.eft_counts[0] as f64 >= rep.detour_share * rep.n_admitted_window as f64 - 1.0);
+    }
+
+    #[test]
+    fn eft_demote_drop_frees_source_copies_and_keeps_the_audit_clean() {
+        // Loaded enough that EFT moves sessions (cheap pulls, no duplication charge).
+        let wl = synth_workload(30, 40);
+        let ct = FxHashMap::default();
+        let base = SimConfig {
+            p_policy: "eft".into(),
+            cs_workload: "true".into(),
+            pull_start: "queue".into(),
+            repull_on_admission: true,
+            queued_prefix_protect: true,
+            demote_source: true,
+            split_on_match: true,
+            cs_eft_dup_rho: 0.0,
+            concurrency: 30,
+            ..small_cfg()
+        };
+        let (flag, _) = run(base.clone(), &wl, &ct);
+        let (dr, _) = run(SimConfig { demote_action: "drop".into(), ..base.clone() }, &wl, &ct);
+        let (mv, _) = run(SimConfig { demote_action: "drop".into(), demote_moves_only: true, ..base }, &wl, &ct);
+        let walks = |r: &SimReport| r.demote_stop.iter().sum::<u64>();
+        for rep in [&flag, &dr, &mv] {
+            assert!(rep.n_scored > 100, "scored {}", rep.n_scored);
+            for a in &rep.per_p_audit {
+                assert_eq!(a[..3], [0, 0, 0], "audit {:?}", rep.per_p_audit);
+            }
+        }
+        // Flag (engine): nothing is freed at the release; every completed pull runs the walk.
+        assert_eq!(flag.demote_drop_tokens, [0, 0]);
+        assert_eq!(walks(&flag), flag.demote_pull_kind[0] + flag.demote_pull_kind[1]);
+        // Drop: completed pulls free source copies; only pinned nodes are flagged instead.
+        assert!(dr.demote_pull_kind[1] > 0, "moved pulls {:?} eft {:?}", dr.demote_pull_kind, dr.eft_counts);
+        assert!(dr.demote_drop_tokens[0] > 0, "drop {:?} stop {:?}", dr.demote_drop_tokens, dr.demote_stop);
+        assert_eq!(dr.demote_flagged_tokens, dr.demote_drop_tokens[1]);
+        assert_eq!(walks(&dr), dr.demote_pull_kind[0] + dr.demote_pull_kind[1]);
+        // Moves only: the walk runs only for pulls of moved requests.
+        assert_eq!(walks(&mv), mv.demote_pull_kind[1]);
     }
 }

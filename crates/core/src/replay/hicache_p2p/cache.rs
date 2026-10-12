@@ -146,6 +146,10 @@ pub struct CacheStats {
     /// node was pinned at that moment.
     pub moved_freed_blocks: u64,
     pub moved_flagged_blocks: u64,
+    /// Demote action "drop" (engine VARIANT of lever 1): source blocks freed at the complete release,
+    /// and blocks only flagged because a node was pinned at that moment.
+    pub drop_freed_blocks: u64,
+    pub drop_flagged_blocks: u64,
 }
 
 /// Window-filtered host eviction samples: (evict time, blocks, age since last use, age since write).
@@ -663,6 +667,74 @@ impl TwoTierRadix {
         self.stats.demote_flagged_nodes += fn_;
         self.stats.demote_flagged_blocks += fb;
         (fn_, fb, reason)
+    }
+
+    /// Demote action "drop" (an engine VARIANT of lever 1 `--peer-kv-demote-source`, not engine
+    /// behaviour): the same node selection as the engine's release-time walk, but the selected nodes
+    /// are FREED from both tiers at once instead of flagged for host eviction first.
+    /// Selection = `demote_from` (engine @f8a08865b1: unified_tree_core.py
+    /// select_peer_demote_nodes :2855-2878 resolves the node whose last page is the last leased page,
+    /// "a lease that ends inside a node flags nothing" -> no_node; peer_kv_demote.py
+    /// select_demote_path :117-148 walks parent links and keeps a node only if it has no child outside
+    /// the leased path and no local access at or after the lookup tick; it stops at the first node that
+    /// fails (the first branch point), at a node without a host copy, or at the root). Already flagged
+    /// nodes on the walk are freed too. The engine path flags them instead (apply_peer_demote
+    /// :2880-2901) and host eviction takes flagged leaves first (unified_tree_core.py :1833-1838,
+    /// full_component.py :270-293); the device copy is not reordered there.
+    /// Freeing goes deepest first (a node is a leaf once its path child is gone). A pinned node
+    /// (in-flight lock, lease, host lock) is flagged instead and ends the freeing (its parent keeps a
+    /// child). Returns (freed blocks, flagged-instead blocks, stop reason as `demote_walk`).
+    pub fn demote_drop(&mut self, runs: &[(u64, u32)], lookup_t: f64) -> (u64, u64, u8) {
+        let want = run_blocks(runs) as u32;
+        let m = self.walk(runs, None, false);
+        let Some(&(last_id, last_m)) = m.path.last() else { return (0, 0, 0) };
+        if m.total() < want || !self.nodes[last_id as usize].alive || last_m < self.nodes[last_id as usize].nb {
+            return (0, 0, 0);
+        }
+        let mut node = last_id;
+        let mut path_child = NONE;
+        let mut reason = 5u8;
+        let mut col: Vec<NodeId> = Vec::new();
+        while node != NONE && node != ROOT {
+            let n = &self.nodes[node as usize];
+            if !n.alive || !n.host {
+                reason = 1;
+                break;
+            }
+            let allowed = if path_child == NONE { 0 } else { 1 };
+            if n.ch.len() > allowed {
+                reason = if path_child == NONE { 2 } else { 3 };
+                break;
+            }
+            if n.last >= lookup_t {
+                reason = 4;
+                break;
+            }
+            col.push(node);
+            path_child = node;
+            node = n.par;
+        }
+        let (mut freed, mut flagged) = (0u64, 0u64);
+        for id in col {
+            let n = &self.nodes[id as usize];
+            if !n.alive || !n.ch.is_empty() {
+                break;
+            }
+            if n.host_pinned() {
+                if !n.demoted {
+                    let nb = n.nb as u64;
+                    self.nodes[id as usize].demoted = true;
+                    self.stats.demote_flagged_nodes += 1;
+                    self.stats.demote_flagged_blocks += nb;
+                    flagged += nb;
+                }
+                break;
+            }
+            freed += self.drop_node(id);
+        }
+        self.stats.drop_freed_blocks += freed;
+        self.stats.drop_flagged_blocks += flagged;
+        (freed, flagged, reason)
     }
 
     /// ORACLE O2 "perfect move" (NOT engine behaviour; bypasses the flag-then-evict-first path of
@@ -1221,6 +1293,49 @@ mod tests {
         c.insert(&runs(400, 4), 6.0, false);
         assert_eq!(c.move_free(&runs(400, 4), 5.0), (0, 0), "used at or after the lookup");
         c.check().unwrap();
+    }
+
+    #[test]
+    fn demote_drop_frees_only_the_moved_private_suffix_below_the_branch_point() {
+        // Lever-1 design example (in blocks): shared system prompt S (30) with the suffixes of agent1
+        // (470) and agent2 (270). agent1's prefix was pulled away: only agent1's suffix is freed, from
+        // both tiers; S and agent2 stay.
+        let mut c = TwoTierRadix::new(2000, 2000);
+        c.insert(&[(0, 30), (1000, 470)], 1.0, false);
+        c.insert(&[(0, 30), (5000, 270)], 2.0, false); // S is a branch point
+        let (dev0, host0) = (c.dev_used, c.host_used);
+        assert_eq!(c.demote_drop(&[(0, 30), (1000, 470)], 3.0), (470, 0, 3));
+        assert_eq!((c.dev_used, c.host_used), (dev0 - 470, host0 - 470));
+        c.check().unwrap();
+        assert_eq!(c.match_peek(&[(0, 30), (1000, 470)]).total(), 30);
+        assert_eq!(c.match_peek(&[(0, 30), (5000, 270)]).total(), 300);
+        assert_eq!((c.stats.drop_freed_blocks, c.stats.demote_flagged_blocks), (470, 0));
+        // Engine stop rules: a lease that ends inside a node frees nothing (no_node); a local access at
+        // or after the lookup stops the walk; without a branch the whole chain goes, up to the root.
+        let mut d = TwoTierRadix::new(100, 100);
+        d.insert(&runs(0, 8), 1.0, false);
+        assert_eq!(d.demote_drop(&runs(0, 6), 2.0), (0, 0, 0));
+        assert_eq!(d.demote_drop(&runs(0, 8), 1.0), (0, 0, 4));
+        assert_eq!(d.demote_drop(&runs(0, 8), 2.0), (8, 0, 5));
+        assert_eq!((d.dev_used, d.host_used, d.live_nodes()), (0, 0, 1));
+        d.check().unwrap();
+        // A pinned node is flagged instead (host eviction takes it first later) and ends the freeing.
+        let mut e = TwoTierRadix::new(100, 100);
+        e.insert(&runs(0, 4), 1.0, false);
+        let p = e.insert(&[(0, 4), (100, 4)], 1.0, false); // chain [0..4] -> [100..104]
+        let upper = p[0];
+        e.lock(Some(upper), 1);
+        assert_eq!(e.demote_drop(&[(0, 4), (100, 4)], 2.0), (4, 4, 5));
+        assert!(e.node(upper).demoted);
+        e.check().unwrap();
+        e.lock(Some(upper), -1);
+        let mut f = TwoTierRadix::new(100, 100);
+        f.insert(&runs(0, 4), 1.0, false);
+        let q = f.insert(&[(0, 4), (100, 4)], 1.0, false);
+        f.host_lock(Some(q[1]), 1);
+        assert_eq!(f.demote_drop(&[(0, 4), (100, 4)], 2.0), (0, 4, 5));
+        assert!(f.node(q[1]).demoted && !f.node(q[0]).demoted);
+        f.check().unwrap();
     }
 
     #[test]
