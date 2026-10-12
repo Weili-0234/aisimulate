@@ -222,6 +222,10 @@ pub struct SimConfig {
     /// (s); 0 = off. Small-prefix-first: a move may pull at most this many tokens; 0 = off.
     pub cs_eft_burst_wait_s: f64,
     pub cs_eft_max_pull_tokens: u64,
+    /// EFT pull timing in the predicted finish: false = total max(wait, pull) + own + dup (the pull
+    /// overlaps the queue wait; GPU router rule); true = wait + pull + own + dup (no overlap credit,
+    /// e.g. when the JIT pull starts only near the head of the target's queue).
+    pub cs_eft_pull_serial: bool,
     /// P waiting-queue order (engine VARIANT): "fcfs" (engine) or "sjf_aging" = least
     /// (uncached estimate - sjf_aging_tok_per_s x seconds in the waiting queue) first; held requests
     /// are still skipped, the continuing chunk still goes first.
@@ -343,6 +347,7 @@ impl Default for SimConfig {
             cs_eft_one_way: true,
             cs_eft_burst_wait_s: 0.0,
             cs_eft_max_pull_tokens: 0,
+            cs_eft_pull_serial: false,
             p_queue_order: "fcfs".into(),
             sjf_aging_tok_per_s: 8192.0,
             shared_pool: false,
@@ -905,7 +910,29 @@ pub(crate) fn eft_choose(
     max_pull: u64,
     margin_s: f64,
 ) -> (usize, u8) {
-    let tot = |w: usize| wait[w].max(pull_s[w]) + own_s[w] + dup[w];
+    eft_choose_mode(wait, own_s, pull_s, dup, pulled, own, excluded, burst_s, max_pull, margin_s, false)
+}
+
+/// `eft_choose` with the pull timing as a parameter: `serial` = false -> total max(wait, pull) + own +
+/// dup; true -> wait + pull + own + dup (no overlap credit for the pull).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn eft_choose_mode(
+    wait: &[f64],
+    own_s: &[f64],
+    pull_s: &[f64],
+    dup: &[f64],
+    pulled: &[u64],
+    own: usize,
+    excluded: Option<usize>,
+    burst_s: f64,
+    max_pull: u64,
+    margin_s: f64,
+    serial: bool,
+) -> (usize, u8) {
+    let tot = |w: usize| {
+        let qp = if serial { wait[w] + pull_s[w] } else { wait[w].max(pull_s[w]) };
+        qp + own_s[w] + dup[w]
+    };
     let base = tot(own);
     let better = |w: usize| w != own && tot(w) + margin_s < base;
     let pick = |ok: &dyn Fn(usize) -> bool| -> Option<usize> {
@@ -1777,7 +1804,7 @@ impl<'a> Sim<'a> {
                     }
                     _ => None,
                 };
-                let (t_, why) = eft_choose(
+                let (t_, why) = eft_choose_mode(
                     &wait,
                     &own_s,
                     &pull_s,
@@ -1788,6 +1815,7 @@ impl<'a> Sim<'a> {
                     self.c.cs_eft_burst_wait_s,
                     self.c.cs_eft_max_pull_tokens,
                     self.c.cs_eft_margin_s,
+                    self.c.cs_eft_pull_serial,
                 );
                 tgt = t_;
                 match why {
@@ -3527,6 +3555,20 @@ mod tests {
         assert_eq!((t, why), (0, 4));
         let (t, why) = eft_choose(&wait, &own_s, &z, &z, &[0, 10, 10], 0, None, 8.0, 0, 0.0);
         assert_eq!((t, why), (1, 1));
+    }
+
+    #[test]
+    fn eft_choose_serial_pull_gets_no_overlap_credit() {
+        // Owner 0 waits 3 s; P1 waits 2 s and needs a 1.5-s pull; own prefill 1 s everywhere.
+        let (wait, own_s, pull_s, z) = ([3.0, 2.0], [1.0; 2], [0.0, 1.5], [0.0; 2]);
+        let pulled = [0u64, 150_000];
+        // Overlap (max): P1 = max(2, 1.5) + 1 = 3 < owner 4 -> move.
+        assert_eq!(eft_choose_mode(&wait, &own_s, &pull_s, &z, &pulled, 0, None, 0.0, 0, 0.0, false), (1, 1));
+        assert_eq!(eft_choose(&wait, &own_s, &pull_s, &z, &pulled, 0, None, 0.0, 0, 0.0), (1, 1));
+        // Serial: P1 = 2 + 1.5 + 1 = 4.5 > owner 4 -> stay.
+        assert_eq!(eft_choose_mode(&wait, &own_s, &pull_s, &z, &pulled, 0, None, 0.0, 0, 0.0, true), (0, 0));
+        // Serial still moves when the wait gap covers the pull: owner 5 s -> P1 4.5 < 6.
+        assert_eq!(eft_choose_mode(&[5.0, 2.0], &own_s, &pull_s, &z, &pulled, 0, None, 0.0, 0, 0.0, true), (1, 1));
     }
 
     #[test]
