@@ -255,6 +255,9 @@ pub struct SimConfig {
     pub ld_claim_passes: u32,
     /// D step overhead per held entry and per DEFERRED leg (ms per decode step; 0 = off).
     pub ld_held_scan_ms: f64,
+    /// Fixed D step overhead with late D on (ms per decode step; the per-pass prealloc walk, handshake
+    /// poll and inbox work of late D; fitted on the GB300 TPOT shift; 0 = off).
+    pub ld_step_overhead_ms: f64,
     /// IDEAL bound (oracle, not an engine path): one two-tier pool shared by all P (device and host
     /// capacity = n_p x the per-P sizes; every P reads it at local cost: no duplicate copies, no
     /// pulls, no transfer time). Requires p_policy "ideal_eft" (no pulls) and fix 3 off.
@@ -386,6 +389,7 @@ impl Default for SimConfig {
             ld_meta_latency_s: 0.03,
             ld_claim_passes: 20,
             ld_held_scan_ms: 0.0,
+            ld_step_overhead_ms: 0.0,
             shared_pool: false,
             ideal_backlog: "true".into(),
             lease_budget_tokens: 1_510_000,
@@ -3160,6 +3164,9 @@ impl<'a> Sim<'a> {
         let mut step = step_ms(self.d[d].b, self.d[d].s);
         if self.c.ld_held_scan_ms > 0.0 {
             step += self.c.ld_held_scan_ms * (self.d[d].held.len() as f64 + self.d[d].legs.max(0) as f64);
+        }
+        if self.c.d_mode != "d0" {
+            step += self.c.ld_step_overhead_ms;
         }
         self.d[d].rate = 1.0 / (self.c.tpot_s * step / self.c.step_ref_ms);
         let dt = ((tgt - self.d[d].v) / self.d[d].rate).max(0.0);
