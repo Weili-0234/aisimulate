@@ -100,7 +100,7 @@ pub struct SimConfig {
     pub step_ref_ms: f64,
     pub tpot_fb: bool,
     // ---- router P
-    /// "smgca" | "cosched" | "sticky" | "rr"
+    /// "smgca" | "cosched" | "sticky" | "rr" | "eft" | "ideal_eft" (the last two: SWEEP-PDLOAD variants)
     pub p_policy: String,
     pub smg_threshold: f64,
     pub smg_abs: i64,
@@ -194,6 +194,37 @@ pub struct SimConfig {
     pub cs_hyst_n: u32,
     pub cs_hyst_t: f64,
     pub cs_hyst_k: f64,
+    /// SWEEP-PDLOAD (2026-10-12) router VARIANTS, not engine behaviour; defaults keep every older arm.
+    /// p_policy "eft" = co-schedule + P2P pull with an earliest-finish detour: per candidate P the
+    /// router predicts the P-side finish time = max(backlog seconds, pull seconds) + own prefill
+    /// seconds (pass model c0 amortized per chunk, c1, c2 attention, c3 host / c4 pulled load-back)
+    /// and adds a duplication charge = cs_eft_dup_rho x pulled tokens x per-token seconds; it detours
+    /// to the best other P iff that total + cs_eft_margin_s < the owner's total. Pull seconds =
+    /// cs_eft_pull_fixed_s + cs_eft_pull_s_per_100k x pulled / 1e5. One-way moves (cs_eft_one_way):
+    /// the agent chain's home P (its last target) is the owner, and the P the chain moved away from
+    /// last is not a detour target while it still holds >= pull_min_tokens of the prompt.
+    pub cs_eft_pull_s_per_100k: f64,
+    pub cs_eft_pull_fixed_s: f64,
+    pub cs_eft_dup_rho: f64,
+    pub cs_eft_margin_s: f64,
+    pub cs_eft_one_way: bool,
+    /// Burst-only detour: no detour unless the owner's predicted wait (backlog seconds) is >= this
+    /// (s); 0 = off. Small-prefix-first: a move may pull at most this many tokens; 0 = off.
+    pub cs_eft_burst_wait_s: f64,
+    pub cs_eft_max_pull_tokens: u64,
+    /// P waiting-queue order (engine VARIANT): "fcfs" (engine) or "sjf_aging" = least
+    /// (uncached estimate - sjf_aging_tok_per_s x seconds in the waiting queue) first; held requests
+    /// are still skipped, the continuing chunk still goes first.
+    pub p_queue_order: String,
+    pub sjf_aging_tok_per_s: f64,
+    /// IDEAL bound (oracle, not an engine path): one two-tier pool shared by all P (device and host
+    /// capacity = n_p x the per-P sizes; every P reads it at local cost: no duplicate copies, no
+    /// pulls, no transfer time). Requires p_policy "ideal_eft" (no pulls) and fix 3 off.
+    pub shared_pool: bool,
+    /// p_policy "ideal_eft": earliest predicted finish over all P with the same backlog-seconds model
+    /// as "eft"; ideal_backlog "true" = waiting queue + admitted prefills (as cs_workload "true"),
+    /// "all" = also the bootstrap queue.
+    pub ideal_backlog: String,
     /// Owner lease budget (64 GiB at 2,912,256 B per 64-token page = 1.51 M tokens).
     pub lease_budget_tokens: u64,
     /// Leases pin the source tree nodes (false = engine behavior: eviction is lease-blind).
@@ -293,6 +324,17 @@ impl Default for SimConfig {
             cs_hyst_n: 0,
             cs_hyst_t: 0.0,
             cs_hyst_k: 1.0,
+            cs_eft_pull_s_per_100k: 0.74,
+            cs_eft_pull_fixed_s: 0.0,
+            cs_eft_dup_rho: 0.10,
+            cs_eft_margin_s: 0.0,
+            cs_eft_one_way: true,
+            cs_eft_burst_wait_s: 0.0,
+            cs_eft_max_pull_tokens: 0,
+            p_queue_order: "fcfs".into(),
+            sjf_aging_tok_per_s: 8192.0,
+            shared_pool: false,
+            ideal_backlog: "true".into(),
             lease_budget_tokens: 1_510_000,
             lease_pins: false,
             jit_lead_tokens: 131_072,
@@ -703,6 +745,14 @@ pub struct SimReport {
     pub requests_sent: u64,
     pub host_fill: Vec<f64>,
     pub dev_fill: Vec<f64>,
+    /// SWEEP-PDLOAD output additions (scored rows): E2E p90 / p95 (same percentile rule as `ttft`),
+    /// prompt / uncached / output token sums; EFT counters (whole run): [moves, kept at the owner by
+    /// the one-way rule, by the pull cap, by the burst threshold].
+    pub e2e_p90_p95: [f64; 2],
+    pub prompt_tokens_scored: u64,
+    pub uncached_tokens_scored: u64,
+    pub output_tokens_scored: u64,
+    pub eft_counts: [u64; 4],
     pub wall_s: f64,
 }
 
@@ -730,6 +780,12 @@ pub struct Row {
     pub e2e: f64,
     pub ct: u32,
     pub completed: bool,
+    /// Output additions (s; -1 = n/a): P waiting queue (ready -> first forward), D allocation wait,
+    /// prefill (first forward -> prefill done), decode (first token -> done).
+    pub p_queue: f64,
+    pub d_wait: f64,
+    pub prefill_s: f64,
+    pub decode_s: f64,
 }
 
 pub struct Sim<'a> {
@@ -784,6 +840,10 @@ pub struct Sim<'a> {
     last_local: FxHashMap<(u16, u64), f64>,
     /// Per task admission: (P, prefill-done time) of the latest prefill done.
     sess_last_pd: FxHashMap<u64, (u16, f64)>,
+    /// EFT one-way moves: per agent chain (home P, P the chain moved away from last); counters as
+    /// SimReport::eft_counts.
+    eft_home: FxHashMap<(u64, u32), (Option<u16>, Option<u16>)>,
+    eft_counts: [u64; 4],
     lo: f64,
     hi: f64,
 }
@@ -792,6 +852,65 @@ fn step_ms(b: i64, s_tok: u64) -> f64 {
     let lk = (1.0f64 - 8.0 / 256.0).ln();
     let b = b as f64;
     9.71 + 0.467 * b + 10.59 * (1.0 - (6.0 * b * lk).exp()) + 0.996 * s_tok as f64 / 1e6
+}
+
+/// EFT / IDEAL router model: P seconds to prefill `unc` new tokens after a `pre`-token prefix on a P
+/// with pass model `beta` (c0 amortized over full chunks, c1 per 1k new tokens, c2 per 1e9 attention
+/// pairs, c3 per 100k host-loaded tokens, c4 per 100k pulled tokens loaded).
+pub(crate) fn eft_secs(beta: &[f64; 5], chunk: u64, unc: u64, pre: u64, host: u64, pulled: u64) -> f64 {
+    let u = unc as f64;
+    beta[0] * u / chunk.max(1) as f64
+        + beta[1] * u / 1e3
+        + beta[2] * (u * pre as f64 + u * (u + 1.0) / 2.0) / 1e9
+        + beta[3] * host as f64 / 1e5
+        + beta[4] * pulled as f64 / 1e5
+}
+
+/// EFT detour decision (pure). Per candidate P: `wait[w]` backlog seconds, `own_s[w]` own prefill
+/// seconds, `pull_s[w]` pull seconds (0 = no pull), `dup[w]` duplication charge (s), `pulled[w]`
+/// tokens a move to w pulls. Total[w] = max(wait, pull) + own + dup. Returns (target, reason):
+/// reason 0 = stay (no better P), 1 = move, 2 = stay because the only better P is `excluded`
+/// (one-way), 3 = stay because a better P needs a pull above `max_pull` (cap; 0 = no cap), 4 = stay
+/// because the owner's wait is below `burst_s` (0 = off). A move needs total + margin < owner total.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn eft_choose(
+    wait: &[f64],
+    own_s: &[f64],
+    pull_s: &[f64],
+    dup: &[f64],
+    pulled: &[u64],
+    own: usize,
+    excluded: Option<usize>,
+    burst_s: f64,
+    max_pull: u64,
+    margin_s: f64,
+) -> (usize, u8) {
+    let tot = |w: usize| wait[w].max(pull_s[w]) + own_s[w] + dup[w];
+    let base = tot(own);
+    let better = |w: usize| w != own && tot(w) + margin_s < base;
+    let pick = |ok: &dyn Fn(usize) -> bool| -> Option<usize> {
+        (0..wait.len()).filter(|&w| better(w) && ok(w)).min_by(|&a, &b| tot(a).total_cmp(&tot(b)).then(a.cmp(&b)))
+    };
+    if pick(&|_| true).is_none() {
+        return (own, 0);
+    }
+    if burst_s > 0.0 && wait[own] < burst_s {
+        return (own, 4);
+    }
+    let not_excl = |w: usize| Some(w) != excluded;
+    let capped = |w: usize| max_pull == 0 || pulled[w] <= max_pull;
+    if let Some(w) = pick(&|w| not_excl(w) && capped(w)) {
+        return (w, 1);
+    }
+    if pick(&|w| capped(w)).is_some() {
+        return (own, 2);
+    }
+    (own, 3)
+}
+
+/// IDEAL choice (pure): least predicted finish `f`, ties -> fewer active requests, then lower index.
+pub(crate) fn ideal_choose(f: &[f64], act: &[u64]) -> usize {
+    (0..f.len()).min_by(|&a, &b| f[a].total_cmp(&f[b]).then(act[a].cmp(&act[b])).then(a.cmp(&b))).unwrap_or(0)
 }
 
 impl<'a> Sim<'a> {
@@ -840,6 +959,15 @@ impl<'a> Sim<'a> {
                 idle_since: None,
                 idle_win: [0.0; 3],
             });
+        }
+        if c.shared_pool {
+            // IDEAL bound: P 0's tree is the one pool of all P (sizes x n_p); the others stay empty.
+            assert!(
+                c.p_policy != "cosched" && c.p_policy != "eft" && !c.queued_prefix_protect && !c.demote_source,
+                "shared_pool is an oracle without pulls: use p_policy ideal_eft (or smgca / sticky / rr), fix 3 and demote off"
+            );
+            p[0].radix.dev_cap = c.n_p as u64 * (c.p_dev_tokens / bt);
+            p[0].radix.host_cap = c.n_p as u64 * (c.p_host_tokens / bt);
         }
         let d = (0..c.n_d)
             .map(|_| DW {
@@ -911,9 +1039,43 @@ impl<'a> Sim<'a> {
             demote_stop: [0; 6],
             last_local: FxHashMap::default(),
             sess_last_pd: FxHashMap::default(),
+            eft_home: FxHashMap::default(),
+            eft_counts: [0; 4],
             lo,
             hi,
         }
+    }
+
+    /// Radix index used for P `p`: P 0's tree for every P with the IDEAL shared pool, else P's own.
+    fn rx(&self, p: usize) -> usize {
+        if self.c.shared_pool { 0 } else { p }
+    }
+
+    /// Router backlog of P `w` in seconds of P time (EFT / IDEAL model): requests in the waiting
+    /// queue (router charge or uncached estimate, at their prefix depth), the not-yet-computed part
+    /// of admitted prefills, and with `with_bq` the bootstrap queue; pass model of P `w`.
+    fn backlog_secs(&self, w: usize, with_bq: bool) -> f64 {
+        let p = &self.p[w];
+        let ch = self.c.chunk_tokens;
+        let mut s = 0.0;
+        for &r in p.wq.iter() {
+            let rq = &self.reqs[r as usize];
+            let u = rq.cs_cost.unwrap_or(rq.unc_est);
+            s += eft_secs(&p.beta, ch, u, rq.pt.saturating_sub(u), 0, 0);
+        }
+        for &r in p.pf_set.iter() {
+            let rq = &self.reqs[r as usize];
+            let left = rq.unc.saturating_sub(rq.computed);
+            s += eft_secs(&p.beta, ch, left, rq.pt.saturating_sub(left), 0, 0);
+        }
+        if with_bq {
+            for &r in p.bq.iter() {
+                let rq = &self.reqs[r as usize];
+                let u = rq.cs_cost.unwrap_or(rq.unc_est);
+                s += eft_secs(&p.beta, ch, u, rq.pt.saturating_sub(u), 0, 0);
+            }
+        }
+        s
     }
 
     fn at(&mut self, t: f64, ev: Ev) {
@@ -1346,12 +1508,20 @@ impl<'a> Sim<'a> {
     fn gpu_hits(&mut self, r: u32) -> Vec<u64> {
         let bt = self.c.block_tokens;
         let runs = self.reqs[r as usize].runs.clone();
+        if self.c.shared_pool {
+            let h = self.p[0].radix.match_peek(&runs).dev as u64 * bt;
+            return vec![h; self.p.len()];
+        }
         self.p.iter_mut().map(|p| p.radix.match_peek(&runs).dev as u64 * bt).collect()
     }
 
     fn actual_hits(&mut self, r: u32) -> Vec<u64> {
         let bt = self.c.block_tokens;
         let runs = self.reqs[r as usize].runs.clone();
+        if self.c.shared_pool {
+            let h = self.p[0].radix.match_peek(&runs).total() as u64 * bt;
+            return vec![h; self.p.len()];
+        }
         self.p.iter_mut().map(|p| p.radix.match_peek(&runs).total() as u64 * bt).collect()
     }
 
@@ -1495,6 +1665,129 @@ impl<'a> Sim<'a> {
                     }
                 }
             }
+            "ideal_eft" => {
+                // IDEAL bound: with the shared pool every P sees the same prefix; earliest predicted
+                // finish. (Without the shared pool: earliest finish on each P's own cache, no pulls.)
+                let l = pt;
+                let with_bq = self.c.ideal_backlog == "all";
+                let ch = self.c.chunk_tokens;
+                let f: Vec<f64> = (0..np)
+                    .map(|w| {
+                        let h = hits[w].min(l);
+                        self.backlog_secs(w, with_bq) + eft_secs(&self.p[w].beta, ch, l - h, h, 0, 0)
+                    })
+                    .collect();
+                let act: Vec<u64> = self.p.iter().map(|p| p.cs_active).collect();
+                tgt = ideal_choose(&f, &act);
+                own = tgt;
+                let unc = l - hits[tgt].min(l);
+                self.p[tgt].cs_pending += unc;
+                self.p[tgt].cs_active += 1;
+                self.reqs[r as usize].cs_cost = Some(unc);
+            }
+            "eft" => {
+                // Co-schedule + P2P pull with an earliest-finish detour (SWEEP-PDLOAD router variant).
+                // Hints and expected hits as "cosched" (co_schedule.rs:675-707).
+                let l = pt;
+                let bt_ = self.c.block_tokens;
+                let runs = self.reqs[r as usize].runs.clone();
+                let ms: Vec<MatchResult> = (0..np).map(|w| self.p[w].radix.match_peek(&runs)).collect();
+                let gpu: Vec<u64> = ms.iter().map(|m| m.dev as u64 * bt_).collect();
+                let local: Vec<u64> = hits.iter().map(|&h| h.min(l)).collect();
+                let mut hint: Vec<Option<(usize, u64)>> = vec![None; np];
+                let mut exp: Vec<u64> = vec![0; np];
+                for w in 0..np {
+                    let s_ = (0..np)
+                        .filter(|&k| k != w && hits[k] > 0)
+                        .min_by(|&a, &b| hits[b].cmp(&hits[a]).then(a.cmp(&b)));
+                    if let Some(s_) = s_ {
+                        if hits[s_] >= self.c.pull_min_tokens
+                            && hits[s_].saturating_sub(hits[w]) >= self.c.pull_min_incremental_tokens
+                        {
+                            hint[w] = Some((s_, hits[s_]));
+                        }
+                    }
+                    let hs = hint[w].map(|(_, h)| h).unwrap_or(0);
+                    exp[w] = local[w].max(hs).min(l);
+                }
+                let pend: Vec<u64> = (0..np).map(|w| self.true_backlog(w)).collect();
+                let act: Vec<u64> = self.p.iter().map(|p| p.cs_active).collect();
+                let own_hit = (0..np)
+                    .min_by(|&a, &b| {
+                        local[b].cmp(&local[a]).then(gpu[b].cmp(&gpu[a])).then(pend[a].cmp(&pend[b]))
+                            .then(act[a].cmp(&act[b])).then(a.cmp(&b))
+                    })
+                    .unwrap();
+                let ckey = self.chain_key(r);
+                let (home, prev) = self.eft_home.get(&ckey).copied().unwrap_or((None, None));
+                own = match home {
+                    Some(h) if self.c.cs_eft_one_way && (h as usize) < np => h as usize,
+                    _ => own_hit,
+                };
+                let ch = self.c.chunk_tokens;
+                let mut wait = vec![0.0; np];
+                let mut own_s = vec![0.0; np];
+                let mut pull_s = vec![0.0; np];
+                let mut dup = vec![0.0; np];
+                let mut pulled = vec![0u64; np];
+                for w in 0..np {
+                    let b = self.p[w].beta;
+                    let pl = exp[w].saturating_sub(local[w]);
+                    let host_local = local[w].saturating_sub(gpu[w].min(local[w]));
+                    wait[w] = self.backlog_secs(w, false);
+                    own_s[w] = eft_secs(&b, ch, l - exp[w], exp[w], host_local, pl);
+                    pull_s[w] = if pl > 0 {
+                        self.c.cs_eft_pull_fixed_s + self.c.cs_eft_pull_s_per_100k * pl as f64 / 1e5
+                    } else {
+                        0.0
+                    };
+                    dup[w] = self.c.cs_eft_dup_rho * eft_secs(&b, ch, pl, 0, 0, 0);
+                    pulled[w] = pl;
+                }
+                let excluded = match prev {
+                    Some(pv) if self.c.cs_eft_one_way
+                        && (pv as usize) < np
+                        && pv as usize != own
+                        && local[pv as usize] >= self.c.pull_min_tokens =>
+                    {
+                        Some(pv as usize)
+                    }
+                    _ => None,
+                };
+                let (t_, why) = eft_choose(
+                    &wait,
+                    &own_s,
+                    &pull_s,
+                    &dup,
+                    &pulled,
+                    own,
+                    excluded,
+                    self.c.cs_eft_burst_wait_s,
+                    self.c.cs_eft_max_pull_tokens,
+                    self.c.cs_eft_margin_s,
+                );
+                tgt = t_;
+                match why {
+                    1 => self.eft_counts[0] += 1,
+                    2 => self.eft_counts[1] += 1,
+                    3 => self.eft_counts[2] += 1,
+                    4 => self.eft_counts[3] += 1,
+                    _ => {}
+                }
+                let nh = if tgt != own { (Some(tgt as u16), Some(own as u16)) } else { (Some(tgt as u16), prev) };
+                self.eft_home.insert(ckey, nh);
+                let cost = l - exp[tgt];
+                self.p[tgt].cs_pending += cost;
+                self.p[tgt].cs_active += 1;
+                self.reqs[r as usize].cs_cost = Some(cost);
+                if self.c.pull_enabled {
+                    if let Some((src, hs)) = hint[tgt] {
+                        self.reqs[r as usize].pull_src = Some(src as u16);
+                        self.reqs[r as usize].pull_hint = hs.saturating_sub(hits[tgt]);
+                        self.reqs[r as usize].hint_expected = hs;
+                    }
+                }
+            }
             "sticky" => {
                 let (task, agent) = {
                     let rq = &self.reqs[r as usize];
@@ -1524,7 +1817,7 @@ impl<'a> Sim<'a> {
                 own = tgt;
             }
         }
-        if pol != "cosched" {
+        if pol != "cosched" && pol != "eft" {
             own = (0..np).min_by(|&a, &b| hits[b].cmp(&hits[a]).then(a.cmp(&b))).unwrap();
             if hits[own] == hits[tgt] {
                 own = tgt;
@@ -1614,7 +1907,8 @@ impl<'a> Sim<'a> {
         // Arrival match / bootstrap-prefetch re-match refresh the local LRU (H5) [approx: at intake].
         let runs = self.lkey(r);
         if self.c.touch_at_intake {
-            self.p[p].radix.match_local(&runs, t);
+            let x = self.rx(p);
+            self.p[x].radix.match_local(&runs, t);
         }
         if self.reqs[r as usize].pull_src.is_some() && self.c.pull_enabled && !self.c.pull_at_route {
             let jit = self.c.pull_start == "queue";
@@ -1768,7 +2062,8 @@ impl<'a> Sim<'a> {
     /// again, up to 2x the shortfall (URC:2069-2097; QPG relieve_host_pressure :282-304,
     /// release_newest :306-317); a released request takes no arrival lock for 256 passes (:456-457).
     fn guard_pressure(&mut self, t: f64, p: usize, requester: Option<u32>) {
-        let short = self.p[p].radix.host_used.saturating_sub(self.p[p].radix.host_cap);
+        let x = self.rx(p);
+        let short = self.p[x].radix.host_used.saturating_sub(self.p[x].radix.host_cap);
         if short == 0 || !self.c.queued_prefix_protect {
             return;
         }
@@ -2075,7 +2370,8 @@ impl<'a> Sim<'a> {
         let bt = self.c.block_tokens;
         let runs = self.reqs[r as usize].runs.clone();
         // Waiting-queue entry is not a match point in the engine (H5): no LRU refresh here.
-        let est = self.p[p].radix.match_peek(&runs).total() as u64 * bt;
+        let x = self.rx(p);
+        let est = self.p[x].radix.match_peek(&runs).total() as u64 * bt;
         self.reqs[r as usize].unc_est = self.reqs[r as usize].pt.saturating_sub(est).max(1);
         self.p[p].wq.push_back(r);
         if self.p[p].run_items.is_none() {
@@ -2141,7 +2437,8 @@ impl<'a> Sim<'a> {
         self.last_local.insert((p as u16, ns), t);
         self.dem_on_serve(p, r);
         let lk = self.lkey(r);
-        let m = self.p[p].radix.match_local(&lk, t);
+        let x = self.rx(p);
+        let m = self.p[x].radix.match_local(&lk, t);
         let mut dev = m.dev as u64 * bt;
         let mut host = m.host as u64 * bt;
         let pt = self.reqs[r as usize].pt;
@@ -2165,9 +2462,9 @@ impl<'a> Sim<'a> {
             stor = beyond_have.min(pulled).min(host);
             host -= stor;
         }
-        self.p[p].radix.load_back(&m.path, t);
+        self.p[x].radix.load_back(&m.path, t);
         let deep = m.path.last().map(|&(n, _)| n);
-        self.p[p].radix.lock(deep, 1);
+        self.p[x].radix.lock(deep, 1);
         // F3: the queued-prefix host lock is released at admission.
         self.guard_release(p, r);
         let beta = self.p[p].beta;
@@ -2212,6 +2509,18 @@ impl<'a> Sim<'a> {
                 return Some(items);
             }
             self.p[p].chunked = None;
+        }
+        if self.c.p_queue_order == "sjf_aging" && self.p[p].wq.len() > 1 {
+            // Engine VARIANT (not SGLang behaviour): least (uncached estimate - aging x wait) first;
+            // stable sort keeps FCFS order among equal keys.
+            let a = self.c.sjf_aging_tok_per_s;
+            let key = |s: &Self, r: u32| {
+                let rq = &s.reqs[r as usize];
+                rq.cs_cost.unwrap_or(rq.unc_est) as f64 - a * (t - rq.p_ready.unwrap_or(t)).max(0.0)
+            };
+            let mut v: Vec<(f64, u32)> = self.p[p].wq.iter().map(|&r| (key(self, r), r)).collect();
+            v.sort_by(|x, y| x.0.total_cmp(&y.0));
+            self.p[p].wq = v.into_iter().map(|x| x.1).collect();
         }
         if self.c.pull_start == "queue" {
             self.jit_scan(t, p);
@@ -2356,17 +2665,18 @@ impl<'a> Sim<'a> {
         if !self.reqs[r as usize].warm {
             self.sess_last_pd.insert(ns, (p as u16, t));
         }
-        let before = self.p[p].radix.stats.host_inserted_blocks;
-        let path = self.p[p].radix.insert(&runs, t, false);
+        let x = self.rx(p);
+        let before = self.p[x].radix.stats.host_inserted_blocks;
+        let path = self.p[x].radix.insert(&runs, t, false);
         self.guard_pressure(t, p, Some(r));
-        let ins = (self.p[p].radix.stats.host_inserted_blocks - before) * self.c.block_tokens;
+        let ins = (self.p[x].radix.stats.host_inserted_blocks - before) * self.c.block_tokens;
         if t >= self.lo && t < self.hi {
             self.p[p].host_ins_win += ins;
         }
         let nd = path.last().copied();
-        self.p[p].radix.lock(nd, 1);
+        self.p[x].radix.lock(nd, 1);
         let old = self.reqs[r as usize].locked;
-        self.p[p].radix.lock(old, -1);
+        self.p[x].radix.lock(old, -1);
         self.reqs[r as usize].locked = nd;
         let pt = self.reqs[r as usize].pt;
         let tr = self.qdraw(4);
@@ -2390,8 +2700,9 @@ impl<'a> Sim<'a> {
         }
         self.reqs[r as usize].t_kv = Some(t);
         let lk = self.reqs[r as usize].locked.take();
-        self.p[p].radix.lock(lk, -1);
-        self.p[p].radix.evict_dev(t);
+        let x = self.rx(p);
+        self.p[x].radix.lock(lk, -1);
+        self.p[x].radix.evict_dev(t);
         let df = self.qdraw(1);
         let first = t + if df.is_nan() { self.c.d_first_s } else { df.max(0.0) };
         self.reqs[r as usize].first = Some(first);
@@ -2591,6 +2902,7 @@ impl<'a> Sim<'a> {
             }
             rep.e2e[0] = percentile_in_place(&mut e2e, 50.0);
             rep.e2e[1] = percentile_in_place(&mut e2e, 99.0);
+            rep.e2e_p90_p95 = [percentile_in_place(&mut e2e, 90.0), percentile_in_place(&mut e2e, 95.0)];
         }
         rep.p_queue_mean = sum(&|r| r.t_fwd.unwrap() - r.p_ready.unwrap_or(r.t_fwd.unwrap())) / n;
         {
@@ -2613,6 +2925,9 @@ impl<'a> Sim<'a> {
                 .collect();
             rep.tpot = [pct7(&mut tp, 0.50), pct7(&mut tp, 0.99)];
             rep.uncached_per_req = sum(&|r| (r.pt as f64 - actual(r)).max(0.0)) / n;
+            rep.prompt_tokens_scored = cmp.iter().map(|r| r.pt).sum();
+            rep.uncached_tokens_scored = cmp.iter().map(|r| r.pt.saturating_sub(r.dev + r.host + r.stor)).sum();
+            rep.output_tokens_scored = cmp.iter().map(|r| r.ct as u64).sum();
             let fill = |vals: Vec<(f64, f64)>, out: &mut [f64; 10]| {
                 // (value, weight)
                 if vals.is_empty() {
@@ -3004,10 +3319,14 @@ impl<'a> Sim<'a> {
         rep.overcommit_tokens_mean = if oe > 0 { ob as f64 * self.c.block_tokens as f64 / oe as f64 } else { 0.0 };
         rep.guard_released_pressure = self.p.iter().map(|w| w.guard_released_pressure).sum();
         for (i, w) in self.p.iter().enumerate() {
-            let locks: Vec<NodeId> =
-                self.reqs.iter().filter(|r| r.p as usize == i).filter_map(|r| r.locked).collect();
-            let hlocks: Vec<NodeId> =
-                self.reqs.iter().filter(|r| r.p as usize == i).filter_map(|r| r.qlock.map(|x| x.0)).collect();
+            let shared = self.c.shared_pool;
+            if shared && i > 0 {
+                rep.per_p_audit.push([0, 0, 0, 0]);
+                continue;
+            }
+            let mine = |r: &&Req| shared || r.p as usize == i;
+            let locks: Vec<NodeId> = self.reqs.iter().filter(mine).filter_map(|r| r.locked).collect();
+            let hlocks: Vec<NodeId> = self.reqs.iter().filter(mine).filter_map(|r| r.qlock.map(|x| x.0)).collect();
             let (ml, mh, nodes) = w.radix.pin_audit(&locks, &hlocks);
             let chk = if w.radix.check().is_err() { 1 } else { 0 };
             rep.per_p_audit.push([chk, ml, mh, nodes]);
@@ -3052,6 +3371,7 @@ impl<'a> Sim<'a> {
         rep.demote_stop = self.demote_stop;
         rep.demote_deferred = [self.dem_deferred[0], self.dem_deferred[1], self.dem_pend.values().map(|v| v.len() as u64).sum()];
         rep.requests_sent = self.reqs.len() as u64;
+        rep.eft_counts = self.eft_counts;
         rep.wall_s = wall_s;
         let mut rows = Vec::new();
         if self.c.record_rows {
@@ -3079,6 +3399,19 @@ impl<'a> Sim<'a> {
                     e2e: r.done.map(|f| f - r.start).unwrap_or(-1.0),
                     ct: r.ct,
                     completed: ok,
+                    p_queue: match (r.t_fwd, r.p_ready) {
+                        (Some(f), Some(p)) => f - p,
+                        _ => -1.0,
+                    },
+                    d_wait: r.t_alloc.map(|a| a - r.d_recv).unwrap_or(-1.0),
+                    prefill_s: match (r.t_pd, r.t_fwd) {
+                        (Some(d), Some(f)) if d >= 0.0 => d - f,
+                        _ => -1.0,
+                    },
+                    decode_s: match (r.done, r.first) {
+                        (Some(d), Some(f)) => d - f,
+                        _ => -1.0,
+                    },
                 });
             }
         }
@@ -3092,4 +3425,166 @@ pub fn run(c: SimConfig, wl: &Workload, ct_map: &FxHashMap<(u32, u32, u32), u32>
     let mut sim = Sim::new(c, wl, ct_map);
     sim.run();
     sim.report(t0.elapsed().as_secs_f64())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::replay::hicache_p2p::trie::{Agent, Task};
+
+    const B: [f64; 5] = [0.12, 0.023, 0.117, 0.0855, 0.0855];
+
+    #[test]
+    fn eft_secs_is_the_pass_model_with_amortized_pass_cost() {
+        let u = 8192u64;
+        let want = 0.12 + 0.023 * 8.192 + 0.117 * (8192.0 * 8193.0 / 2.0) / 1e9;
+        assert!((eft_secs(&B, 8192, u, 0, 0, 0) - want).abs() < 1e-12);
+        // Prefix depth adds attention pairs; host / pulled load-back add linearly.
+        let deep = eft_secs(&B, 8192, u, 100_000, 0, 0);
+        assert!((deep - want - 0.117 * 8192.0 * 100_000.0 / 1e9).abs() < 1e-12);
+        let lb = eft_secs(&B, 8192, 0, 0, 200_000, 100_000);
+        assert!((lb - (0.0855 * 2.0 + 0.0855)).abs() < 1e-12);
+        assert_eq!(eft_secs(&B, 8192, 0, 50_000, 0, 0), 0.0);
+    }
+
+    #[test]
+    fn eft_choose_moves_only_to_a_strictly_earlier_finish() {
+        let pulled = [0u64, 100_000, 100_000];
+        // Owner 0 waits 10 s; P1 finishes at max(1, 0.5) + 2 + 0.1 = 3.1 s; P2 at 7.1 s.
+        let (t, why) = eft_choose(&[10.0, 1.0, 5.0], &[2.0; 3], &[0.0, 0.5, 0.5], &[0.0, 0.1, 0.1], &pulled, 0, None, 0.0, 0, 0.0);
+        assert_eq!((t, why), (1, 1));
+        // A long pull is not hidden by a short queue: P1 = max(0.2, 4.0) + 2 + 0.1 = 6.1 > owner 3 + 2.
+        let (t, why) = eft_choose(&[3.0, 0.2], &[2.0; 2], &[0.0, 4.0], &[0.0, 0.1], &[0, 400_000], 0, None, 0.0, 0, 0.0);
+        assert_eq!((t, why), (0, 0));
+        // Ties and gains below the margin stay at the owner.
+        let (t, why) = eft_choose(&[1.0, 1.0], &[1.0; 2], &[0.0; 2], &[0.0; 2], &[0, 0], 0, None, 0.0, 0, 0.0);
+        assert_eq!((t, why), (0, 0));
+        let (t, _) = eft_choose(&[2.0, 1.0], &[1.0; 2], &[0.0; 2], &[0.0; 2], &[0, 0], 0, None, 0.0, 0, 1.5);
+        assert_eq!(t, 0);
+        // The duplication charge can cancel a small gain.
+        let (t, _) = eft_choose(&[2.0, 1.5], &[1.0; 2], &[0.0; 2], &[0.0, 0.6], &[0, 50_000], 0, None, 0.0, 0, 0.0);
+        assert_eq!(t, 0);
+    }
+
+    #[test]
+    fn eft_choose_one_way_cap_and_burst_rules() {
+        let wait = [10.0, 1.0, 4.0];
+        let own_s = [1.0; 3];
+        let z = [0.0; 3];
+        // The best P (1) is the one the chain left: the next better P (2) is taken.
+        let (t, why) = eft_choose(&wait, &own_s, &z, &z, &[0, 10, 10], 0, Some(1), 0.0, 0, 0.0);
+        assert_eq!((t, why), (2, 1));
+        // Only the excluded P is better: stay, reason one-way.
+        let (t, why) = eft_choose(&[10.0, 1.0, 12.0], &own_s, &z, &z, &[0, 10, 10], 0, Some(1), 0.0, 0, 0.0);
+        assert_eq!((t, why), (0, 2));
+        // Pull cap: P1 would pull 120k > 100k, P2 pulls 20k and is still better than the owner.
+        let (t, why) = eft_choose(&wait, &own_s, &z, &z, &[0, 120_000, 20_000], 0, None, 0.0, 100_000, 0.0);
+        assert_eq!((t, why), (2, 1));
+        let (t, why) = eft_choose(&wait, &own_s, &z, &z, &[0, 120_000, 120_000], 0, None, 0.0, 100_000, 0.0);
+        assert_eq!((t, why), (0, 3));
+        // Burst-only: no move while the owner's wait is below the threshold.
+        let (t, why) = eft_choose(&wait, &own_s, &z, &z, &[0, 10, 10], 0, None, 12.0, 0, 0.0);
+        assert_eq!((t, why), (0, 4));
+        let (t, why) = eft_choose(&wait, &own_s, &z, &z, &[0, 10, 10], 0, None, 8.0, 0, 0.0);
+        assert_eq!((t, why), (1, 1));
+    }
+
+    #[test]
+    fn ideal_choose_least_finish_then_fewer_active_then_index() {
+        assert_eq!(ideal_choose(&[3.0, 1.0, 2.0], &[0, 9, 0]), 1);
+        assert_eq!(ideal_choose(&[1.0, 1.0, 2.0], &[5, 2, 0]), 1);
+        assert_eq!(ideal_choose(&[1.0, 1.0, 1.0], &[2, 2, 2]), 0);
+    }
+
+    fn synth_workload(tasks: usize, turns: usize) -> Workload {
+        let mut wl = Workload::default();
+        for i in 0..tasks {
+            let mut ev = Vec::new();
+            for k in 0..turns {
+                ev.push(Event::Generate {
+                    runs: vec![(i as u64 * 1_000_000, 40 + 40 * k as u32)],
+                    max_tokens: 64,
+                    out_blocks: 1,
+                    src_t: None,
+                    src_api: None,
+                });
+                ev.push(Event::Wait { seconds: 3.0 });
+            }
+            wl.tasks.push(Task {
+                id: format!("t{i}"),
+                block_size: 64,
+                agents: vec![Agent { id: "a".into(), routing_key: None, events: ev }],
+                deps: Vec::new(),
+            });
+        }
+        wl
+    }
+
+    fn small_cfg() -> SimConfig {
+        SimConfig {
+            n_p: 3,
+            n_d: 3,
+            concurrency: 9,
+            duration_s: 400.0,
+            warm_s: 50.0,
+            score_s: 300.0,
+            p_lat_s: 0.0,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn shared_pool_ideal_spreads_requests_and_keeps_every_prefix_hit() {
+        let wl = synth_workload(12, 40);
+        let ct = FxHashMap::default();
+        let c = SimConfig { p_policy: "ideal_eft".into(), shared_pool: true, ..small_cfg() };
+        let (rep, rows) = run(c, &wl, &ct);
+        assert!(rep.n_scored > 100, "scored {}", rep.n_scored);
+        // One pool: a returning session hits its whole earlier prompt on whichever P it lands.
+        assert!(rep.hit_sum_a_over_i > 0.99, "hit {}", rep.hit_sum_a_over_i);
+        let used = rep.per_p_share.iter().filter(|&&s| s > 0.05).count();
+        assert_eq!(used, 3, "share {:?}", rep.per_p_share);
+        // Requests of one session move between P without losing the prefix.
+        let mut moved = 0;
+        let mut last: FxHashMap<u32, u16> = FxHashMap::default();
+        for r in rows.iter().filter(|r| r.completed) {
+            if let Some(&p) = last.get(&r.task_row) {
+                if p != r.p && r.ideal > 0 {
+                    moved += 1;
+                    assert!(r.actual + 64 >= r.ideal.min(r.pt.saturating_sub(64)), "row {:?}", r);
+                }
+            }
+            last.insert(r.task_row, r.p);
+        }
+        assert!(moved > 0);
+        // Pin audit: no check error and no lock mismatch on the shared tree.
+        for a in &rep.per_p_audit {
+            assert_eq!(a[..3], [0, 0, 0], "audit {:?}", rep.per_p_audit);
+        }
+        assert!(rows.iter().filter(|r| r.completed).all(|r| r.p_queue >= 0.0 && r.decode_s >= 0.0));
+    }
+
+    #[test]
+    fn eft_policy_runs_with_pulls_and_records_moves() {
+        let wl = synth_workload(12, 40);
+        let ct = FxHashMap::default();
+        let c = SimConfig {
+            p_policy: "eft".into(),
+            cs_workload: "true".into(),
+            pull_start: "queue".into(),
+            repull_on_admission: true,
+            queued_prefix_protect: true,
+            demote_source: true,
+            split_on_match: true,
+            ..small_cfg()
+        };
+        let (rep, _) = run(c, &wl, &ct);
+        assert!(rep.n_scored > 100);
+        assert!(rep.hit_sum_a_over_i > 0.9, "hit {}", rep.hit_sum_a_over_i);
+        for a in &rep.per_p_audit {
+            assert_eq!(a[..3], [0, 0, 0], "audit {:?}", rep.per_p_audit);
+        }
+        // Moves happen only with a strictly earlier predicted finish; every move is counted.
+        assert!(rep.eft_counts[0] as f64 >= rep.detour_share * rep.n_admitted_window as f64 - 1.0);
+    }
 }
