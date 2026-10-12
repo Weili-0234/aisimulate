@@ -644,6 +644,10 @@ pub struct SimReport {
     pub per_d_used_frac_mean: Vec<f64>,
     pub per_d_fifo_mean: Vec<f64>,
     pub per_p_host_age_last_pct_s: Vec<[f64; 5]>,
+    /// Same window, host evictions of pages NOT flagged by the demote-source walk (real content, not
+    /// duplicate source copies): evicted tokens per P and age since last local use p10/p25/p50/p75/p90.
+    pub per_p_host_evicted_nodem_tokens: Vec<u64>,
+    pub per_p_host_age_last_nodem_pct_s: Vec<[f64; 5]>,
     /// Census over the score window: mean fractions of the host pool (pinned, device-resident, demoted)
     /// and mean / p10 usable fraction (= 1 - pinned - device-resident).
     pub pool_pinned_frac: f64,
@@ -3287,6 +3291,18 @@ impl<'a> Sim<'a> {
                 }
             }
             rep.per_p_host_age_last_pct_s.push(pc);
+            {
+                let nd: Vec<_> = ev.iter().filter(|e| !e.demoted).collect();
+                rep.per_p_host_evicted_nodem_tokens.push(nd.iter().map(|e| e.blocks as u64).sum::<u64>() * bt);
+                let mut a2: Vec<f64> = nd.iter().map(|e| e.age_last).collect();
+                let mut pc2 = [0.0; 5];
+                if !a2.is_empty() {
+                    for (k, q) in [10.0, 25.0, 50.0, 75.0, 90.0].iter().enumerate() {
+                        pc2[k] = percentile_in_place(&mut a2, *q);
+                    }
+                }
+                rep.per_p_host_age_last_nodem_pct_s.push(pc2);
+            }
             rep.per_p_busy.push(pw.win_busy / self.c.score_s);
             rep.per_p_share.push(cmp.iter().filter(|r| r.p as usize == i).count() as f64 / n);
             rep.per_p_host_inserted_tokens_win.push(pw.host_ins_win);
