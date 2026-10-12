@@ -275,6 +275,20 @@ pub struct SimConfig {
     pub repull_min_tokens: u64,
     /// Pool size used in the turnover metric (12,405,568; eviction capacity is p_host_tokens).
     pub turnover_pool_tokens: u64,
+    /// S2 serving-D model (option; false = no D cache, as before). Each D keeps a two-tier radix:
+    /// device tier = the D KV pool not held by active reservations, host tier = d_host_ratio x the
+    /// pool, write-through, LRU. The prompt is inserted at decode finish (the trace's output blocks
+    /// never recur in a later prompt, so they are not inserted); the prefix is matched and locked at
+    /// D prealloc and the P sends only [D prefix, len) (KV tail). Reservations are unchanged (no D
+    /// memory saving for a cached prefix).
+    pub d_cache: bool,
+    pub d_host_ratio: f64,
+    /// S2 read before P admission of [local, avail) from a D copy (needs d_cache): "off"; "a" = from
+    /// the serving D after a hinted pull left the P short; "b" = "a" + the same read for any request;
+    /// "c" = "b" with the D that served the chain's previous turn as the source (oracle bound). A read
+    /// happens when avail - local >= s2_min_tokens; it takes pull_fit time and lands like a pull.
+    pub s2_read: String,
+    pub s2_min_tokens: u64,
 }
 
 impl Default for SimConfig {
@@ -397,6 +411,10 @@ impl Default for SimConfig {
             jit_lead_tokens: 131_072,
             repull_min_tokens: 8192,
             turnover_pool_tokens: 12_405_568,
+            d_cache: false,
+            d_host_ratio: 6.0,
+            s2_read: "off".into(),
+            s2_min_tokens: 8192,
         }
     }
 }
@@ -412,6 +430,8 @@ enum Ev {
     DRecv(u32),
     PReady(u32),
     PullDone(u32),
+    /// S2: a read from a D copy landed on the P.
+    DReadDone(u32),
     EndIter(u16),
     PrefillDone(u16, u32),
     KvArrived(u32),
@@ -548,6 +568,19 @@ struct Req {
     ld_held_since: Option<f64>,
     ld_bound_t: Option<f64>,
     ld_inflight: u64,
+    /// S2: D prefix matched and locked at D prealloc (tokens, at most len-1 page aligned) and its lock;
+    /// D read: tokens read, P local match at issue, in flight, decision taken, tokens counted as hit at
+    /// the first chunk, source D, source lease (oracle "c"), blocks covered.
+    d_prefix: u64,
+    d_lock: Option<NodeId>,
+    dread: u64,
+    dread_have: u64,
+    dread_pending: bool,
+    dread_tried: bool,
+    drd: u64,
+    dread_src: Option<u16>,
+    dread_lease: Option<NodeId>,
+    dread_upto: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -649,6 +682,8 @@ struct DW {
     held: VecDeque<(u32, u64)>,
     inflight_tok: u64,
     legs: i64,
+    /// S2 D cache (used only with d_cache).
+    radix: TwoTierRadix,
 }
 
 /// Aggregate output.
@@ -844,6 +879,22 @@ pub struct SimReport {
     pub ld_held: [f64; 4],
     pub ld_held_share: f64,
     pub ld_waits: [f64; 3],
+    /// S2 serving-D model (scored rows; 0 without d_cache): D reads (count, tokens read, tokens counted
+    /// as hit at the first chunk); D prefix at prealloc as a share of prompt tokens; the static serving-D
+    /// bound Dsrv = sum max(0, min(I, D prefix) - A) in tokens, over sumI and over P-computed tokens;
+    /// share of rows with D prefix > A; D-local reuse = sum max(0, D prefix - A) / prompt tokens; D reads
+    /// issued in the whole run (count, tokens).
+    pub dreads_scored: u64,
+    pub dread_tokens_scored: u64,
+    pub dread_hit_tokens_scored: u64,
+    pub d_prefix_share: f64,
+    pub dsrv_tokens: f64,
+    pub dsrv_over_ideal: f64,
+    pub dsrv_over_computed: f64,
+    pub d_prefix_gt_a_rows: f64,
+    pub d_local_reuse: f64,
+    pub dreads_all: u64,
+    pub dread_tokens_all: u64,
     pub wall_s: f64,
 }
 
@@ -879,6 +930,9 @@ pub struct Row {
     pub decode_s: f64,
     /// Late D: held at D = ADMIT at D -> allocation (s; -1 = no bind).
     pub d_held: f64,
+    /// S2: D prefix at prealloc and the D-read part of `actual` (tokens; 0 without d_cache).
+    pub d_prefix: u64,
+    pub dread: u64,
 }
 
 pub struct Sim<'a> {
@@ -937,6 +991,10 @@ pub struct Sim<'a> {
     /// SimReport::eft_counts.
     eft_home: FxHashMap<(u64, u32), (Option<u16>, Option<u16>)>,
     eft_counts: [u64; 4],
+    /// S2: per agent chain, the D that served its latest finished turn; D reads issued / tokens.
+    last_d: FxHashMap<(u64, u32), u16>,
+    dreads_all: u64,
+    dread_tok_all: u64,
     lo: f64,
     hi: f64,
 }
@@ -1091,6 +1149,15 @@ impl<'a> Sim<'a> {
                 held: VecDeque::new(),
                 inflight_tok: 0,
                 legs: 0,
+                radix: {
+                    let mut r = TwoTierRadix::new(
+                        c.d_cap_tokens / bt,
+                        (c.d_host_ratio.max(0.0) * c.d_cap_tokens as f64) as u64 / bt,
+                    );
+                    r.split_refresh = c.split_refresh;
+                    r.split_on_match = c.split_on_match;
+                    r
+                },
             })
             .collect();
         // Router-side trees (SMG cache_aware) keep their calibrated split behavior (no refresh).
@@ -1146,6 +1213,9 @@ impl<'a> Sim<'a> {
             sess_last_pd: FxHashMap::default(),
             eft_home: FxHashMap::default(),
             eft_counts: [0; 4],
+            last_d: FxHashMap::default(),
+            dreads_all: 0,
+            dread_tok_all: 0,
             lo,
             hi,
         }
@@ -1267,6 +1337,7 @@ impl<'a> Sim<'a> {
                 }
                 Ev::PReady(r) => self.p_ready(t, r),
                 Ev::PullDone(r) => self.pull_done(t, r),
+                Ev::DReadDone(r) => self.dread_done(t, r),
                 Ev::DemoteDue(id) => self.demote_due(id),
                 Ev::EndIter(p) => self.end_iter(t, p as usize),
                 Ev::PrefillDone(p, r) => self.prefill_done(t, p as usize, r),
@@ -1998,6 +2069,7 @@ impl<'a> Sim<'a> {
             self.d[d].used += need;
             self.reqs[r as usize].t_alloc = Some(t);
             self.reqs[r as usize].pa_on = true;
+            self.d_prealloc(t, r);
             if self.reqs[r as usize].p_in {
                 self.boot_done(t, r);
             }
@@ -2019,6 +2091,135 @@ impl<'a> Sim<'a> {
         } else {
             self.ld_try_held(t, d);
         }
+        if self.c.d_cache {
+            self.d_cache_cap(t, d);
+        }
+    }
+
+    // ------------------------------------------------------------------------------ S2 D cache
+    /// S2 device tier of D `d` = the KV pool not held by active reservations; evict to fit.
+    fn d_cache_cap(&mut self, t: f64, d: usize) {
+        let bt = self.c.block_tokens;
+        let dw = &mut self.d[d];
+        dw.radix.dev_cap = dw.cap.saturating_sub(dw.used) / bt;
+        dw.radix.evict_dev(t);
+    }
+
+    /// S2 D prealloc (engine _match_prefix_and_lock): match the prompt prefix on the D radix
+    /// (refreshes it), lock it until the request ends, record the D prefix (at most len-1, page
+    /// aligned).
+    fn d_prealloc(&mut self, t: f64, r: u32) {
+        if !self.c.d_cache {
+            return;
+        }
+        let bt = self.c.block_tokens;
+        let d = self.reqs[r as usize].d as usize;
+        let lk = self.lkey(r);
+        let m = self.d[d].radix.match_local(&lk, t);
+        let deep = m.path.last().map(|&(n, _)| n);
+        self.d[d].radix.lock(deep, 1);
+        let pt = self.reqs[r as usize].pt;
+        let capm = (pt.saturating_sub(1) / bt) * bt;
+        self.reqs[r as usize].d_prefix = (m.total() as u64 * bt).min(capm);
+        self.reqs[r as usize].d_lock = deep;
+        self.d_cache_cap(t, d);
+    }
+
+    /// S2 decode finish: unlock the prealloc match and insert the prompt into the D radix (write-
+    /// through); remember the chain's D for the oracle source.
+    fn d_finish(&mut self, t: f64, r: u32) {
+        if !self.c.d_cache {
+            return;
+        }
+        let d = self.reqs[r as usize].d as usize;
+        let lk = self.reqs[r as usize].d_lock.take();
+        self.d[d].radix.lock(lk, -1);
+        let runs = std::mem::take(&mut self.reqs[r as usize].runs);
+        self.d[d].radix.insert(&runs, t, false);
+        self.reqs[r as usize].runs = runs;
+        let key = self.chain_key(r);
+        self.last_d.insert(key, d as u16);
+    }
+
+    /// S2 read decision before P admission (one per request): source = the serving D ("a", "b";
+    /// its prefix is locked since prealloc) or the D of the chain's previous turn ("c", oracle; leased
+    /// for the read); "a" only for requests that had a pull hint (the pull has ended, short or failed).
+    /// Reads [local, avail) when avail - local >= s2_min_tokens. Returns true when a read is in flight.
+    fn s2_issue(&mut self, t: f64, p: usize, r: u32) -> bool {
+        let bt = self.c.block_tokens;
+        let mode = self.c.s2_read.as_str();
+        if !self.c.d_cache || mode == "off" || (mode == "a" && self.reqs[r as usize].pull_src.is_none()) {
+            return false;
+        }
+        let oracle = mode == "c";
+        let lk = self.lkey(r);
+        let x = self.rx(p);
+        let local = self.p[x].radix.match_peek(&lk).total() as u64;
+        let pt = self.reqs[r as usize].pt;
+        let cap_blocks = pt.saturating_sub(1) / bt;
+        let (src, avail, lease) = if oracle {
+            let key = self.chain_key(r);
+            let Some(&sd) = self.last_d.get(&key) else { return false };
+            let m = self.d[sd as usize].radix.match_peek(&lk);
+            let upto = (m.total() as u64).min(cap_blocks);
+            (sd as usize, upto, TwoTierRadix::path_node_covering(&m.path, upto as u32))
+        } else {
+            (self.reqs[r as usize].d as usize, self.reqs[r as usize].d_prefix / bt, None)
+        };
+        if avail <= local || (avail - local) * bt < self.c.s2_min_tokens {
+            return false;
+        }
+        if oracle {
+            self.d[src].radix.lease(lease, 1);
+        }
+        let n = (avail - local) * bt;
+        let rq = &mut self.reqs[r as usize];
+        rq.dread_src = Some(src as u16);
+        rq.dread_lease = lease;
+        rq.dread_upto = avail as u32;
+        rq.dread_have = local * bt;
+        rq.dread = n;
+        rq.dread_pending = true;
+        self.dreads_all += 1;
+        self.dread_tok_all += n;
+        let dur = self.c.pull_fit.at(n);
+        self.at(t + dur, Ev::DReadDone(r));
+        true
+    }
+
+    /// S2 read landed: insert the read prefix on the P (as a pull landing), release the oracle
+    /// source lease, wake the P.
+    fn dread_done(&mut self, t: f64, r: u32) {
+        let bt = self.c.block_tokens;
+        let (src, dst, lease, upto) = {
+            let rq = &self.reqs[r as usize];
+            (rq.dread_src.unwrap_or(0) as usize, rq.p as usize, rq.dread_lease, rq.dread_upto)
+        };
+        let runs = runs_prefix(&self.reqs[r as usize].runs, upto);
+        let host_only = self.c.pull_landing == "host";
+        let x = self.rx(dst);
+        let before = self.p[x].radix.stats.host_inserted_blocks;
+        self.p[x].radix.insert(&runs, t, host_only);
+        self.guard_pressure(t, dst, Some(r));
+        let ins = (self.p[x].radix.stats.host_inserted_blocks - before) * bt;
+        if t >= self.lo && t < self.hi {
+            self.p[dst].pull_ins_win += ins;
+        }
+        if self.c.queued_prefix_protect && self.reqs[r as usize].t_fwd.is_none() {
+            self.guard_landed(dst, r);
+        }
+        if lease.is_some() {
+            self.d[src].radix.lease(lease, -1);
+            self.d[src].radix.evict_dev(t);
+        }
+        self.reqs[r as usize].dread_lease = None;
+        self.reqs[r as usize].dread_pending = false;
+        if self.p[dst].run_items.is_none() && !self.p[dst].wq.is_empty() {
+            if let Some(items) = self.form(t, dst) {
+                self.start_iter(t, dst, items);
+            }
+        }
+        self.p_idle_update(t, dst);
     }
 
     // ------------------------------------------------------------------------------ late D (PR #39)
@@ -2158,6 +2359,7 @@ impl<'a> Sim<'a> {
                 self.d[d].used += need;
                 self.reqs[r as usize].t_alloc = Some(t);
                 self.reqs[r as usize].pa_on = true;
+                self.d_prealloc(t, r);
                 self.at(t + self.c.ld_meta_latency_s, Ev::LdBound(r));
                 continue;
             }
@@ -2855,22 +3057,30 @@ impl<'a> Sim<'a> {
             stor = beyond_have.min(pulled).min(host);
             host -= stor;
         }
+        // S2: the part read from a D copy (host-tier blocks beyond the local match at the read).
+        let dread = self.reqs[r as usize].dread;
+        let mut drd = 0;
+        if dread > 0 {
+            let beyond = (dev + host + stor).saturating_sub(self.reqs[r as usize].dread_have);
+            drd = beyond.min(dread).min(host);
+            host -= drd;
+        }
         self.p[x].radix.load_back(&m.path, t);
         let deep = m.path.last().map(|&(n, _)| n);
         self.p[x].radix.lock(deep, 1);
         // F3: the queued-prefix host lock is released at admission.
         self.guard_release(p, r);
         let beta = self.p[p].beta;
-        let mut lb = beta[3] * host as f64 / 1e5 + beta[4] * stor as f64 / 1e5;
+        let mut lb = beta[3] * host as f64 / 1e5 + beta[4] * (stor + drd) as f64 / 1e5;
         if self.c.lb_hidden > 0.0 {
             let cap = (self.c.prefetch_max_tokens as f64).min(self.c.prefetch_max_fraction * pt as f64);
-            let frac = if host + stor > 0 { (cap / (host + stor) as f64).min(1.0) } else { 0.0 };
+            let frac = if host + stor + drd > 0 { (cap / (host + stor + drd) as f64).min(1.0) } else { 0.0 };
             lb -= self.c.lb_hidden * frac * lb;
         }
         self.p[p].pf_set.push(r);
         {
             let a = self.c.ld_ewma_alpha;
-            let h = (dev + host + stor) as f64 / pt.max(1) as f64;
+            let h = (dev + host + stor + drd) as f64 / pt.max(1) as f64;
             let pw = &mut self.p[p];
             pw.ld_hit = (1.0 - a) * pw.ld_hit + a * h;
         }
@@ -2879,7 +3089,8 @@ impl<'a> Sim<'a> {
         rq.dev = dev;
         rq.host = host;
         rq.stor = stor;
-        rq.unc = pt.saturating_sub(dev + host + stor).max(1);
+        rq.drd = drd;
+        rq.unc = pt.saturating_sub(dev + host + stor + drd).max(1);
         rq.sched = 0;
         rq.computed = 0;
         rq.lbcost = lb.max(0.0);
@@ -2939,8 +3150,8 @@ impl<'a> Sim<'a> {
                 self.p[p].wq.remove(idx);
                 continue;
             }
-            // Hold: a request whose pull is in flight is skipped; later requests pass it.
-            if self.reqs[r as usize].pull_pending {
+            // Hold: a request whose pull (or S2 D read) is in flight is skipped; later requests pass it.
+            if self.reqs[r as usize].pull_pending || self.reqs[r as usize].dread_pending {
                 idx += 1;
                 continue;
             }
@@ -2969,6 +3180,14 @@ impl<'a> Sim<'a> {
                         idx += 1;
                         continue;
                     }
+                }
+            }
+            // S2: one read decision per request, after any pull has ended (the read lands like a pull).
+            if self.c.s2_read != "off" && !self.reqs[r as usize].dread_tried {
+                self.reqs[r as usize].dread_tried = true;
+                if self.s2_issue(t, p, r) {
+                    idx += 1;
+                    continue;
                 }
             }
             self.p[p].wq.remove(idx);
@@ -3093,9 +3312,10 @@ impl<'a> Sim<'a> {
         self.kv_send(t, r);
     }
 
-    /// KV transfer tail to D (LDX-OFF fit + residual table) -> KV arrived.
+    /// KV transfer tail to D (LDX-OFF fit + residual table) -> KV arrived. With the S2 D cache the
+    /// P sends only [D prefix, len).
     fn kv_send(&mut self, t: f64, r: u32) {
-        let pt = self.reqs[r as usize].pt;
+        let pt = self.reqs[r as usize].pt.saturating_sub(self.reqs[r as usize].d_prefix);
         let tr = self.qdraw(4);
         let tail = if tr.is_nan() {
             self.c.kv_tail.at(pt)
@@ -3218,6 +3438,7 @@ impl<'a> Sim<'a> {
         self.ideal.insert(&runs, t, false);
         self.reqs[r as usize].runs = runs;
         let d = self.reqs[r as usize].d as usize;
+        self.d_finish(t, r);
         self.d_release(t, r);
         if self.reqs[r as usize].d_counted {
             self.reqs[r as usize].d_counted = false;
@@ -3267,7 +3488,7 @@ impl<'a> Sim<'a> {
         rep.rps = cmp.len() as f64 / self.c.score_s;
         let sum = |f: &dyn Fn(&Req) -> f64| -> f64 { cmp.iter().map(|r| f(r)).sum() };
         let pt = sum(&|r| r.pt as f64).max(1.0);
-        let actual = |r: &Req| (r.dev + r.host + r.stor) as f64;
+        let actual = |r: &Req| (r.dev + r.host + r.stor + r.drd) as f64;
         let sa = sum(&|r| actual(r));
         let si = sum(&|r| r.ideal.min(r.pt) as f64);
         rep.hit_sum_a_over_i = if si > 0.0 { sa / si } else { 0.0 };
@@ -3277,6 +3498,20 @@ impl<'a> Sim<'a> {
         rep.host_share = sum(&|r| r.host as f64) / pt;
         rep.pulled_share = sum(&|r| r.stor as f64) / pt;
         let n = cmp.len().max(1) as f64;
+        if self.c.d_cache {
+            let comp = sum(&|r| (r.pt as f64 - actual(r)).max(0.0));
+            rep.d_prefix_share = sum(&|r| r.d_prefix as f64) / pt;
+            rep.dsrv_tokens = sum(&|r| (r.ideal.min(r.pt).min(r.d_prefix) as f64 - actual(r)).max(0.0));
+            rep.dsrv_over_ideal = if si > 0.0 { rep.dsrv_tokens / si } else { 0.0 };
+            rep.dsrv_over_computed = if comp > 0.0 { rep.dsrv_tokens / comp } else { 0.0 };
+            rep.d_prefix_gt_a_rows = cmp.iter().filter(|r| r.d_prefix as f64 > actual(r)).count() as f64 / n;
+            rep.d_local_reuse = sum(&|r| (r.d_prefix as f64 - actual(r)).max(0.0)) / pt;
+            rep.dreads_scored = cmp.iter().filter(|r| r.dread > 0).count() as u64;
+            rep.dread_tokens_scored = cmp.iter().map(|r| r.dread).sum();
+            rep.dread_hit_tokens_scored = cmp.iter().map(|r| r.drd).sum();
+            rep.dreads_all = self.dreads_all;
+            rep.dread_tokens_all = self.dread_tok_all;
+        }
         let zero: Vec<&&Req> = cmp.iter().filter(|r| actual(r) == 0.0 && r.ideal > 0).collect();
         rep.zero_hit_row_share = zero.len() as f64 / n;
         let ideal_rows = cmp.iter().filter(|r| r.ideal > 0).count().max(1) as f64;
@@ -3843,7 +4078,7 @@ impl<'a> Sim<'a> {
                     p: r.p,
                     d: r.d,
                     pt: r.pt,
-                    actual: r.dev + r.host + r.stor,
+                    actual: r.dev + r.host + r.stor + r.drd,
                     ideal: r.ideal,
                     dev: r.dev,
                     host: r.host,
@@ -3874,6 +4109,8 @@ impl<'a> Sim<'a> {
                         (Some(a), Some(b)) => (a - b).max(0.0),
                         _ => -1.0,
                     },
+                    d_prefix: r.d_prefix,
+                    dread: r.drd,
                 });
             }
         }
@@ -4198,5 +4435,76 @@ mod tests {
         }
         // Moves happen only with a strictly earlier predicted finish; every move is counted.
         assert!(rep.eft_counts[0] as f64 >= rep.detour_share * rep.n_admitted_window as f64 - 1.0);
+    }
+
+    /// S2 test config: a P cache that keeps one landed prefix but loses most prompts between turns,
+    /// a large D cache; one D uses round robin (power of two needs two D).
+    fn s2_cfg(n_d: usize, mode: &str) -> SimConfig {
+        SimConfig {
+            n_d,
+            d_policy: if n_d == 1 { "rr".into() } else { "po2".into() },
+            p_dev_tokens: 65_536,
+            p_host_tokens: 131_072,
+            d_cache: true,
+            s2_read: mode.into(),
+            ..small_cfg()
+        }
+    }
+
+    #[test]
+    fn d_cache_matches_at_prealloc_and_releases_every_lock() {
+        let wl = synth_workload(6, 30);
+        let ct = FxHashMap::default();
+        // One D: every later turn finds its earlier prompt on the D.
+        let c = SimConfig { n_d: 1, d_policy: "rr".into(), d_cache: true, ..small_cfg() };
+        let mut sim = Sim::new(c, &wl, &ct);
+        sim.run();
+        let done: Vec<&Req> = sim.reqs.iter().filter(|r| r.done.is_some() && !r.cancel).collect();
+        assert!(done.len() > 50);
+        assert!(done.iter().all(|r| r.d_lock.is_none()), "a D prealloc lock was not released");
+        let later = done.iter().filter(|r| r.ideal > 0).count();
+        let covered = done.iter().filter(|r| r.ideal > 0 && r.d_prefix + 64 >= r.ideal.min(r.pt - 64)).count();
+        assert!(covered * 10 >= later * 9, "D prefix covers {covered} of {later} later turns");
+        let (rep, rows) = sim.report(0.0);
+        assert!(rep.d_prefix_share > 0.5, "D prefix share {}", rep.d_prefix_share);
+        assert!(rows.iter().any(|r| r.d_prefix > 0));
+        // Off: no D prefix, no D-side numbers.
+        let (rep0, _) = run(SimConfig { n_d: 1, d_policy: "rr".into(), ..small_cfg() }, &wl, &ct);
+        assert_eq!(rep0.d_prefix_share, 0.0);
+        assert_eq!(rep0.dsrv_tokens, 0.0);
+    }
+
+    #[test]
+    fn s2b_reads_the_serving_d_copy_when_the_p_lost_the_prefix() {
+        let wl = synth_workload(12, 30);
+        let ct = FxHashMap::default();
+        let (base, _) = run(s2_cfg(1, "off"), &wl, &ct);
+        let (rd, rows) = run(s2_cfg(1, "b"), &wl, &ct);
+        // Base: the P lost part of the prefixes and the D held them (static bound > 0); no read.
+        assert!(base.dsrv_over_ideal > 0.05, "Dsrv {} hit {}", base.dsrv_over_ideal, base.hit_sum_a_over_i);
+        assert_eq!(base.dreads_all, 0);
+        // S2b: reads from the serving D recover part of it.
+        assert!(rd.dreads_scored > 0 && rd.dread_hit_tokens_scored > 0);
+        assert!(rd.hit_sum_a_over_i > base.hit_sum_a_over_i + 0.02, "hit {} vs {}", rd.hit_sum_a_over_i, base.hit_sum_a_over_i);
+        assert!(rd.uncached_per_req < base.uncached_per_req);
+        assert!(rows.iter().filter(|r| r.completed).any(|r| r.dread > 0 && r.actual >= r.dread));
+        // "a" reads only after a hinted pull; CA gives no hints: no read.
+        let (ra, _) = run(s2_cfg(1, "a"), &wl, &ct);
+        assert_eq!(ra.dreads_all, 0);
+    }
+
+    #[test]
+    fn s2c_reads_from_the_previous_turn_d() {
+        let wl = synth_workload(12, 30);
+        let ct = FxHashMap::default();
+        // Three D chosen by power of two: the serving D often did not serve the previous turn.
+        let mut sim = Sim::new(s2_cfg(3, "c"), &wl, &ct);
+        sim.run();
+        let reads: Vec<&Req> = sim.reqs.iter().filter(|r| r.dread > 0).collect();
+        assert!(!reads.is_empty());
+        assert!(reads.iter().any(|r| r.dread_src != Some(r.d)), "no read from another D");
+        assert!(sim.reqs.iter().all(|r| r.dread_pending == false || r.done.is_none()));
+        let (rc, _) = sim.report(0.0);
+        assert!(rc.dread_hit_tokens_scored > 0);
     }
 }
