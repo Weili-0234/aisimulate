@@ -352,6 +352,10 @@ pub struct TwoTierRadix {
     /// S6: eviction trigger label set by the caller around an insert (0 prefill, 1 pull landing,
     /// 2 other = default); recorded on host evictions and device-eviction counters.
     pub ev_cause: u8,
+    /// LAMBDA: record the block runs of every deleted node (blocks gone from both tiers) for the caller's ghost
+    /// list (the caller drains ghost_log).
+    pub ghost_on: bool,
+    pub ghost_log: Vec<(u64, u32)>,
 }
 
 /// Longest common prefix of node runs `eruns` and prompt runs `pruns[ri..]` (offset `off` into
@@ -443,6 +447,8 @@ impl TwoTierRadix {
             pf_mark: false,
             pf_blocks: 0,
             ev_cause: 2,
+            ghost_on: false,
+            ghost_log: Vec::new(),
         }
     }
 
@@ -499,6 +505,10 @@ impl TwoTierRadix {
     }
 
     fn release(&mut self, id: NodeId) {
+        if self.ghost_on {
+            let runs = std::mem::take(&mut self.nodes[id as usize].runs);
+            self.ghost_log.extend(runs);
+        }
         let n = &mut self.nodes[id as usize];
         n.alive = false;
         n.ch = FxHashMap::default();

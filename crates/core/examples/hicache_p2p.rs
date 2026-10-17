@@ -91,15 +91,16 @@ fn main() -> Result<()> {
         if let Some(pfx) = &rows_prefix {
             let path = format!("{pfx}-seed{}.tsv", rep.seed);
             let mut f = std::io::BufWriter::new(std::fs::File::create(&path)?);
-            writeln!(f, "task_row\tagent\tidx\tadmit\tp\td\tpt\tactual\tideal\tdev\thost\tpulled\troute_best\troute_tgt\tfc_best\tpull_hint\tdetour\tttft\te2e\tct\tcompleted\tp_queue\td_wait\tprefill_s\tdecode_s\td_held\td_prefix\tdread\tpred_lab\tpred_c\tpred_c0\tpred_b0\tpred_s0\tpred_idle\trecv_s\tready_s\towner")?;
+            writeln!(f, "task_row\tagent\tidx\tadmit\tp\td\tpt\tactual\tideal\tdev\thost\tpulled\troute_best\troute_tgt\tfc_best\tpull_hint\tdetour\tttft\te2e\tct\tcompleted\tp_queue\td_wait\tprefill_s\tdecode_s\td_held\td_prefix\tdread\tpred_lab\tpred_c\tpred_c0\tpred_b0\tpred_s0\tpred_idle\trecv_s\tready_s\towner\tforced\tfm_gain\tfm_pulled\tinj\tghost")?;
             for r in &rows {
                 writeln!(
                     f,
-                    "{}\t{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}",
+                    "{}\t{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{}\t{:.4}\t{}\t{}\t{}",
                     r.task_row, r.agent, r.idx, r.admit, r.p, r.d, r.pt, r.actual, r.ideal, r.dev, r.host, r.pulled,
                     r.route_best, r.route_tgt, r.fc_best, r.pull_hint, r.detour as u8, r.ttft, r.e2e, r.ct, r.completed as u8,
                     r.p_queue, r.d_wait, r.prefill_s, r.decode_s, r.d_held, r.d_prefix, r.dread,
-                    r.pred_lab, r.pred_c, r.pred_c0, r.pred_b0, r.pred_s0, r.pred_idle as u8, r.recv_s, r.ready_s, r.owner
+                    r.pred_lab, r.pred_c, r.pred_c0, r.pred_b0, r.pred_s0, r.pred_idle as u8, r.recv_s, r.ready_s, r.owner,
+                    r.forced as u8, r.fm_gain, r.fm_pulled, r.inj as u8, r.ghost
                 )?;
             }
         }

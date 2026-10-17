@@ -494,6 +494,38 @@ pub struct SimConfig {
     /// Output only: every 0.1 s of the score window, P idle while work waits elsewhere (router queue or another
     /// P's waiting queue) and the per-P outstanding uncached tokens max / mean.
     pub iww_metric: bool,
+    /// LAMBDA study (2026-10-17; all default off = every older arm bit-identical).
+    /// Ghost list: per P the blocks most recently deleted from the P (gone from both tiers), up to ghost_frac x the
+    /// host capacity, FIFO by deletion. A request's ghost hit = blocks beyond its actual match (local + pulled) on the
+    /// serving P, contiguous from the match end, that are in that P's ghost: they would have hit with a host pool
+    /// larger by the ghost size. h = ghost-hit tokens per second / ghost tokens = marginal hit rate of host capacity.
+    /// 0 = off.
+    pub ghost_frac: f64,
+    /// Online estimators (EWMA time constant lam_tau_s, sampled every lam_tick_s): per P ghost-hit rate, ghost size,
+    /// class-0 (known-zero) host tokens, class-0 and all host-evicted tok/s, busy fraction, requests on the P
+    /// (bootstrap + waiting + prefilling), prefill tokens per second; busy periods (P fully idle at both ends).
+    pub lam_tau_s: f64,
+    pub lam_tick_s: f64,
+    /// lambda_auto (EFT path): "off" | "global" | "pair". The copy price per pulled token (s) becomes
+    /// lam_scale x q x h x T_dup / R. h as above; T_dup = class-0 host tokens / class-0 host-evicted tok/s (residence
+    /// of the released source copy; capped at the host turnover); q = E2E seconds per second of extra P work (lam_q);
+    /// R = prefill tokens per busy second. "global" = pool-wide estimates; "pair" = h, q, R of the destination and
+    /// T_dup of the pull source. Until lam_min_s seconds of samples exist, cs_eft_dup_per_token_s applies.
+    pub lam_auto: String,
+    /// q proxy: "sat" = concurrency / n_p x busy fraction; "bp" = requests from a random request to the end of its
+    /// busy period (sum n(n+1)/2 / sum n over busy periods); "L" = 1 + requests on the P; "one" = 1.
+    pub lam_q: String,
+    pub lam_scale: f64,
+    pub lam_min_s: f64,
+    /// Forced moves (counterfactual probe; separate RNG stream): an EFT decision that keeps the owner although the
+    /// best non-owner P with a pull (least price-free total max(wait, pull) + own) is cheaper, with owner hit >=
+    /// fm_min_tokens, is sent to that P with probability fm_rate. 0 = off.
+    pub fm_rate: f64,
+    pub fm_min_tokens: u64,
+    /// Work injection (counterfactual probe; same separate stream): with probability inj_rate a non-warm request's
+    /// first prefill pass takes inj_s more seconds (no cache effect). 0 = off.
+    pub inj_rate: f64,
+    pub inj_s: f64,
 }
 
 impl Default for SimConfig {
@@ -698,6 +730,17 @@ impl Default for SimConfig {
             cs_hol_rho_cap: 0.95,
             cs_hol_rate: "routed".into(),
             iww_metric: false,
+            ghost_frac: 0.0,
+            lam_tau_s: 120.0,
+            lam_tick_s: 5.0,
+            lam_auto: "off".into(),
+            lam_q: "sat".into(),
+            lam_scale: 1.0,
+            lam_min_s: 300.0,
+            fm_rate: 0.0,
+            fm_min_tokens: 32_768,
+            inj_rate: 0.0,
+            inj_s: 1.0,
         }
     }
 }
@@ -748,6 +791,8 @@ enum Ev {
     /// LATE-P: router queue timer; idle-while-waiting sample (output only).
     LpbTick,
     IwwTick,
+    /// LAMBDA: online estimator tick.
+    LamTick,
 }
 
 /// S5 per agent chain router state for the work-function / ski-rental arms: work function per P,
@@ -913,6 +958,13 @@ struct Req {
     /// identity (the agent state; a new identity after an S4 idle END).
     kv_ver: u32,
     kv_sid: u32,
+    /// LAMBDA: forced move (probe) with its predicted self gain (s) and pulled tokens; work injected; ghost-hit
+    /// tokens at the first chunk.
+    forced: bool,
+    fm_gain: f64,
+    fm_pulled: u64,
+    inj: bool,
+    ghost: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -1026,6 +1078,27 @@ struct PW {
     /// LATE-P: forecast-error factor of this P (redrawn per pass); start time of the running pass.
     lpb_nf: f64,
     pass_t0: f64,
+    /// LAMBDA: ghost FIFO (block, seq), live ghost entries (block -> seq), next seq; ghost-hit tokens (whole run,
+    /// score window); prefill tokens computed (whole run); online EWMAs [ghost-hit tok/s, ghost tokens, class-0 host
+    /// tokens, class-0 evicted tok/s, all host-evicted tok/s, busy fraction, requests on the P, prefill tok/s], the
+    /// last raw counters [ghost hits, class-0 evicted, all evicted, busy s, prefill tokens], first-sample flag; busy
+    /// period: requests prefilled in the open period, open flag, decayed sums of n(n+1)/2 and n, last close time,
+    /// window sums [n(n+1)/2, n, periods].
+    ghost_q: VecDeque<(u64, u64)>,
+    ghost_map: FxHashMap<u64, u64>,
+    ghost_seq: u64,
+    ghost_hit_all: u64,
+    ghost_hit_win: u64,
+    tok_done: u64,
+    lam_e: [f64; 8],
+    lam_last: [f64; 5],
+    lam_ok: bool,
+    bp_n: u64,
+    bp_open: bool,
+    bp_a: f64,
+    bp_b: f64,
+    bp_t: f64,
+    bp_win: [f64; 3],
 }
 
 struct DW {
@@ -1379,6 +1452,22 @@ pub struct SimReport {
     /// iww_metric: [share of P-samples idle while work waits elsewhere, samples, per-P outstanding uncached max /
     /// mean p50, p90].
     pub iww: [f64; 4],
+    /// LAMBDA study (score window). ghost: [ghost-hit tok/s (all P), mean ghost tokens (all P), h = their ratio
+    /// (1/s)]. lam_est (means of the online estimators over the window ticks, pool-wide): [h (1/s), T_dup (s), q_sat,
+    /// q_bp, q_L, R (prefill tok per busy s), lambda_auto global with lam_q (s per token, mean of ticks), class-0 host
+    /// tokens, class-0 evicted tok/s, all host-evicted tok/s]; lam_auto_pct: p10 / p90 of the per-tick global value;
+    /// q_bp_win: [sum n(n+1)/2 / sum n over the window's busy periods, busy periods, mean n]; lam_used: [mean price
+    /// used on priced pull candidates in the window (s per token), count]; fm: [eligible decisions (whole run), forced
+    /// (whole run), forced in the window, mean pulled tokens, mean predicted self gain (s)]; inj: [whole run, window];
+    /// per-request ghost-hit tokens of the scored requests (mean); prefill tokens computed in the window per second.
+    pub ghost: [f64; 3],
+    pub lam_est: [f64; 10],
+    pub lam_auto_pct: [f64; 2],
+    pub q_bp_win: [f64; 3],
+    pub lam_used: [f64; 2],
+    pub fm: [f64; 5],
+    pub inj: [u64; 2],
+    pub ghost_per_req: f64,
     pub wall_s: f64,
 }
 
@@ -1429,6 +1518,12 @@ pub struct Row {
     pub recv_s: f64,
     pub ready_s: f64,
     pub owner: u16,
+    /// LAMBDA: forced move (probe), its predicted self gain (s) and pulled tokens; work injected; ghost-hit tokens.
+    pub forced: bool,
+    pub fm_gain: f64,
+    pub fm_pulled: u64,
+    pub inj: bool,
+    pub ghost: u64,
 }
 
 pub struct Sim<'a> {
@@ -1558,6 +1653,21 @@ pub struct Sim<'a> {
     lmm: Vec<f64>,
     lo: f64,
     hi: f64,
+    /// LAMBDA: estimator tick time, first tick, score-window samples [ghost-hit tok/s, ghost tokens, class-0 host
+    /// tokens, class-0 evicted tok/s, all evicted tok/s (sums over P), busy fraction, requests on a P (means over P),
+    /// prefill tok/s (sum), q_bp (pool), lambda_auto global (s per token), h, T_dup, q (lam_q), R]; lambda_auto used on
+    /// priced pull candidates (sum, count, window sum, window count); forced moves [eligible, forced whole run,
+    /// forced in window], their pulled tokens and predicted self gain in the window; injections [whole run, window].
+    lam_t: f64,
+    lam_t0: f64,
+    lam_win: Vec<[f64; 14]>,
+    lam_used: (f64, u64, f64, u64),
+    fm_rng: PyRandom,
+    fm_elig: u64,
+    fm_n: [u64; 2],
+    fm_tok_win: u64,
+    fm_gain_win: f64,
+    inj_n: [u64; 2],
 }
 
 fn step_ms(b: i64, s_tok: u64) -> f64 {
@@ -1699,6 +1809,7 @@ impl<'a> Sim<'a> {
             radix.demote_scope =
                 if c.demote_scope_device { DemoteScope::DeviceAndHost } else { DemoteScope::Host };
             radix.record_evictions = true;
+            radix.ghost_on = c.ghost_frac > 0.0;
             radix.split_refresh = c.split_refresh;
             radix.split_on_match = c.split_on_match;
             if c.kv_retention {
@@ -1752,6 +1863,21 @@ impl<'a> Sim<'a> {
                 lp_cur: 0,
                 lpb_nf: 1.0,
                 pass_t0: 0.0,
+                ghost_q: VecDeque::new(),
+                ghost_map: FxHashMap::default(),
+                ghost_seq: 0,
+                ghost_hit_all: 0,
+                ghost_hit_win: 0,
+                tok_done: 0,
+                lam_e: [0.0; 8],
+                lam_last: [0.0; 5],
+                lam_ok: false,
+                bp_n: 0,
+                bp_open: false,
+                bp_a: 0.0,
+                bp_b: 0.0,
+                bp_t: 0.0,
+                bp_win: [0.0; 3],
             });
         }
         if c.kv_retention {
@@ -1929,6 +2055,16 @@ impl<'a> Sim<'a> {
             lmm: Vec::new(),
             lo,
             hi,
+            lam_t: 0.0,
+            lam_t0: -1.0,
+            lam_win: Vec::new(),
+            lam_used: (0.0, 0, 0.0, 0),
+            fm_rng: PyRandom::new(0x4c41_0000 + s5_seed),
+            fm_elig: 0,
+            fm_n: [0; 2],
+            fm_tok_win: 0,
+            fm_gain_win: 0.0,
+            inj_n: [0; 2],
         }
     }
 
@@ -2026,6 +2162,15 @@ impl<'a> Sim<'a> {
         if self.c.iww_metric {
             self.at(self.lo, Ev::IwwTick);
         }
+        if self.c.ghost_frac > 0.0 || self.c.lam_auto != "off" {
+            assert!(matches!(self.c.lam_auto.as_str(), "off" | "global" | "pair"), "lam_auto: off | global | pair");
+            assert!(matches!(self.c.lam_q.as_str(), "sat" | "bp" | "L" | "one"), "lam_q: sat | bp | L | one");
+            assert!(
+                self.c.lam_auto == "off" || (self.c.ghost_frac > 0.0 && self.c.p_policy == "eft"),
+                "lam_auto needs ghost_frac > 0 and p_policy eft"
+            );
+            self.at(self.c.lam_tick_s.max(0.1), Ev::LamTick);
+        }
         while let Some(it) = self.heap.pop() {
             if it.t > self.c.duration_s + 1.0 {
                 break;
@@ -2104,6 +2249,7 @@ impl<'a> Sim<'a> {
                     self.lpb_dispatch(t);
                 }
                 Ev::IwwTick => self.iww_tick(t),
+                Ev::LamTick => self.lam_tick(t),
                 Ev::FpiPilotEnd => {
                     let dt = self.c.cs_fpi_pilot_s.max(1e-9);
                     let cap = self.c.cs_fpi_rho_cap;
@@ -2854,6 +3000,15 @@ impl<'a> Sim<'a> {
                         self.lp_stats.0 += m;
                         self.lp_stats.1 += 1;
                         self.c.cs_eft_dup_per_token_s * m
+                    } else if self.c.lam_auto != "off" && pl > 0 {
+                        let la = self.lam_auto_s(t, w, hint[w].map(|x| x.0));
+                        self.lam_used.0 += la;
+                        self.lam_used.1 += 1;
+                        if t >= self.lo && t < self.hi {
+                            self.lam_used.2 += la;
+                            self.lam_used.3 += 1;
+                        }
+                        la
                     } else {
                         self.c.cs_eft_dup_per_token_s
                     };
@@ -3019,6 +3174,33 @@ impl<'a> Sim<'a> {
                     )
                 };
                 tgt = t_;
+                if self.c.fm_rate > 0.0 && tgt == own && self.force_tgt.is_none() && local[own] >= self.c.fm_min_tokens {
+                    // LAMBDA probe: force a priced-out pull move to the best non-owner P (price-free total).
+                    let tot0 = |w: usize| wait[w].max(pull_s[w]) + own_s[w];
+                    let best = (0..np)
+                        .filter(|&w| w != own && pulled[w] > 0)
+                        .min_by(|&a, &b| tot0(a).total_cmp(&tot0(b)).then(a.cmp(&b)));
+                    if let Some(b) = best {
+                        if tot0(b) < tot0(own) {
+                            self.fm_elig += 1;
+                            let u = self.fm_rng.random();
+                            if u < self.c.fm_rate {
+                                tgt = b;
+                                let g = tot0(own) - tot0(b);
+                                let rq = &mut self.reqs[r as usize];
+                                rq.forced = true;
+                                rq.fm_gain = g;
+                                rq.fm_pulled = pulled[b];
+                                self.fm_n[0] += 1;
+                                if t >= self.lo && t < self.hi {
+                                    self.fm_n[1] += 1;
+                                    self.fm_tok_win += pulled[b];
+                                    self.fm_gain_win += g;
+                                }
+                            }
+                        }
+                    }
+                }
                 if let Some(f) = self.force_tgt {
                     tgt = f;
                     own = own_hit;
@@ -3825,6 +4007,9 @@ impl<'a> Sim<'a> {
                 0
             };
             self.p[p].idle_since = Some((t, cls));
+            if cls == 0 && (self.c.ghost_frac > 0.0 || self.c.lam_auto != "off") {
+                self.bp_close(t, p);
+            }
         }
     }
 
@@ -4247,6 +4432,21 @@ impl<'a> Sim<'a> {
         rq.sched = 0;
         rq.computed = 0;
         rq.lbcost = lb.max(0.0);
+        if self.c.inj_rate > 0.0 && !self.reqs[r as usize].warm {
+            let u = self.fm_rng.random();
+            if u < self.c.inj_rate {
+                let rq = &mut self.reqs[r as usize];
+                rq.lbcost += self.c.inj_s;
+                rq.inj = true;
+                self.inj_n[0] += 1;
+                if t >= self.lo && t < self.hi {
+                    self.inj_n[1] += 1;
+                }
+            }
+        }
+        if self.c.ghost_frac > 0.0 {
+            self.ghost_count(t, x, r);
+        }
     }
 
     /// One scheduler pass: form a batch, then the F3 guard step (after batch formation).
@@ -4408,6 +4608,7 @@ impl<'a> Sim<'a> {
         }
         pw.run_items = Some(items);
         pw.pass_t0 = t;
+        pw.bp_open = true;
         self.p_idle_update(t, p);
         self.at(t + svc, Ev::EndIter(p as u16));
         let nxt = self.form(t, p);
@@ -4416,6 +4617,7 @@ impl<'a> Sim<'a> {
 
     fn end_iter(&mut self, t: f64, p: usize) {
         let items = self.p[p].run_items.take().unwrap_or_default();
+        self.p[p].tok_done += items.iter().map(|x| x.n).sum::<u64>();
         for it in &items {
             let rq = &mut self.reqs[it.r as usize];
             rq.computed += it.n;
@@ -4451,6 +4653,7 @@ impl<'a> Sim<'a> {
 
     fn prefill_done(&mut self, t: f64, p: usize, r: u32) {
         self.reqs[r as usize].t_pd = Some(t);
+        self.p[p].bp_n += 1;
         if let Some(i) = self.p[p].pf_set.iter().position(|&x| x == r) {
             self.p[p].pf_set.swap_remove(i);
         }
@@ -5226,6 +5429,211 @@ impl<'a> Sim<'a> {
 
     /// Output only (iww_metric): P idle while work waits in the router queue or in another P's waiting queue;
     /// per-P outstanding uncached tokens (waiting + admitted + bootstrap) max / mean.
+    // ------------------------------------------------------------------------------ LAMBDA study
+    /// Move the deletions logged by P p's tree into its ghost list and trim it to ghost_frac x host capacity.
+    fn ghost_drain(&mut self, p: usize) {
+        let cap = (self.c.ghost_frac * self.p[p].radix.host_cap as f64).max(1.0) as usize;
+        let pw = &mut self.p[p];
+        let log = std::mem::take(&mut pw.radix.ghost_log);
+        for (s, c) in log {
+            for i in 0..c as u64 {
+                pw.ghost_seq += 1;
+                pw.ghost_map.insert(s + i, pw.ghost_seq);
+                pw.ghost_q.push_back((s + i, pw.ghost_seq));
+            }
+        }
+        while pw.ghost_map.len() > cap {
+            let Some((b, q)) = pw.ghost_q.pop_front() else { break };
+            if pw.ghost_map.get(&b) == Some(&q) {
+                pw.ghost_map.remove(&b);
+            }
+        }
+        if pw.ghost_q.len() > 4 * cap + 1024 {
+            let gm = &pw.ghost_map;
+            pw.ghost_q.retain(|&(b, q)| gm.get(&b) == Some(&q));
+        }
+    }
+
+    /// Ghost hit of request r on its serving P p (first chunk): blocks beyond the actual match, contiguous from the
+    /// match end and within the engine match cap, that are in p's ghost. Counted blocks leave the ghost (recomputed).
+    fn ghost_count(&mut self, t: f64, p: usize, r: u32) {
+        self.ghost_drain(p);
+        let bt = self.c.block_tokens;
+        let (have, cap, runs) = {
+            let rq = &self.reqs[r as usize];
+            ((rq.dev + rq.host + rq.stor + rq.drd) / bt, rq.pt.saturating_sub(1) / bt, rq.runs.clone())
+        };
+        let pw = &mut self.p[p];
+        let mut off = 0u64;
+        let mut n = 0u64;
+        'outer: for &(s, c) in &runs {
+            let c = c as u64;
+            if off + c <= have {
+                off += c;
+                continue;
+            }
+            for i in have.saturating_sub(off)..c {
+                if off + i >= cap || pw.ghost_map.remove(&(s + i)).is_none() {
+                    break 'outer;
+                }
+                n += 1;
+            }
+            off += c;
+        }
+        let tok = n * bt;
+        pw.ghost_hit_all += tok;
+        if t >= self.lo && t < self.hi {
+            pw.ghost_hit_win += tok;
+        }
+        self.reqs[r as usize].ghost = tok;
+    }
+
+    /// Busy-period bookkeeping: called when P p becomes fully idle (nothing queued or running).
+    fn bp_close(&mut self, t: f64, p: usize) {
+        let tau = self.c.lam_tau_s.max(1e-3);
+        let win = t >= self.lo && t < self.hi;
+        let pw = &mut self.p[p];
+        if !pw.bp_open {
+            return;
+        }
+        pw.bp_open = false;
+        let n = pw.bp_n as f64;
+        pw.bp_n = 0;
+        if n <= 0.0 {
+            return;
+        }
+        let d = (-(t - pw.bp_t).max(0.0) / tau).exp();
+        pw.bp_a = pw.bp_a * d + n * (n + 1.0) / 2.0;
+        pw.bp_b = pw.bp_b * d + n;
+        pw.bp_t = t;
+        if win {
+            pw.bp_win[0] += n * (n + 1.0) / 2.0;
+            pw.bp_win[1] += n;
+            pw.bp_win[2] += 1.0;
+        }
+    }
+
+    /// lambda_auto parts over destination set w (None = all P) and source set o: [h, T_dup, q, R, lambda (s/token)].
+    fn lam_parts(&self, w: Option<usize>, o: Option<usize>) -> [f64; 5] {
+        let np = self.p.len();
+        let iw: Vec<usize> = match w {
+            Some(k) => vec![k],
+            None => (0..np).collect(),
+        };
+        let io: Vec<usize> = match o {
+            Some(k) => vec![k],
+            None => (0..np).collect(),
+        };
+        let bt = self.c.block_tokens as f64;
+        let sum = |ix: &[usize], k: usize| ix.iter().map(|&i| self.p[i].lam_e[k]).sum::<f64>();
+        let gs = sum(&iw, 1);
+        let gtarget: f64 = iw.iter().map(|&i| self.c.ghost_frac * self.p[i].radix.host_cap as f64 * bt).sum();
+        let h = if gs > 0.01 * gtarget && gs > 0.0 { sum(&iw, 0) / gs } else { 0.0 };
+        let (c0, e0, eall) = (sum(&io, 2), sum(&io, 3), sum(&io, 4));
+        let cap: f64 = io.iter().map(|&i| self.p[i].radix.host_cap as f64 * bt).sum();
+        let turn = cap / eall.max(1.0);
+        let tdup = ((c0 + bt) / e0.max(1.0)).min(turn);
+        let nw = iw.len() as f64;
+        let busy = (sum(&iw, 5) / nw).clamp(0.0, 1.0);
+        let q = match self.c.lam_q.as_str() {
+            "sat" => self.c.concurrency as f64 / np as f64 * busy,
+            "bp" => {
+                let a: f64 = iw.iter().map(|&i| self.p[i].bp_a).sum();
+                let b: f64 = iw.iter().map(|&i| self.p[i].bp_b).sum();
+                if b > 0.0 { (a / b).max(1.0) } else { 1.0 }
+            }
+            "L" => 1.0 + sum(&iw, 6) / nw,
+            _ => 1.0,
+        };
+        let r = sum(&iw, 7) / sum(&iw, 5).max(1e-9);
+        let lam = if r > 0.0 { self.c.lam_scale * q * h * tdup / r } else { 0.0 };
+        [h, tdup, q, r, lam]
+    }
+
+    /// Copy price (s per pulled token) of lambda_auto for a pull to w from source o.
+    fn lam_auto_s(&self, t: f64, w: usize, o: Option<usize>) -> f64 {
+        if self.lam_t0 < 0.0 || t - self.lam_t0 < self.c.lam_min_s {
+            return self.c.cs_eft_dup_per_token_s;
+        }
+        if self.c.lam_auto == "pair" {
+            self.lam_parts(Some(w), o)[4]
+        } else {
+            self.lam_parts(None, None)[4]
+        }
+    }
+
+    /// Online estimator tick: per P EWMAs of the lambda_auto inputs; window samples.
+    fn lam_tick(&mut self, t: f64) {
+        let np = self.p.len();
+        let bt = self.c.block_tokens as f64;
+        let dt = (t - self.lam_t).max(1e-9);
+        self.lam_t = t;
+        let a = 1.0 - (-dt / self.c.lam_tau_s.max(1e-3)).exp();
+        for w in 0..np {
+            if self.c.ghost_frac > 0.0 {
+                self.ghost_drain(w);
+            }
+            let pw = &mut self.p[w];
+            let raw = [
+                pw.ghost_hit_all as f64,
+                (pw.radix.stats.kv_evicted_blocks[0] + pw.radix.stats.kv_evicted_blocks[1]) as f64 * bt,
+                pw.radix.stats.host_evicted_blocks as f64 * bt,
+                pw.busy_s,
+                pw.tok_done as f64,
+            ];
+            let c0 = pw.radix.kv_class0_host_blocks() as f64 * bt;
+            let s = [
+                (raw[0] - pw.lam_last[0]) / dt,
+                pw.ghost_map.len() as f64 * bt,
+                c0,
+                (raw[1] - pw.lam_last[1]) / dt,
+                (raw[2] - pw.lam_last[2]) / dt,
+                ((raw[3] - pw.lam_last[3]) / dt).clamp(0.0, 1.0),
+                (pw.bq.len() + pw.wq.len() + pw.pf_set.len()) as f64,
+                (raw[4] - pw.lam_last[4]) / dt,
+            ];
+            if pw.lam_ok {
+                for k in 0..8 {
+                    pw.lam_e[k] += a * (s[k] - pw.lam_e[k]);
+                }
+            } else {
+                pw.lam_e = s;
+                pw.lam_ok = true;
+            }
+            pw.lam_last = raw;
+        }
+        if self.lam_t0 < 0.0 {
+            self.lam_t0 = t;
+        }
+        if t >= self.lo && t < self.hi {
+            let g = self.lam_parts(None, None);
+            let sm = |k: usize| self.p.iter().map(|p| p.lam_e[k]).sum::<f64>();
+            let a_: f64 = self.p.iter().map(|p| p.bp_a).sum();
+            let b_: f64 = self.p.iter().map(|p| p.bp_b).sum();
+            let qbp = if b_ > 0.0 { (a_ / b_).max(1.0) } else { 1.0 };
+            self.lam_win.push([
+                sm(0),
+                sm(1),
+                sm(2),
+                sm(3),
+                sm(4),
+                sm(5) / np as f64,
+                sm(6) / np as f64,
+                sm(7),
+                qbp,
+                g[4],
+                g[0],
+                g[1],
+                g[2],
+                g[3],
+            ]);
+        }
+        if t < self.c.duration_s {
+            let dt = self.c.lam_tick_s.max(0.1);
+            self.at(t + dt, Ev::LamTick);
+        }
+    }
+
     fn iww_tick(&mut self, t: f64) {
         if t >= self.hi {
             return;
@@ -6502,6 +6910,41 @@ impl<'a> Sim<'a> {
                 rep.pull_free_tokens[2] += w.radix.pf_blocks * bt;
             }
         }
+        if self.c.ghost_frac > 0.0 || self.c.lam_auto != "off" {
+            let sc = (hi - lo).max(1e-9);
+            let gh: f64 = self.p.iter().map(|p| p.ghost_hit_win as f64).sum::<f64>() / sc;
+            let ns = self.lam_win.len().max(1) as f64;
+            let m = |k: usize| self.lam_win.iter().map(|x| x[k]).sum::<f64>() / ns;
+            rep.ghost = [gh, m(1), if m(1) > 0.0 { gh / m(1) } else { 0.0 }];
+            let busy = m(5);
+            let bw: [f64; 3] = self.p.iter().fold([0.0; 3], |acc, p| [acc[0] + p.bp_win[0], acc[1] + p.bp_win[1], acc[2] + p.bp_win[2]]);
+            rep.q_bp_win = [
+                if bw[1] > 0.0 { bw[0] / bw[1] } else { 0.0 },
+                bw[2],
+                if bw[2] > 0.0 { bw[1] / bw[2] } else { 0.0 },
+            ];
+            rep.lam_est = [
+                if m(1) > 0.0 { m(0) / m(1) } else { 0.0 },
+                m(11),
+                self.c.concurrency as f64 / self.p.len() as f64 * busy,
+                m(8),
+                1.0 + m(6),
+                m(13),
+                m(9),
+                m(2),
+                m(3),
+                m(4),
+            ];
+            let mut lv: Vec<f64> = self.lam_win.iter().map(|x| x[9]).collect();
+            if !lv.is_empty() {
+                rep.lam_auto_pct = [percentile_in_place(&mut lv, 10.0), percentile_in_place(&mut lv, 90.0)];
+            }
+        }
+        rep.lam_used = [if self.lam_used.3 > 0 { self.lam_used.2 / self.lam_used.3 as f64 } else { 0.0 }, self.lam_used.3 as f64];
+        let nf = self.fm_n[1].max(1) as f64;
+        rep.fm = [self.fm_elig as f64, self.fm_n[0] as f64, self.fm_n[1] as f64, self.fm_tok_win as f64 / nf, self.fm_gain_win / nf];
+        rep.inj = self.inj_n;
+        rep.ghost_per_req = cmp.iter().map(|r| r.ghost as f64).sum::<f64>() / cmp.len().max(1) as f64;
         let mut rows = Vec::new();
         if self.c.record_rows {
             for r in &w {
@@ -6559,6 +7002,11 @@ impl<'a> Sim<'a> {
                     recv_s: if r.pred_t > 0.0 { r.p_recv - r.pred_t } else { -1.0 },
                     ready_s: r.p_ready.map(|x| x - r.p_recv).unwrap_or(-1.0),
                     owner: r.owner,
+                    forced: r.forced,
+                    fm_gain: r.fm_gain,
+                    fm_pulled: r.fm_pulled,
+                    inj: r.inj,
+                    ghost: r.ghost,
                 });
             }
         }
@@ -7550,5 +7998,60 @@ mod tests {
         assert!(rep.guard_grants.iter().sum::<u64>() > 0, "guard never locked");
         assert!(rep.kv_evicted_tokens_all[0] + rep.kv_evicted_tokens_all[1] > 0, "{:?}", rep.kv_evicted_tokens_all);
         assert!(rep.kv_end_ops[0] > 0);
+    }
+    #[test]
+    fn lambda_probes_and_auto_price_run_and_keep_counts_consistent() {
+        let wl = synth_workload(12, 30);
+        let ct = FxHashMap::default();
+        let base = SimConfig {
+            cs_workload: "true".into(),
+            p_dev_tokens: 131_072,
+            p_host_tokens: 262_144,
+            kv_retention: true,
+            kvret_mode: "transfer_end".into(),
+            pull_min_incremental_tokens: 512,
+            p_policy: "eft".into(),
+            cs_eft_one_way: false,
+            cs_eft_dup_rho: 0.0,
+            cs_eft_wait_transit: true,
+            cs_eft_dup_per_token_s: 6.8e-4,
+            ..kv_cfg("smgca")
+        };
+        let go = |c: SimConfig| {
+            let mut s = Sim::new(c, &wl, &ct);
+            s.run();
+            for w in &s.p {
+                w.radix.check().unwrap();
+                assert!(w.ghost_map.len() as f64 <= (s.c.ghost_frac * w.radix.host_cap as f64).max(1.0) + 1.0);
+            }
+            let (rep, rows) = s.report(0.0);
+            assert!(rep.n_scored > 50, "scored {}", rep.n_scored);
+            (rep, rows)
+        };
+        let (b, _) = go(base.clone());
+        assert_eq!(b.ghost, [0.0; 3]);
+        assert_eq!(b.fm[1], 0.0);
+        let g = SimConfig { ghost_frac: 0.05, lam_tick_s: 5.0, lam_tau_s: 60.0, lam_min_s: 30.0, ..base.clone() };
+        let (gr, _) = go(g.clone());
+        // Ghost tracking alone does not change routing.
+        assert_eq!(gr.rps, b.rps);
+        assert_eq!(gr.e2e_mean, b.e2e_mean);
+        assert!(gr.ghost.iter().all(|x| x.is_finite() && *x >= 0.0), "{:?}", gr.ghost);
+        assert!(gr.lam_est.iter().all(|x| x.is_finite() && *x >= 0.0), "{:?}", gr.lam_est);
+        assert!(gr.lam_est[5] > 0.0, "R {:?}", gr.lam_est);
+        assert!(gr.q_bp_win[0] >= 1.0 || gr.q_bp_win[1] == 0.0, "{:?}", gr.q_bp_win);
+        for (mode, q) in [("global", "sat"), ("pair", "bp"), ("global", "L"), ("pair", "one")] {
+            let (a, _) = go(SimConfig { lam_auto: mode.into(), lam_q: q.into(), record_rows: true, ..g.clone() });
+            assert!(a.lam_used[0].is_finite() && a.lam_used[0] >= 0.0, "{:?}", a.lam_used);
+            assert!(a.rps > 0.0);
+        }
+        let (f, rows) = go(SimConfig { fm_rate: 0.5, fm_min_tokens: 0, record_rows: true, ..g.clone() });
+        assert!(f.fm[1] <= f.fm[0] && f.fm[2] <= f.fm[1], "{:?}", f.fm);
+        let nf = rows.iter().filter(|r| r.forced).count() as f64;
+        assert!(nf <= f.fm[2] + 1e-9, "{nf} {:?}", f.fm);
+        assert!(rows.iter().filter(|r| r.forced).all(|r| r.fm_gain > 0.0 && r.fm_pulled > 0));
+        let (i, rows) = go(SimConfig { inj_rate: 0.2, inj_s: 0.5, record_rows: true, ..g.clone() });
+        assert!(i.inj[0] > 0 && i.inj[1] <= i.inj[0], "{:?}", i.inj);
+        assert!(rows.iter().any(|r| r.inj));
     }
 }
