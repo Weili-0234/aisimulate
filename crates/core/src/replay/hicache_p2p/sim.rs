@@ -214,6 +214,14 @@ pub struct SimConfig {
     /// (s); 0 = off. Small-prefix-first: a move may pull at most this many tokens; 0 = off.
     pub cs_eft_burst_wait_s: f64,
     pub cs_eft_max_pull_tokens: u64,
+    /// One-way rule part 2 (with cs_eft_one_way): the P the chain moved away from last is not a
+    /// detour target. false = keep the home P as the owner but allow any target (session-sticky
+    /// hysteresis arm: stay home unless another P finishes > cs_eft_margin_s earlier).
+    pub cs_eft_exclude_prev: bool,
+    /// co_schedule pull cap (router VARIANT): a detour target whose pull (expected hit - own hit)
+    /// exceeds this many tokens is not a candidate; the request stays on the cache-holding P unless
+    /// another candidate within the cap wins. 0 = off.
+    pub cs_max_pull_tokens: u64,
     /// P waiting-queue order (engine VARIANT): "fcfs" (engine) or "sjf_aging" = least
     /// (uncached estimate - sjf_aging_tok_per_s x seconds in the waiting queue) first; held requests
     /// are still skipped, the continuing chunk still goes first.
@@ -304,6 +312,9 @@ pub struct SimConfig {
     /// (kvret_dup_reclaim). D side unchanged (no tags reach D). Requires demote-source off.
     pub kv_retention: bool,
     /// With kv_retention: "ready_end" (default: #25 release after READY on a move + END),
+    /// "transfer_end" (the user's design: on a move WITH a pull, the source P's registration of the
+    /// session is released when the pulled pages are committed on the destination, at the same moment
+    /// as the destination's +1; moves without a pull keep ready_end; END as ready_end),
     /// "end_only" (no release on a move; END only), "recency_only" (the #49 engine without session
     /// tags, as with SMG cache-aware: every range untracked = class 1; only the host-recency changes
     /// and the class-1 order apply; no router control traffic).
@@ -409,6 +420,8 @@ impl Default for SimConfig {
             cs_eft_one_way: true,
             cs_eft_burst_wait_s: 0.0,
             cs_eft_max_pull_tokens: 0,
+            cs_eft_exclude_prev: true,
+            cs_max_pull_tokens: 0,
             p_queue_order: "fcfs".into(),
             sjf_aging_tok_per_s: 8192.0,
             d_mode: "d0".into(),
@@ -952,6 +965,12 @@ pub struct SimReport {
     /// bad registrations, live registrations].
     pub kv_releases_sent: [u64; 2],
     pub kv_ready_wait: [f64; 4],
+    /// transfer_end: releases at pull commit [whole run, window] and their wait (move -> release) in
+    /// the window [count, mean, p50, p90] s; kv_ready_wait then covers the READY releases only.
+    /// co_schedule decisions kept on the owner by the pull cap (whole run).
+    pub kv_transfer_releases: [u64; 2],
+    pub kv_transfer_wait: [f64; 4],
+    pub cs_cap_kept: u64,
     pub kv_end_ops: [u64; 2],
     pub kv_retire_cancelled: u64,
     pub kv_retire_dropped_end: u64,
@@ -1070,6 +1089,8 @@ pub struct Sim<'a> {
     /// SimReport::eft_counts.
     eft_home: FxHashMap<(u64, u32), (Option<u16>, Option<u16>)>,
     eft_counts: [u64; 4],
+    /// co_schedule decisions kept on the owner by cs_max_pull_tokens.
+    cs_cap_kept: u64,
     /// S2: per agent chain, the D that served its latest finished turn; D reads issued / tokens.
     last_d: FxHashMap<(u64, u32), u16>,
     dreads_all: u64,
@@ -1079,7 +1100,7 @@ pub struct Sim<'a> {
     /// (delivery time, session, P, version, op), last generate index per (task row, agent).
     kv_sess: FxHashMap<u32, KvSess>,
     kv_pend: Vec<u32>,
-    kv_rel: Vec<(f64, f64)>,
+    kv_rel: Vec<(f64, f64, u8)>,
     kv_end_t: Vec<f64>,
     kv_cancel: u64,
     kv_drop_end: u64,
@@ -1228,8 +1249,8 @@ impl<'a> Sim<'a> {
                  no oracle move, no deferred demote, no shared pool, no S2 read"
             );
             assert!(
-                matches!(c.kvret_mode.as_str(), "ready_end" | "end_only" | "recency_only"),
-                "kvret_mode: ready_end | end_only | recency_only"
+                matches!(c.kvret_mode.as_str(), "ready_end" | "transfer_end" | "end_only" | "recency_only"),
+                "kvret_mode: ready_end | transfer_end | end_only | recency_only"
             );
         }
         if c.shared_pool {
@@ -1325,6 +1346,7 @@ impl<'a> Sim<'a> {
             sess_last_pd: FxHashMap::default(),
             eft_home: FxHashMap::default(),
             eft_counts: [0; 4],
+            cs_cap_kept: 0,
             last_d: FxHashMap::default(),
             dreads_all: 0,
             dread_tok_all: 0,
@@ -1421,7 +1443,7 @@ impl<'a> Sim<'a> {
         if self.c.p_policy == "smgca" && self.c.smg_evict_interval_s > 0.0 {
             self.at(self.c.smg_evict_interval_s, Ev::SmgEvict);
         }
-        if self.kv_tagged() && self.c.kvret_mode == "ready_end" {
+        if self.kv_tagged() && (self.c.kvret_mode == "ready_end" || self.c.kvret_mode == "transfer_end") {
             self.at(self.c.kvret_poll_s, Ev::KvTick);
         }
         while let Some(it) = self.heap.pop() {
@@ -1945,14 +1967,24 @@ impl<'a> Sim<'a> {
                     Some(v) if v.len() >= 2 => v.iter().map(|&x| x as usize).collect(),
                     _ => (0..np).collect(),
                 };
-                let least = allowed
-                    .iter()
-                    .copied()
-                    .min_by(|&a, &b| {
-                        after[a].cmp(&after[b]).then(gpu[b].cmp(&gpu[a])).then(local[b].cmp(&local[a]))
-                            .then(act[a].cmp(&act[b])).then(a.cmp(&b))
-                    })
-                    .unwrap();
+                let pick_least = |cand: &[usize]| -> usize {
+                    cand.iter()
+                        .copied()
+                        .min_by(|&a, &b| {
+                            after[a].cmp(&after[b]).then(gpu[b].cmp(&gpu[a])).then(local[b].cmp(&local[a]))
+                                .then(act[a].cmp(&act[b])).then(a.cmp(&b))
+                        })
+                        .unwrap_or(own)
+                };
+                let mut least = pick_least(&allowed);
+                let cap = self.c.cs_max_pull_tokens;
+                let least_uncapped = least;
+                if cap > 0 {
+                    // Pull cap: a target whose pull (expected hit - own hit) exceeds the cap is no candidate.
+                    let ok: Vec<usize> =
+                        allowed.iter().copied().filter(|&w| w == own || exp[w].saturating_sub(local[w]) <= cap).collect();
+                    least = pick_least(&ok);
+                }
                 let saved = after[own].saturating_sub(after[least]);
                 let mut thr = self.c.cs_margin_tokens as f64;
                 if self.c.cs_hyst_n > 0 || self.c.cs_hyst_t > 0.0 {
@@ -1969,6 +2001,18 @@ impl<'a> Sim<'a> {
                     thr += pulled_est * (self.c.cs_r3_rho + self.c.cs_r3_lambda);
                 }
                 tgt = if least != own && saved as f64 > thr { least } else { own };
+                if cap > 0 && least_uncapped != least {
+                    let saved_u = after[own].saturating_sub(after[least_uncapped]);
+                    let mut thr_u = self.c.cs_margin_tokens as f64;
+                    if self.c.cs_r3_lambda >= 0.0 {
+                        let pe = local[own].saturating_sub(local[least_uncapped]) as f64;
+                        thr_u += pe * (self.c.cs_r3_rho + self.c.cs_r3_lambda);
+                    }
+                    let tgt_u = if least_uncapped != own && saved_u as f64 > thr_u { least_uncapped } else { own };
+                    if tgt_u != tgt {
+                        self.cs_cap_kept += 1;
+                    }
+                }
                 if let Some(k) = pkey {
                     let v = self.pair_set.entry(k).or_default();
                     if !v.contains(&(tgt as u16)) {
@@ -2074,6 +2118,7 @@ impl<'a> Sim<'a> {
                 }
                 let excluded = match prev {
                     Some(pv) if self.c.cs_eft_one_way
+                        && self.c.cs_eft_exclude_prev
                         && (pv as usize) < np
                         && pv as usize != own
                         && local[pv as usize] >= self.c.pull_min_tokens =>
@@ -2977,6 +3022,10 @@ impl<'a> Sim<'a> {
             None
         };
         self.p[dst].radix.insert_kv(&runs, t, host_only, tag);
+        if self.c.kv_retention && self.c.kvret_mode == "transfer_end" {
+            // The destination took its +1 at this commit (insert_kv tag); release the source now.
+            self.kv_transfer_release(t, r, src);
+        }
         self.guard_pressure(t, dst, Some(r));
         let ins = (self.p[dst].radix.stats.host_inserted_blocks - before) * bt;
         if t >= self.lo && t < self.hi {
@@ -3707,13 +3756,32 @@ impl<'a> Sim<'a> {
                 let items = std::mem::take(&mut self.kv_sess.get_mut(&sid).unwrap().retire);
                 for (wp, wv, t0) in items {
                     self.at(t + dt, Ev::KvCtl(sid, wp, wv, 0));
-                    self.kv_rel.push((t, t - t0));
+                    self.kv_rel.push((t, t - t0, 0));
                 }
             } else {
                 keep.push(sid);
             }
         }
         self.kv_pend.extend(keep);
+    }
+
+    /// transfer_end: a pull of the session's current version has landed on its current P; if the pull
+    /// source holds a pending retirement of this session (a move with a pull), release it at once
+    /// (log op 2) instead of waiting for READY.
+    fn kv_transfer_release(&mut self, t: f64, r: u32, src: usize) {
+        let (sid, ver, dst) = {
+            let rq = &self.reqs[r as usize];
+            (rq.agent_state, rq.kv_ver, rq.p)
+        };
+        let Some(s) = self.kv_sess.get_mut(&sid) else { return };
+        if s.ended || s.ver != ver || s.cur != Some(dst) {
+            return;
+        }
+        let Some(i) = s.retire.iter().position(|x| x.0 as usize == src) else { return };
+        let (wp, wv, t0) = s.retire.remove(i);
+        self.p[src].radix.kv_release(sid, wv);
+        self.kv_log.push((t, sid, wp, wv, 2));
+        self.kv_rel.push((t, t - t0, 1));
     }
 
     /// A control op reaches P `p`.
@@ -4407,12 +4475,24 @@ impl<'a> Sim<'a> {
             // ---- session retention, duplicate census, moves per session (output only)
             let inw = |x: f64| x >= lo && x < hi;
             rep.kv_releases_sent = [self.kv_rel.len() as u64, self.kv_rel.iter().filter(|x| inw(x.0)).count() as u64];
-            let mut ages: Vec<f64> = self.kv_rel.iter().filter(|x| inw(x.0)).map(|x| x.1).collect();
-            if !ages.is_empty() {
-                let m = ages.iter().sum::<f64>() / ages.len() as f64;
-                let k = ages.len() as f64;
-                rep.kv_ready_wait = [k, m, percentile_in_place(&mut ages, 50.0), percentile_in_place(&mut ages, 90.0)];
+            for kind in 0..2u8 {
+                let mut ages: Vec<f64> = self.kv_rel.iter().filter(|x| inw(x.0) && x.2 == kind).map(|x| x.1).collect();
+                if !ages.is_empty() {
+                    let m = ages.iter().sum::<f64>() / ages.len() as f64;
+                    let k = ages.len() as f64;
+                    let v = [k, m, percentile_in_place(&mut ages, 50.0), percentile_in_place(&mut ages, 90.0)];
+                    if kind == 0 {
+                        rep.kv_ready_wait = v;
+                    } else {
+                        rep.kv_transfer_wait = v;
+                    }
+                }
             }
+            rep.kv_transfer_releases = [
+                self.kv_rel.iter().filter(|x| x.2 == 1).count() as u64,
+                self.kv_rel.iter().filter(|x| x.2 == 1 && inw(x.0)).count() as u64,
+            ];
+            rep.cs_cap_kept = self.cs_cap_kept;
             rep.kv_end_ops = [self.kv_end_t.len() as u64, self.kv_end_t.iter().filter(|&&x| inw(x)).count() as u64];
             rep.kv_retire_cancelled = self.kv_cancel;
             rep.kv_retire_dropped_end = self.kv_drop_end;
@@ -5038,6 +5118,74 @@ mod tests {
         assert!(ro.p.iter().all(|w| w.radix.kvret && w.radix.kv_class0_host_blocks() == 0));
         let (rr, _) = ro.report(0.0);
         assert_eq!(rr.kv_evicted_tokens_all[0] + rr.kv_evicted_tokens_all[1], 0);
+    }
+
+    #[test]
+    fn kv_transfer_end_releases_the_pull_source_at_the_landing() {
+        let wl = synth_workload(12, 30);
+        let ct = FxHashMap::default();
+        let c = SimConfig {
+            cs_workload: "true".into(),
+            pull_start: "queue".into(),
+            repull_on_admission: true,
+            queued_prefix_protect: true,
+            p_dev_tokens: 131_072,
+            p_host_tokens: 262_144,
+            kvret_mode: "transfer_end".into(),
+            ..kv_cfg("eft")
+        };
+        let mut sim = Sim::new(c, &wl, &ct);
+        sim.run();
+        let tr: Vec<_> = sim.kv_log.iter().filter(|x| x.4 == 2).copied().collect();
+        assert!(!tr.is_empty(), "no transfer release");
+        for &(t, sid, p, ver, _) in &tr {
+            // The release happens at the landing of a newer version's pull from that P onto another P.
+            // (A re-pull at admission can overwrite pull_end, so test the issue-to-admission window.)
+            let ok = sim.reqs.iter().any(|q| {
+                q.agent_state == sid
+                    && q.kv_ver > ver
+                    && q.p != p
+                    && q.pull_src == Some(p)
+                    && q.pull_first_issue_t.is_some_and(|x| x <= t)
+                    && q.t_fwd.map_or(true, |f| t <= f + 1e-9)
+            });
+            assert!(ok, "transfer release of session {sid} v{ver} on P{p} at {t} without a landing");
+        }
+        let (rep, _) = sim.report(0.0);
+        assert_eq!(rep.kv_transfer_releases[0] as usize, tr.len());
+        for a in &rep.kv_audit {
+            assert_eq!(a[..3], [0, 0, 0], "{:?}", rep.kv_audit);
+        }
+        for a in &rep.per_p_audit {
+            assert_eq!(a[..3], [0, 0, 0], "{:?}", rep.per_p_audit);
+        }
+        // ready_end on the same config sends no transfer release.
+        let mut re = Sim::new(SimConfig { kvret_mode: "ready_end".into(), ..sim.c.clone() }, &wl, &ct);
+        re.run();
+        assert!(re.kv_log.iter().all(|x| x.4 != 2));
+    }
+
+    #[test]
+    fn cosched_pull_cap_keeps_large_pulls_on_the_owner() {
+        let wl = synth_workload(12, 30);
+        let ct = FxHashMap::default();
+        let base = SimConfig {
+            p_policy: "cosched".into(),
+            cs_workload: "true".into(),
+            cs_margin_tokens: 0,
+            pull_start: "queue".into(),
+            split_on_match: true,
+            ..small_cfg()
+        };
+        let cap = 16_384u64;
+        let mut sim = Sim::new(SimConfig { cs_max_pull_tokens: cap, ..base.clone() }, &wl, &ct);
+        sim.run();
+        for q in sim.reqs.iter().filter(|q| q.p != q.owner) {
+            assert!(q.pull_hint <= cap, "detour with pull {} > cap", q.pull_hint);
+        }
+        let (rc, _) = sim.report(0.0);
+        let (r0, _) = run(base, &wl, &ct);
+        assert!(rc.cs_cap_kept > 0 && r0.cs_cap_kept == 0);
     }
 
     #[test]
