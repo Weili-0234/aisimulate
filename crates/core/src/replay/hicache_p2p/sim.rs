@@ -432,6 +432,25 @@ pub struct SimConfig {
     /// S7: the copy price lambda applies to every token a candidate would duplicate (best cached
     /// prefix on any P - its own), pulled or recomputed; false = pulled tokens only.
     pub cs_eft_dup_on_recompute: bool,
+    /// S8 PRED-GATE (EFT path; all default off). Forecast error: each P's forecast (B and S together) is
+    /// multiplied per decision by exp(scale x e), e drawn from a table of 201 log(pred / actual) quantiles
+    /// (uniform probabilities 0..1) of a real predictor; the idle table applies when the P has no
+    /// backlog (empty = the busy table). Empty busy table = no noise (oracle forecast).
+    pub cs_pred_noise: Vec<f64>,
+    pub cs_pred_noise_idle: Vec<f64>,
+    pub cs_pred_noise_scale: f64,
+    /// Gate: owner o (most cached prefix, ties by C); w* = argmin over w != o of C_w; move only if
+    /// (C_o - C_w*) - m sqrt(b_o^2 + b_w*^2) > gmin, b_x = k(idle/busy) x forecast_x + floor, where
+    /// forecast_x = max(B_x, T_pull_x) + S_x (the copy price is not part of the forecast).
+    pub cs_pred_gate: bool,
+    pub cs_pred_m: f64,
+    pub cs_pred_gmin_s: f64,
+    pub cs_pred_k_idle: f64,
+    pub cs_pred_k_busy: f64,
+    pub cs_pred_floor_s: f64,
+    /// Output only: record the routing-time forecast of the selected P (ingress base + max(B, T_pull) + S;
+    /// noisy and noise-free) and score it against the actual decision -> prefill-done time.
+    pub pred_metric: bool,
 }
 
 impl Default for SimConfig {
@@ -608,6 +627,16 @@ impl Default for SimConfig {
             cs_hold_sess_cd_s: 60.0,
             idle_overlap_metric: false,
             cs_eft_dup_on_recompute: false,
+            cs_pred_noise: Vec::new(),
+            cs_pred_noise_idle: Vec::new(),
+            cs_pred_noise_scale: 1.0,
+            cs_pred_gate: false,
+            cs_pred_m: 0.0,
+            cs_pred_gmin_s: 0.0,
+            cs_pred_k_idle: 0.0,
+            cs_pred_k_busy: 0.0,
+            cs_pred_floor_s: 0.0,
+            pred_metric: false,
         }
     }
 }
@@ -770,6 +799,11 @@ struct Req {
     /// S7 B1: seconds held in the router; taken by a P other than its owner.
     hold_s: f64,
     stolen: bool,
+    /// S8: routing time and forecast of the selected P (noisy, noise-free), P idle at the decision.
+    pred_t: f64,
+    pred_c: f64,
+    pred_c0: f64,
+    pred_idle: bool,
     unc_est: u64,
     ideal: u64,
     // routing / gap cause
@@ -1233,6 +1267,13 @@ pub struct SimReport {
     pub stolen_share: f64,
     pub hold_s_mean: f64,
     pub idle_overlap_share: f64,
+    /// S8 forecast scoring (pred_metric; scored requests routed on the EFT path): rows [noisy forecast,
+    /// noise-free forecast] x [n, MAPE all, MAPE idle, MAPE busy, APE p50, APE p90, bias s, n idle];
+    /// |actual - forecast| / forecast quantiles q 0.5 / 0.6827 / 0.8 / 0.9, rows [noisy idle, noisy busy,
+    /// noise-free idle, noise-free busy]; gate counters [decisions, cheaper non-owner P exists, moves].
+    pub pred_err: Vec<[f64; 8]>,
+    pub pred_kq: Vec<[f64; 4]>,
+    pub pred_gate: [u64; 3],
     /// S7 B1 debug at the end of the run: held count, then per P [backlog s without ledger, ledger s,
     /// waiting, bootstrap, prefilling counts].
     pub hold_end: Vec<f64>,
@@ -1378,6 +1419,8 @@ pub struct Sim<'a> {
     /// last steal received per P, last move per session; idle intervals (start, end, P).
     held: Vec<(u32, u16, f64)>,
     hold_tick_on: bool,
+    /// S8 gate counters: decisions, decisions with a cheaper non-owner P, moves.
+    pred_stats: [u64; 3],
     force_tgt: Option<usize>,
     steal_rx_t: Vec<f64>,
     sess_move_t: FxHashMap<(u64, u32), f64>,
@@ -1474,6 +1517,20 @@ pub(crate) fn eft_choose_k(
         return (own, 2);
     }
     (own, 3)
+}
+
+/// S8: inverse-CDF draw from a table of n >= 2 quantiles at uniform probabilities 0..1 (linear).
+pub(crate) fn table_draw(tab: &[f64], u: f64) -> f64 {
+    let n = tab.len();
+    if n == 0 {
+        return 0.0;
+    }
+    if n == 1 {
+        return tab[0];
+    }
+    let x = u.clamp(0.0, 1.0) * (n - 1) as f64;
+    let i = (x as usize).min(n - 2);
+    tab[i] + (tab[i + 1] - tab[i]) * (x - i as f64)
 }
 
 /// S5 FPI admission cost (pure): start + x + lambda x (2 u + x) / (2 (1 - rho)).
@@ -1704,6 +1761,7 @@ impl<'a> Sim<'a> {
             gate_stats: (0, 0),
             held: Vec::new(),
             hold_tick_on: false,
+            pred_stats: [0; 3],
             force_tgt: None,
             steal_rx_t: vec![f64::NEG_INFINITY; s5_np],
             sess_move_t: FxHashMap::default(),
@@ -2561,6 +2619,9 @@ impl<'a> Sim<'a> {
                 let mut pull_s = vec![0.0; np];
                 let mut dup = vec![0.0; np];
                 let mut pulled = vec![0u64; np];
+                let mut pidle = vec![false; np];
+                let mut wait0 = vec![0.0; np];
+                let mut own0 = vec![0.0; np];
                 for w in 0..np {
                     let b = self.p[w].beta;
                     let pl = exp[w].saturating_sub(local[w]);
@@ -2584,6 +2645,20 @@ impl<'a> Sim<'a> {
                         let z2 = self.ngauss();
                         wait[w] *= (s * z1).exp();
                         own_s[w] *= (s * z2).exp();
+                    }
+                    pidle[w] = wait[w] <= 1e-9;
+                    wait0[w] = wait[w];
+                    own0[w] = own_s[w];
+                    if !self.c.cs_pred_noise.is_empty() {
+                        let u = self.nrng.random();
+                        let tab = if pidle[w] && !self.c.cs_pred_noise_idle.is_empty() {
+                            &self.c.cs_pred_noise_idle
+                        } else {
+                            &self.c.cs_pred_noise
+                        };
+                        let f = (self.c.cs_pred_noise_scale * table_draw(tab, u)).exp();
+                        wait[w] *= f;
+                        own_s[w] *= f;
                     }
                     pull_s[w] = if pl > 0 {
                         self.c.cs_eft_pull_fixed_s + self.c.cs_eft_pull_s_per_100k * pl as f64 / 1e5
@@ -2654,6 +2729,30 @@ impl<'a> Sim<'a> {
                 let mut fpi_pull = true;
                 let (t_, why) = if gate_hold {
                     (own, 0)
+                } else if self.c.cs_pred_gate {
+                    let fc = |w: usize| wait[w].max(pull_s[w]) + own_s[w];
+                    let tot = |w: usize| fc(w) + dup[w];
+                    let bnd = |w: usize| {
+                        let k = if pidle[w] { self.c.cs_pred_k_idle } else { self.c.cs_pred_k_busy };
+                        k * fc(w) + self.c.cs_pred_floor_s
+                    };
+                    self.pred_stats[0] += 1;
+                    match (0..np).filter(|&w| w != own).min_by(|&a, &b| tot(a).total_cmp(&tot(b)).then(a.cmp(&b))) {
+                        Some(w) => {
+                            let gain = tot(own) - tot(w);
+                            if gain > 0.0 {
+                                self.pred_stats[1] += 1;
+                            }
+                            let need = self.c.cs_pred_m * (bnd(own).powi(2) + bnd(w).powi(2)).sqrt() + self.c.cs_pred_gmin_s;
+                            if gain - need > 0.0 {
+                                self.pred_stats[2] += 1;
+                                (w, 1)
+                            } else {
+                                (own, 0)
+                            }
+                        }
+                        None => (own, 0),
+                    }
                 } else if self.c.cs_fpi != "off" {
                     let rec_s: Vec<f64> = (0..np)
                         .map(|w| {
@@ -2690,6 +2789,14 @@ impl<'a> Sim<'a> {
                     3 => self.eft_counts[2] += 1,
                     4 => self.eft_counts[3] += 1,
                     _ => {}
+                }
+                if self.c.pred_metric {
+                    let ing = self.c.ing_p.a + self.c.ing_p.b_per_100k * l as f64 / 1e5;
+                    let rq = &mut self.reqs[r as usize];
+                    rq.pred_t = t;
+                    rq.pred_c = ing + wait[tgt].max(pull_s[tgt]) + own_s[tgt];
+                    rq.pred_c0 = ing + wait0[tgt].max(pull_s[tgt]) + own0[tgt];
+                    rq.pred_idle = pidle[tgt];
                 }
                 let nh = if tgt != own { (Some(tgt as u16), Some(own as u16)) } else { (Some(tgt as u16), prev) };
                 self.eft_home.insert(ckey, nh);
@@ -5661,6 +5768,57 @@ impl<'a> Sim<'a> {
                     row[0] /= ns;
                 }
                 rep.e2e_by_move = em;
+                rep.pred_gate = self.pred_stats;
+                if self.c.pred_metric {
+                    let rows: Vec<(f64, f64, f64, bool)> = cmp
+                        .iter()
+                        .filter(|q| q.pred_t > 0.0 && q.t_pd.is_some_and(|x| x > q.pred_t))
+                        .map(|q| (q.t_pd.unwrap() - q.pred_t, q.pred_c, q.pred_c0, q.pred_idle))
+                        .collect();
+                    let qs = |v: &mut Vec<f64>, p: f64| -> f64 {
+                        if v.is_empty() {
+                            return f64::NAN;
+                        }
+                        v.sort_by(|a, b| a.total_cmp(b));
+                        let x = p * (v.len() - 1) as f64;
+                        let i = x as usize;
+                        let j = (i + 1).min(v.len() - 1);
+                        v[i] + (v[j] - v[i]) * (x - i as f64)
+                    };
+                    for k in 0..2 {
+                        let pc = |x: &(f64, f64, f64, bool)| if k == 0 { x.1 } else { x.2 };
+                        let ape: Vec<(f64, bool)> = rows.iter().map(|x| ((pc(x) - x.0).abs() / x.0, x.3)).collect();
+                        let mean = |f: &dyn Fn(&(f64, bool)) -> bool| -> f64 {
+                            let v: Vec<f64> = ape.iter().filter(|x| f(x)).map(|x| x.0).collect();
+                            if v.is_empty() { f64::NAN } else { v.iter().sum::<f64>() / v.len() as f64 }
+                        };
+                        let mut all: Vec<f64> = ape.iter().map(|x| x.0).collect();
+                        let bias = rows.iter().map(|x| pc(x) - x.0).sum::<f64>() / (rows.len().max(1) as f64);
+                        rep.pred_err.push([
+                            rows.len() as f64,
+                            mean(&|_| true),
+                            mean(&|x| x.1),
+                            mean(&|x| !x.1),
+                            qs(&mut all, 0.5),
+                            qs(&mut all, 0.9),
+                            bias,
+                            rows.iter().filter(|x| x.3).count() as f64,
+                        ]);
+                    }
+                    for k in 0..2 {
+                        for idle in [true, false] {
+                            let mut v: Vec<f64> = rows
+                                .iter()
+                                .filter(|x| x.3 == idle)
+                                .map(|x| {
+                                    let p = if k == 0 { x.1 } else { x.2 };
+                                    (x.0 - p).abs() / p.max(1e-9)
+                                })
+                                .collect();
+                            rep.pred_kq.push([qs(&mut v, 0.5), qs(&mut v, 0.6827), qs(&mut v, 0.8), qs(&mut v, 0.9)]);
+                        }
+                    }
+                }
                 if self.c.cs_hold_passes > 0.0 {
                     let h: Vec<&&Req> = cmp.iter().filter(|q| q.hold_s > 0.0).collect();
                     rep.held_share = h.len() as f64 / ns;
@@ -5855,6 +6013,16 @@ mod tests {
         let lb = eft_secs(&B, 8192, 0, 0, 200_000, 100_000);
         assert!((lb - (0.0855 * 2.0 + 0.0855)).abs() < 1e-12);
         assert_eq!(eft_secs(&B, 8192, 0, 50_000, 0, 0), 0.0);
+    }
+
+    #[test]
+    fn table_draw_interpolates_quantiles() {
+        let t = [0.0, 1.0, 3.0];
+        assert_eq!(table_draw(&t, 0.0), 0.0);
+        assert_eq!(table_draw(&t, 0.25), 0.5);
+        assert_eq!(table_draw(&t, 0.75), 2.0);
+        assert_eq!(table_draw(&t, 1.0), 3.0);
+        assert_eq!(table_draw(&[], 0.3), 0.0);
     }
 
     #[test]
@@ -6085,6 +6253,32 @@ mod tests {
         });
         assert_eq!(dr.pulls_all, 0);
         assert_eq!(dr.lost_share, 0.0);
+        // S8 PRED-GATE: noise tables, gate counters and forecast scoring.
+        let tab: Vec<f64> = (0..201).map(|i| -0.5 + i as f64 / 200.0).collect();
+        let pg = |m: f64, g: f64| SimConfig {
+            cs_eft_dup_on_recompute: true,
+            cs_pred_noise: tab.clone(),
+            cs_pred_gate: true,
+            cs_pred_m: m,
+            cs_pred_gmin_s: g,
+            cs_pred_k_idle: 0.2,
+            cs_pred_k_busy: 0.3,
+            pred_metric: true,
+            ..base.clone()
+        };
+        let g0 = go(pg(0.0, 0.0));
+        assert!(g0.pred_gate[0] > 0 && g0.pred_gate[2] <= g0.pred_gate[1] && g0.pred_gate[1] <= g0.pred_gate[0]);
+        assert_eq!(g0.pred_err.len(), 2);
+        assert_eq!(g0.pred_kq.len(), 4);
+        assert!(g0.pred_err[0][0] > 0.0 && g0.pred_err[0][1] > 0.0);
+        // A huge minimum gain stops every move.
+        let gb = go(pg(0.0, 1e9));
+        assert_eq!(gb.pred_gate[2], 0);
+        assert_eq!(gb.pulls_all, 0);
+        // A larger margin never moves more requests than no margin (same noise stream per decision count
+        // is not guaranteed, so only the bound check: moves <= cheaper-P decisions).
+        let gm = go(pg(1.28, 0.5));
+        assert!(gm.pred_gate[2] <= gm.pred_gate[1]);
         // B1 hold: runs with and without steals; every held request is dispatched in the end.
         let h = go(SimConfig { cs_hold_passes: 1.0, cs_eft_handoff_s: 0.32, cs_hold_margin_s: 0.0, idle_overlap_metric: true, ..base.clone() });
         assert!(h.held_share >= h.stolen_share && h.idle_overlap_share >= 0.0 && h.idle_overlap_share <= 1.0 + 1e-9);
