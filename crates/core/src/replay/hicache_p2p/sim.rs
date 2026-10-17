@@ -4146,7 +4146,13 @@ impl<'a> Sim<'a> {
             exp[w] = local[w].max(hs).min(l);
         }
         let pend: Vec<u64> = (0..np).map(|w| self.true_backlog(w)).collect();
-        let act: Vec<u64> = self.p.iter().map(|p| p.cs_active).collect();
+        // In-flight requests per P (route -> KV arrived): the co_schedule ledger count, or SMG's own
+        // counter on the cache-aware path (the ledger is not kept there; same release point).
+        let act: Vec<u64> = if self.c.p_policy == "smgca" {
+            self.p.iter().map(|p| p.nin.max(0) as u64).collect()
+        } else {
+            self.p.iter().map(|p| p.cs_active).collect()
+        };
         let after: Vec<u64> = (0..np).map(|w| pend[w] + (l - exp[w])).collect();
         let own = (0..np)
             .min_by(|&a, &b| {
