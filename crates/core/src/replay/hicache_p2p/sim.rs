@@ -515,6 +515,10 @@ pub struct SimConfig {
     /// q proxy: "sat" = concurrency / n_p x busy fraction; "bp" = requests from a random request to the end of its
     /// busy period (sum n(n+1)/2 / sum n over busy periods); "L" = 1 + requests on the P; "one" = 1.
     pub lam_q: String,
+    /// Induced recompute per pulled token: "ghost" = h x T_dup (local marginal value); "one" = 1 (each pulled
+    /// token displaces one live token that is recomputed later: the full-displacement bound). Price = q x mu / R.
+    /// lam_q "bpsat" = min(busy-period count incl. the open period, concurrency / n_p x busy fraction).
+    pub lam_mu: String,
     pub lam_scale: f64,
     pub lam_min_s: f64,
     /// Forced moves (counterfactual probe; separate RNG stream): an EFT decision that keeps the owner although the
@@ -735,6 +739,7 @@ impl Default for SimConfig {
             lam_tick_s: 5.0,
             lam_auto: "off".into(),
             lam_q: "sat".into(),
+            lam_mu: "ghost".into(),
             lam_scale: 1.0,
             lam_min_s: 300.0,
             fm_rate: 0.0,
@@ -2164,7 +2169,8 @@ impl<'a> Sim<'a> {
         }
         if self.c.ghost_frac > 0.0 || self.c.lam_auto != "off" {
             assert!(matches!(self.c.lam_auto.as_str(), "off" | "global" | "pair"), "lam_auto: off | global | pair");
-            assert!(matches!(self.c.lam_q.as_str(), "sat" | "bp" | "L" | "one"), "lam_q: sat | bp | L | one");
+            assert!(matches!(self.c.lam_q.as_str(), "sat" | "bp" | "bpsat" | "L" | "one"), "lam_q: sat | bp | bpsat | L | one");
+            assert!(matches!(self.c.lam_mu.as_str(), "ghost" | "one"), "lam_mu: ghost | one");
             assert!(
                 self.c.lam_auto == "off" || (self.c.ghost_frac > 0.0 && self.c.p_policy == "eft"),
                 "lam_auto needs ghost_frac > 0 and p_policy eft"
@@ -5537,6 +5543,12 @@ impl<'a> Sim<'a> {
         let busy = (sum(&iw, 5) / nw).clamp(0.0, 1.0);
         let q = match self.c.lam_q.as_str() {
             "sat" => self.c.concurrency as f64 / np as f64 * busy,
+            "bpsat" => {
+                let a: f64 = iw.iter().map(|&i| { let n = self.p[i].bp_n as f64; self.p[i].bp_a + n * (n + 1.0) / 2.0 }).sum();
+                let b: f64 = iw.iter().map(|&i| self.p[i].bp_b + self.p[i].bp_n as f64).sum();
+                let qb = if b > 0.0 { (a / b).max(1.0) } else { 1.0 };
+                qb.min((self.c.concurrency as f64 / np as f64 * busy).max(1.0))
+            }
             "bp" => {
                 let a: f64 = iw.iter().map(|&i| self.p[i].bp_a).sum();
                 let b: f64 = iw.iter().map(|&i| self.p[i].bp_b).sum();
@@ -5546,7 +5558,8 @@ impl<'a> Sim<'a> {
             _ => 1.0,
         };
         let r = sum(&iw, 7) / sum(&iw, 5).max(1e-9);
-        let lam = if r > 0.0 { self.c.lam_scale * q * h * tdup / r } else { 0.0 };
+        let mu = if self.c.lam_mu == "one" { 1.0 } else { h * tdup };
+        let lam = if r > 0.0 { self.c.lam_scale * q * mu / r } else { 0.0 };
         [h, tdup, q, r, lam]
     }
 
@@ -8040,8 +8053,8 @@ mod tests {
         assert!(gr.lam_est.iter().all(|x| x.is_finite() && *x >= 0.0), "{:?}", gr.lam_est);
         assert!(gr.lam_est[5] > 0.0, "R {:?}", gr.lam_est);
         assert!(gr.q_bp_win[0] >= 1.0 || gr.q_bp_win[1] == 0.0, "{:?}", gr.q_bp_win);
-        for (mode, q) in [("global", "sat"), ("pair", "bp"), ("global", "L"), ("pair", "one")] {
-            let (a, _) = go(SimConfig { lam_auto: mode.into(), lam_q: q.into(), record_rows: true, ..g.clone() });
+        for (mode, q, mu) in [("global", "sat", "ghost"), ("pair", "bp", "ghost"), ("global", "L", "one"), ("pair", "one", "ghost"), ("global", "bpsat", "one")] {
+            let (a, _) = go(SimConfig { lam_auto: mode.into(), lam_q: q.into(), lam_mu: mu.into(), record_rows: true, ..g.clone() });
             assert!(a.lam_used[0].is_finite() && a.lam_used[0] >= 0.0, "{:?}", a.lam_used);
             assert!(a.rps > 0.0);
         }
