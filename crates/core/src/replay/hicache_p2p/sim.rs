@@ -365,6 +365,20 @@ pub struct SimConfig {
     /// cost of executing the move minus the as-if-local FPI cost on k, i.e. in the same units as the
     /// per-turn costs, including the externality of the extra work).
     pub cs_fpi_move_cost: String,
+    /// S6 options (defaults off = every older arm bit-identical).
+    /// EFT path: duplicate-token charge, seconds per pulled token (the pulled tokens then exist on
+    /// >= 2 P), added to each candidate's predicted finish (TRADE lambda).
+    pub cs_eft_dup_per_token_s: f64,
+    /// SMG cache-aware hybrids for the decomposition of the P1 no-pull gain: comma list of request
+    /// classes routed by the P1 rule (least queued uncached tokens, no pull, P1 no-pull candidates)
+    /// instead of the SMG rule: "cold" (best hit < pull_min_tokens), "low" (best hit <= smg_threshold
+    /// x prompt), "multi" (>= 2 P within pull_min_incremental_tokens of the best hit), "single" (the
+    /// rest). Empty = off.
+    pub smg_p1_classes: String,
+    /// SMG load signal: "requests" (default: in-flight requests, smg_abs) or "uncached_tokens"
+    /// (CA-U: live queued uncached tokens of each P, threshold smg_abs_tokens; smg_rel unchanged).
+    pub smg_load: String,
+    pub smg_abs_tokens: u64,
 }
 
 impl Default for SimConfig {
@@ -512,6 +526,10 @@ impl Default for SimConfig {
             cs_fpi_rho_cap: 0.95,
             cs_ski_tau_s: 60.0,
             cs_fpi_move_cost: "seconds".into(),
+            cs_eft_dup_per_token_s: 0.0,
+            smg_p1_classes: String::new(),
+            smg_load: "requests".into(),
+            smg_abs_tokens: 0,
         }
     }
 }
@@ -663,6 +681,10 @@ struct Req {
     /// P holding >= 50 % / >= 90 % of the prompt at the routing decision (device + host).
     copies50: u8,
     copies90: u8,
+    /// S6: routing class at the decision (0 cold, 1 low match, 2 several near-best holders, 3 single
+    /// holder) and cache given up by the choice (best hit - hit on the chosen P, tokens).
+    rclass: u8,
+    lost: u64,
     unc_est: u64,
     ideal: u64,
     // routing / gap cause
@@ -1086,6 +1108,27 @@ pub struct SimReport {
     /// completed non-warm requests sent in the bin, their hit (actual / prompt, tok-w), completions/s].
     pub host_evicted_tok_s_win: f64,
     pub series_300s: Vec<[f64; 5]>,
+    /// S6 diagnostics. Routing classes of the requests sent in the score window (cold, low match,
+    /// several near-best holders, single holder): [requests, sent to a P with less cache than the
+    /// best P, cache given up (tokens)]; share of scored requests sent to a P with less cache.
+    pub route_class: Vec<[f64; 3]>,
+    pub lost_share: f64,
+    /// Hit deficit of the scored requests (tokens per request, means): [ideal, best P at the
+    /// decision, chosen P at the decision, pulled and used, actual, E_global = ideal - best (cached
+    /// nowhere), E_route = best - chosen - pulled (given up by routing, not recovered by a pull),
+    /// E_queue = chosen + pulled - actual (lost between the decision and admission)]; capped like
+    /// the engine (prompt - 1, page aligned). E_global + E_route + E_queue = ideal - actual.
+    pub deficit: [f64; 8],
+    /// The same by the agent chain's move at this request: rows [first request of the chain in the
+    /// run, stay (same P as the chain's previous request), move to a P not used before by the chain,
+    /// move back to a P the chain used before]: [share, E_global, E_route, E_queue, ideal, actual].
+    pub deficit_by_move: Vec<[f64; 6]>,
+    /// Host-evicted tokens/s in the score window by trigger (rows: prefill write-through insert, pull
+    /// landing insert, other) and class (columns: retention class 0, class 1, LRU order).
+    pub host_ev_cause_tok_s: Vec<[f64; 3]>,
+    /// Device-evicted and device-only-deleted tokens/s over the whole run by trigger (same rows).
+    pub dev_ev_cause_tok_s: [f64; 3],
+    pub devonly_ev_cause_tok_s: [f64; 3],
     pub wall_s: f64,
 }
 
@@ -1384,6 +1427,10 @@ impl<'a> Sim<'a> {
         );
         assert!(c.cs_fpi == "off" || c.p_policy == "eft", "cs_fpi needs p_policy eft");
         assert!(matches!(c.cs_fpi_move_cost.as_str(), "seconds" | "fpi"), "cs_fpi_move_cost: seconds | fpi");
+        assert!(matches!(c.smg_load.as_str(), "requests" | "uncached_tokens"), "smg_load: requests | uncached_tokens");
+        for k in c.smg_p1_classes.split(',').filter(|s| !s.is_empty()) {
+            assert!(matches!(k, "cold" | "low" | "multi" | "single"), "smg_p1_classes: cold, low, multi, single");
+        }
         if c.shared_pool {
             // IDEAL bound: P 0's tree is the one pool of all P (sizes x n_p); the others stay empty.
             assert!(
@@ -2060,15 +2107,21 @@ impl<'a> Sim<'a> {
         let best = *hits.iter().max().unwrap_or(&0);
         let pol = self.c.p_policy.clone();
         let pt = self.reqs[r as usize].pt;
-        let tgt: usize;
+        let mut tgt: usize;
         let mut own: usize;
         match pol.as_str() {
             "smgca" => {
                 let runs = self.reqs[r as usize].runs.clone();
-                let ld: Vec<i64> = self.p.iter().map(|p| p.nin).collect();
+                let tok = self.c.smg_load == "uncached_tokens";
+                let ld: Vec<i64> = if tok {
+                    (0..np).map(|w| self.true_backlog(w) as i64).collect()
+                } else {
+                    self.p.iter().map(|p| p.nin).collect()
+                };
                 let mx = *ld.iter().max().unwrap();
                 let mn = *ld.iter().min().unwrap();
-                let imbalanced = mx - mn > self.c.smg_abs && (mx as f64) > (mn as f64) * self.c.smg_rel;
+                let abs = if tok { self.c.smg_abs_tokens as i64 } else { self.c.smg_abs };
+                let imbalanced = mx - mn > abs && (mx as f64) > (mn as f64) * self.c.smg_rel;
                 let min_load = |s: &mut Self| -> usize {
                     let c: Vec<usize> = (0..np).filter(|&k| ld[k] == mn).collect();
                     c[s.urange(c.len())]
@@ -2092,6 +2145,14 @@ impl<'a> Sim<'a> {
                         tgt = c[self.urange(c.len())];
                     } else {
                         tgt = min_load(self);
+                    }
+                }
+                if !self.c.smg_p1_classes.is_empty() {
+                    // S6 decomposition: this request's class is routed by the P1 no-pull rule.
+                    let cl = self.route_class(&hits, pt);
+                    let name = ["cold", "low", "multi", "single"][cl as usize];
+                    if self.c.smg_p1_classes.split(',').any(|k| k == name) {
+                        tgt = self.p1_choice(r, &hits, 1);
                     }
                 }
                 self.smg[tgt].insert(&runs, t, false);
@@ -2317,7 +2378,8 @@ impl<'a> Sim<'a> {
                     } else {
                         0.0
                     };
-                    dup[w] = self.c.cs_eft_dup_rho * eft_secs(&b, ch, pl, 0, 0, 0);
+                    dup[w] = self.c.cs_eft_dup_rho * eft_secs(&b, ch, pl, 0, 0, 0)
+                        + self.c.cs_eft_dup_per_token_s * pl as f64;
                     pulled[w] = pl;
                 }
                 let excluded = match prev {
@@ -2416,7 +2478,11 @@ impl<'a> Sim<'a> {
         }
         let c50 = hits.iter().filter(|&&h| 2 * h >= pt && h > 0).count() as u8;
         let c90 = hits.iter().filter(|&&h| 10 * h >= 9 * pt && h > 0).count() as u8;
+        let rcl = self.route_class(&hits, pt);
+        let lost = best.min(pt).saturating_sub(hits[tgt].min(pt));
         let rq = &mut self.reqs[r as usize];
+        rq.rclass = rcl;
+        rq.lost = lost;
         rq.copies50 = c50;
         rq.copies90 = c90;
         rq.p = tgt as u16;
@@ -3241,7 +3307,9 @@ impl<'a> Sim<'a> {
         };
         // S3 (d): the pulled pages are outside the destination's host capacity (no displacement).
         self.p[dst].radix.pf_mark = self.c.pull_free_capacity;
+        self.p[dst].radix.ev_cause = 1;
         self.p[dst].radix.insert_kv(&runs, t, host_only, tag);
+        self.p[dst].radix.ev_cause = 2;
         self.p[dst].radix.pf_mark = false;
         if self.c.kv_retention && self.c.kvret_mode == "transfer_end" {
             // The destination took its +1 at this commit (insert_kv tag); release the source now.
@@ -3735,7 +3803,9 @@ impl<'a> Sim<'a> {
         } else {
             None
         };
+        self.p[x].radix.ev_cause = 0;
         let path = self.p[x].radix.insert_kv(&runs, t, false, tag);
+        self.p[x].radix.ev_cause = 2;
         self.guard_pressure(t, p, Some(r));
         let ins = (self.p[x].radix.stats.host_inserted_blocks - before) * self.c.block_tokens;
         if t >= self.lo && t < self.hi {
@@ -4033,6 +4103,67 @@ impl<'a> Sim<'a> {
             self.p[p].radix.kv_end(sid, ver);
         }
         self.kv_log.push((t, sid, p as u16, ver, op));
+    }
+
+    /// S6 routing class of a request from the exact hits: 0 cold (best < pull_min_tokens), 1 low match
+    /// (best <= smg_threshold x prompt), 2 several P within pull_min_incremental_tokens of the best,
+    /// 3 a single best holder.
+    fn route_class(&self, hits: &[u64], pt: u64) -> u8 {
+        let h: Vec<u64> = hits.iter().map(|&x| x.min(pt)).collect();
+        let best = *h.iter().max().unwrap_or(&0);
+        if best < self.c.pull_min_tokens {
+            return 0;
+        }
+        if best as f64 <= self.c.smg_threshold * pt as f64 {
+            return 1;
+        }
+        let near = h.iter().filter(|&&x| x + self.c.pull_min_incremental_tokens > best).count();
+        if near >= 2 {
+            2
+        } else {
+            3
+        }
+    }
+
+    /// S6: the co_schedule decision of P1 (least queued uncached tokens on the live backlog, margin 0,
+    /// no R3 penalty, no pair / hysteresis) with pull cap `cap`, without side effects.
+    fn p1_choice(&mut self, r: u32, hits: &[u64], cap: u64) -> usize {
+        let np = self.p.len();
+        let l = self.reqs[r as usize].pt;
+        let gpu = self.gpu_hits(r);
+        let local: Vec<u64> = hits.iter().map(|&h| h.min(l)).collect();
+        let mut exp = vec![0u64; np];
+        for w in 0..np {
+            let s_ = (0..np).filter(|&k| k != w && hits[k] > 0).min_by(|&a, &b| hits[b].cmp(&hits[a]).then(a.cmp(&b)));
+            let mut hs = 0;
+            if let Some(s_) = s_ {
+                if hits[s_] >= self.c.pull_min_tokens
+                    && hits[s_].saturating_sub(hits[w]) >= self.c.pull_min_incremental_tokens
+                {
+                    hs = hits[s_];
+                }
+            }
+            exp[w] = local[w].max(hs).min(l);
+        }
+        let pend: Vec<u64> = (0..np).map(|w| self.true_backlog(w)).collect();
+        let act: Vec<u64> = self.p.iter().map(|p| p.cs_active).collect();
+        let after: Vec<u64> = (0..np).map(|w| pend[w] + (l - exp[w])).collect();
+        let own = (0..np)
+            .min_by(|&a, &b| {
+                local[b].cmp(&local[a]).then(gpu[b].cmp(&gpu[a])).then(pend[a].cmp(&pend[b])).then(act[a].cmp(&act[b])).then(a.cmp(&b))
+            })
+            .unwrap();
+        let least = (0..np)
+            .filter(|&w| w == own || exp[w].saturating_sub(local[w]) <= cap)
+            .min_by(|&a, &b| {
+                after[a].cmp(&after[b]).then(gpu[b].cmp(&gpu[a])).then(local[b].cmp(&local[a])).then(act[a].cmp(&act[b])).then(a.cmp(&b))
+            })
+            .unwrap_or(own);
+        if least != own && after[own].saturating_sub(after[least]) > 0 {
+            least
+        } else {
+            own
+        }
     }
 
     /// S5: standard normal draw from the noise stream (Box-Muller).
@@ -5002,6 +5133,103 @@ impl<'a> Sim<'a> {
             }
             rep.fpi_counts = self.fpi_counts;
             {
+                // ---- S6 diagnostics
+                let mut rc = vec![[0.0f64; 3]; 4];
+                for q in self.reqs.iter().filter(|q| !q.warm && q.start >= lo && q.start < hi) {
+                    let c = &mut rc[q.rclass as usize];
+                    c[0] += 1.0;
+                    if q.lost > 0 {
+                        c[1] += 1.0;
+                        c[2] += q.lost as f64;
+                    }
+                }
+                rep.route_class = rc;
+                let ns = cmp.len().max(1) as f64;
+                rep.lost_share = cmp.iter().filter(|q| q.lost > 0).count() as f64 / ns;
+                let capm = |q: &Req| (q.pt.saturating_sub(1) / bt) * bt;
+                let comp = |q: &Req| -> [f64; 8] {
+                    let cm = capm(q);
+                    let ideal = q.ideal.min(cm) as f64;
+                    let b = q.route_best.min(cm) as f64;
+                    let tg = q.route_tgt.min(cm) as f64;
+                    let s = q.stor as f64;
+                    let a = (q.dev + q.host + q.stor + q.drd) as f64;
+                    [ideal, b, tg, s, a, ideal - b, b - tg - s, tg + s - a]
+                };
+                let mut d = [0.0f64; 8];
+                for q in &cmp {
+                    let v = comp(q);
+                    for k in 0..8 {
+                        d[k] += v[k] / ns;
+                    }
+                }
+                rep.deficit = d;
+                // Chain history: previous P and P used before, per agent state (non-warm requests).
+                let mut hist: FxHashMap<u32, Vec<(f64, u32, u16)>> = FxHashMap::default();
+                for q in self.reqs.iter().filter(|q| !q.warm) {
+                    hist.entry(q.agent_state).or_default().push((q.admit, q.idx, q.p));
+                }
+                let mut grp: FxHashMap<(u32, u32), u8> = FxHashMap::default();
+                for (a, v) in hist.iter_mut() {
+                    v.sort_by(|x, y| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)));
+                    let mut used: Vec<u16> = Vec::new();
+                    for (i, &(_, idx, p)) in v.iter().enumerate() {
+                        let g = if i == 0 {
+                            0
+                        } else if v[i - 1].2 == p {
+                            1
+                        } else if used.contains(&p) {
+                            3
+                        } else {
+                            2
+                        };
+                        grp.insert((*a, idx), g);
+                        if !used.contains(&p) {
+                            used.push(p);
+                        }
+                    }
+                }
+                let mut dm = vec![[0.0f64; 6]; 4];
+                for q in &cmp {
+                    let g = *grp.get(&(q.agent_state, q.idx)).unwrap_or(&0) as usize;
+                    let v = comp(q);
+                    dm[g][0] += 1.0;
+                    dm[g][1] += v[5];
+                    dm[g][2] += v[6];
+                    dm[g][3] += v[7];
+                    dm[g][4] += v[0];
+                    dm[g][5] += v[4];
+                }
+                for row in dm.iter_mut() {
+                    let k = row[0].max(1.0);
+                    for j in 1..6 {
+                        row[j] /= k;
+                    }
+                    row[0] /= ns;
+                }
+                rep.deficit_by_move = dm;
+                let mut hc = vec![[0.0f64; 3]; 3];
+                for w in &self.p {
+                    for e in w.radix.evictions.iter().filter(|e| inw(e.t)) {
+                        hc[(e.cause as usize).min(2)][(e.class as usize).min(2)] += e.blocks as f64 * bt as f64;
+                    }
+                }
+                let span = (hi - lo).max(1e-9);
+                for row in hc.iter_mut() {
+                    for x in row.iter_mut() {
+                        *x /= span;
+                    }
+                }
+                rep.host_ev_cause_tok_s = hc;
+                let dur_s = self.c.duration_s.max(1e-9);
+                for w in &self.p {
+                    for k in 0..3 {
+                        rep.dev_ev_cause_tok_s[k] += w.radix.stats.dev_ev_cause[k] as f64 * bt as f64 / dur_s;
+                        rep.devonly_ev_cause_tok_s[k] += w.radix.stats.devonly_ev_cause[k] as f64 * bt as f64 / dur_s;
+                    }
+                }
+            }
+            {
                 let nb = (self.c.duration_s / 300.0).ceil().max(1.0) as usize;
                 let mut s = vec![[0.0f64; 5]; nb];
                 let mut cnt = vec![0.0f64; nb];
@@ -5235,6 +5463,60 @@ mod tests {
             assert!(rep.fpi_lambda_rho.iter().all(|x| x[0] > 0.0 && x[1] > 0.0 && x[1] <= 0.95), "{mode} {:?}", rep.fpi_lambda_rho);
             assert!(rep.fpi_counts[3] > 0, "{mode}");
         }
+    }
+
+    #[test]
+    fn s6_trade_hybrids_and_diagnostics_are_consistent() {
+        let wl = synth_workload(12, 30);
+        let ct = FxHashMap::default();
+        let base = SimConfig {
+            cs_workload: "true".into(),
+            p_dev_tokens: 131_072,
+            p_host_tokens: 262_144,
+            kv_retention: true,
+            pull_min_incremental_tokens: 512,
+            ..kv_cfg("smgca")
+        };
+        let go = |c: SimConfig| {
+            let mut s = Sim::new(c, &wl, &ct);
+            s.run();
+            for w in &s.p {
+                w.radix.check().unwrap();
+            }
+            let (rep, _) = s.report(0.0);
+            assert!(rep.n_scored > 50, "scored {}", rep.n_scored);
+            // Deficit identity, class and eviction-cause totals.
+            let d = rep.deficit;
+            assert!((d[5] + d[6] + d[7] - (d[0] - d[4])).abs() < 1e-6, "{d:?}");
+            let shares: f64 = rep.deficit_by_move.iter().map(|x| x[0]).sum();
+            assert!((shares - 1.0).abs() < 1e-9, "{shares}");
+            let want = s.reqs.iter().filter(|q| !q.warm && q.start >= s.lo && q.start < s.hi).count() as f64;
+            let got: f64 = rep.route_class.iter().map(|x| x[0]).sum();
+            assert_eq!(got, want);
+            let ev: f64 = rep.host_ev_cause_tok_s.iter().flat_map(|x| x.iter()).sum();
+            assert!((ev - rep.host_evicted_tok_s_win).abs() <= 1e-6 * ev.max(1.0), "{ev} vs {}", rep.host_evicted_tok_s_win);
+            rep
+        };
+        let a = go(base.clone());
+        // Hybrids and CA-U run; routing all classes by the P1 rule moves no request to a P with less cache
+        // than its P1 no-pull candidates allow (no pull at all).
+        go(SimConfig { smg_p1_classes: "cold,low".into(), ..base.clone() });
+        let all = go(SimConfig { smg_p1_classes: "cold,low,multi,single".into(), ..base.clone() });
+        assert_eq!(all.pulls_all, 0);
+        go(SimConfig { smg_load: "uncached_tokens".into(), smg_abs_tokens: 65_536, ..base.clone() });
+        assert_eq!(a.pulls_all, 0);
+        // TRADE on the EFT path: lambda 0 pulls; a huge per-token charge stops every pull.
+        let trade = |lam: f64| SimConfig {
+            p_policy: "eft".into(),
+            cs_eft_one_way: false,
+            cs_eft_dup_rho: 0.0,
+            cs_eft_dup_per_token_s: lam,
+            ..base.clone()
+        };
+        let t0 = go(trade(0.0));
+        assert!(t0.pulls_all > 0, "TRADE(0) never pulled");
+        let t9 = go(trade(1.0));
+        assert_eq!(t9.pulls_all, 0);
     }
 
     #[test]

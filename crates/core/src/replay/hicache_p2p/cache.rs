@@ -265,6 +265,9 @@ pub struct CacheStats {
     /// whose host copy was later removed (the capacity drops with them).
     pub pf_added_blocks: u64,
     pub pf_removed_blocks: u64,
+    /// S6: device-evicted blocks and device-only deletions (retention) by trigger (as ev_cause).
+    pub dev_ev_cause: [u64; 3],
+    pub devonly_ev_cause: [u64; 3],
 }
 
 /// Window-filtered host eviction samples: (evict time, blocks, age since last use, age since write).
@@ -281,6 +284,9 @@ pub struct HostEviction {
     /// host copy of a GPU-backed duplicate was reclaimed (the node stays on the device).
     pub class: u8,
     pub dup: bool,
+    /// S6: what triggered the eviction (ev_cause at the time): 0 prefill write-through insert,
+    /// 1 pull landing insert, 2 other (load-back at admission, device demotion, ...).
+    pub cause: u8,
 }
 
 /// Host-pool census at one instant (tokens are blocks here; the caller scales).
@@ -343,6 +349,9 @@ pub struct TwoTierRadix {
     /// pf_blocks = resident pf host blocks (host_cap = base capacity + pf_blocks).
     pub pf_mark: bool,
     pub pf_blocks: u64,
+    /// S6: eviction trigger label set by the caller around an insert (0 prefill, 1 pull landing,
+    /// 2 other = default); recorded on host evictions and device-eviction counters.
+    pub ev_cause: u8,
 }
 
 /// Longest common prefix of node runs `eruns` and prompt runs `pruns[ri..]` (offset `off` into
@@ -433,6 +442,7 @@ impl TwoTierRadix {
             uid_next: 0,
             pf_mark: false,
             pf_blocks: 0,
+            ev_cause: 2,
         }
     }
 
@@ -1110,6 +1120,9 @@ impl TwoTierRadix {
                 let (nb, par, key) = (n.nb, n.par, n.runs[0].0);
                 self.stats.dev_evicted_blocks += nb as u64;
                 self.stats.kv_devonly_deleted_blocks += nb as u64;
+                let c = (self.ev_cause as usize).min(2);
+                self.stats.dev_ev_cause[c] += nb as u64;
+                self.stats.devonly_ev_cause[c] += nb as u64;
                 self.set_dev(id, false);
                 if self.nodes[par as usize].ch.get(&key) == Some(&id) {
                     self.nodes[par as usize].ch.remove(&key);
@@ -1123,6 +1136,7 @@ impl TwoTierRadix {
                 continue;
             }
             self.stats.dev_evicted_blocks += n.nb as u64;
+            self.stats.dev_ev_cause[(self.ev_cause as usize).min(2)] += n.nb as u64;
             let par = n.par;
             let leaf = n.ch.is_empty();
             self.set_dev(id, false);
@@ -1187,6 +1201,7 @@ impl TwoTierRadix {
                     ns: key >> 32,
                     class: 2,
                     dup: false,
+                    cause: self.ev_cause,
                 });
             }
             if self.nodes[par as usize].ch.get(&key) == Some(&id) {
@@ -1285,6 +1300,7 @@ impl TwoTierRadix {
                     ns: key >> 32,
                     class: cur.rank,
                     dup: !leaf,
+                    cause: self.ev_cause,
                 });
             }
             self.host_used -= nb as u64;
