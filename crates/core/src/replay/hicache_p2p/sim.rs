@@ -335,6 +335,31 @@ pub struct SimConfig {
     /// S3 (d) attribution option (default off): pull landings do not displace anything; the host
     /// blocks a pull adds on the destination are outside its host capacity while they stay resident.
     pub pull_free_capacity: bool,
+    /// S5 router options (defaults off = every older arm bit-identical).
+    /// co_schedule move mode: "pull" (default: a move to a P with less cache pulls from the best
+    /// holder) or "recompute" (pull hints ignored: expected hit = the P's own cache, a move recomputes).
+    pub cs_move_mode: String,
+    /// co_schedule router-state error: each P's backlog estimate x (1 + U(-e, e)), drawn per P per
+    /// decision (0 = off).
+    pub cs_noise_queue: f64,
+    /// co_schedule predictor error: each candidate's total (backlog + own uncached tokens) x
+    /// exp(sigma Z), Z ~ N(0, 1) per P per decision (0 = off). MAPE = exp(s^2/2) (2 Phi(s) - 1).
+    pub cs_noise_sigma: f64,
+    /// co_schedule state age (s, 0 = off): the router sees each P's backlog as sampled every 0.1 s,
+    /// cs_state_age_s old, plus (cs_state_own_fix) its own charges routed to that P since the sample.
+    pub cs_state_age_s: f64,
+    pub cs_state_own_fix: bool,
+    /// EFT-path arms from OR-MODELS-P-ROUTING (wf_077a930f): "off" | "fpi" (first policy iteration:
+    /// a = start + x + lambda x (2u + x) / (2 (1 - rho)) over (owner, local), (other, pull),
+    /// (other, recompute); argmin, ties to the owner) | "wfa" (work-function algorithm per agent chain
+    /// on FPI costs) | "ski" (ski-rental: move when the excess cost built up on the holder >= the
+    /// move cost) | "skir" (randomized threshold M ln(1 + (e - 1) U)). lambda_p, rho_p are measured
+    /// under owner-always routing during the first cs_fpi_pilot_s seconds (the router routes
+    /// owner-always then); rho capped at cs_fpi_rho_cap. Ski excess decays with cs_ski_tau_s.
+    pub cs_fpi: String,
+    pub cs_fpi_pilot_s: f64,
+    pub cs_fpi_rho_cap: f64,
+    pub cs_ski_tau_s: f64,
 }
 
 impl Default for SimConfig {
@@ -472,6 +497,15 @@ impl Default for SimConfig {
             kvret_end: true,
             kvret_idle_s: 0.0,
             pull_free_capacity: false,
+            cs_move_mode: "pull".into(),
+            cs_noise_queue: 0.0,
+            cs_noise_sigma: 0.0,
+            cs_state_age_s: 0.0,
+            cs_state_own_fix: true,
+            cs_fpi: "off".into(),
+            cs_fpi_pilot_s: 900.0,
+            cs_fpi_rho_cap: 0.95,
+            cs_ski_tau_s: 60.0,
         }
     }
 }
@@ -514,6 +548,20 @@ enum Ev {
     KvCtl(u32, u16, u32, u8),
     /// S4 idle END check for (session, version of the completed request).
     KvIdle(u32, u32),
+    /// S5: router backlog sample (state age); end of the FPI pilot.
+    StateTick,
+    FpiPilotEnd,
+}
+
+/// S5 per agent chain router state for the work-function / ski-rental arms: work function per P,
+/// holder, built-up excess, current threshold draw U, last decision time.
+#[derive(Debug, Clone)]
+struct WfState {
+    w: Vec<f64>,
+    h: usize,
+    r: f64,
+    u: f64,
+    last: f64,
 }
 
 struct Item {
@@ -1023,6 +1071,15 @@ pub struct SimReport {
     /// S3 (d) pull_free_capacity (tokens, all P): added by pull landings outside the capacity, removed
     /// later, still resident at the end.
     pub pull_free_tokens: [u64; 3],
+    /// S5 FPI family: measured (lambda req/s, rho) per P after the pilot; counters (whole run)
+    /// [pull moves, recompute moves, holder resets, decisions after the pilot].
+    pub fpi_lambda_rho: Vec<[f64; 2]>,
+    pub fpi_counts: [u64; 4],
+    /// S5 regime diagnostics (all arms): host-evicted tokens per second over all P in the score
+    /// window; 300-s series over the whole run: [bin start s, host-evicted tok/s, mean E2E of the
+    /// completed non-warm requests sent in the bin, their hit (actual / prompt, tok-w), completions/s].
+    pub host_evicted_tok_s_win: f64,
+    pub series_300s: Vec<[f64; 5]>,
     pub wall_s: f64,
 }
 
@@ -1149,6 +1206,16 @@ pub struct Sim<'a> {
     /// the next request - that completion) of requests routed in the score window.
     agent_last_done: FxHashMap<u32, f64>,
     agent_gaps: Vec<f64>,
+    /// S5: noise RNG (separate stream), backlog samples (t, per-P backlog), charges routed per P since
+    /// (t, tokens), FPI pilot counts / measured (lambda, rho) per P, per-chain WFA / ski state,
+    /// counters [pull moves, recompute moves, holder resets, decisions after the pilot].
+    nrng: PyRandom,
+    st_hist: VecDeque<(f64, Vec<u64>)>,
+    st_routed: Vec<VecDeque<(f64, u64)>>,
+    fpi_n: Vec<u64>,
+    fpi_lr: Option<Vec<(f64, f64)>>,
+    wf: FxHashMap<(u64, u32), WfState>,
+    fpi_counts: [u64; 4],
     lo: f64,
     hi: f64,
 }
@@ -1213,6 +1280,11 @@ pub(crate) fn eft_choose(
     (own, 3)
 }
 
+/// S5 FPI admission cost (pure): start + x + lambda x (2 u + x) / (2 (1 - rho)).
+pub(crate) fn fpi_score(start: f64, x: f64, u: f64, lambda: f64, rho: f64) -> f64 {
+    start + x + lambda * x * (2.0 * u + x) / (2.0 * (1.0 - rho))
+}
+
 /// IDEAL choice (pure): least predicted finish `f`, ties -> fewer active requests, then lower index.
 pub(crate) fn ideal_choose(f: &[f64], act: &[u64]) -> usize {
     (0..f.len()).min_by(|&a, &b| f[a].total_cmp(&f[b]).then(act[a].cmp(&act[b])).then(a.cmp(&b))).unwrap_or(0)
@@ -1221,6 +1293,7 @@ pub(crate) fn ideal_choose(f: &[f64], act: &[u64]) -> usize {
 impl<'a> Sim<'a> {
     pub fn new(c: SimConfig, wl: &'a Workload, ct_map: &'a FxHashMap<(u32, u32, u32), u32>) -> Self {
         let bt = c.block_tokens;
+        let (s5_np, s5_seed) = (c.n_p, c.seed);
         let mut p = Vec::new();
         for i in 0..c.n_p {
             let beta = c.p_beta[i % c.p_beta.len()];
@@ -1298,6 +1371,12 @@ impl<'a> Sim<'a> {
             "kvret_idle_s needs kv_retention with session tags"
         );
         assert!(!(c.pull_free_capacity && c.shared_pool), "pull_free_capacity needs per-P pools");
+        assert!(matches!(c.cs_move_mode.as_str(), "pull" | "recompute"), "cs_move_mode: pull | recompute");
+        assert!(
+            matches!(c.cs_fpi.as_str(), "off" | "fpi" | "wfa" | "ski" | "skir"),
+            "cs_fpi: off | fpi | wfa | ski | skir"
+        );
+        assert!(c.cs_fpi == "off" || c.p_policy == "eft", "cs_fpi needs p_policy eft");
         if c.shared_pool {
             // IDEAL bound: P 0's tree is the one pool of all P (sizes x n_p); the others stay empty.
             assert!(
@@ -1411,6 +1490,13 @@ impl<'a> Sim<'a> {
             kv_idle_new: 0,
             agent_last_done: FxHashMap::default(),
             agent_gaps: Vec::new(),
+            nrng: PyRandom::new(0x6e01_0000 + s5_seed),
+            st_hist: VecDeque::new(),
+            st_routed: vec![VecDeque::new(); s5_np],
+            fpi_n: vec![0; s5_np],
+            fpi_lr: None,
+            wf: FxHashMap::default(),
+            fpi_counts: [0; 4],
             lo,
             hi,
         }
@@ -1497,6 +1583,12 @@ impl<'a> Sim<'a> {
         if self.kv_tagged() && (self.c.kvret_mode == "ready_end" || self.c.kvret_mode == "transfer_end") {
             self.at(self.c.kvret_poll_s, Ev::KvTick);
         }
+        if self.c.cs_state_age_s > 0.0 {
+            self.at(0.0, Ev::StateTick);
+        }
+        if self.c.cs_fpi != "off" {
+            self.at(self.c.cs_fpi_pilot_s, Ev::FpiPilotEnd);
+        }
         while let Some(it) = self.heap.pop() {
             if it.t > self.c.duration_s + 1.0 {
                 break;
@@ -1543,6 +1635,25 @@ impl<'a> Sim<'a> {
                 }
                 Ev::KvCtl(sid, p, ver, op) => self.kv_ctl(t, sid, p as usize, ver, op),
                 Ev::KvIdle(sid, ver) => self.kv_idle(t, sid, ver),
+                Ev::StateTick => {
+                    let v = self.cs_pend_now();
+                    self.st_hist.push_back((t, v));
+                    let keep = self.c.cs_state_age_s + 1.0;
+                    while self.st_hist.len() > 2 && self.st_hist[1].0 < t - keep {
+                        self.st_hist.pop_front();
+                    }
+                    if t < self.c.duration_s {
+                        self.at(t + 0.1, Ev::StateTick);
+                    }
+                }
+                Ev::FpiPilotEnd => {
+                    let dt = self.c.cs_fpi_pilot_s.max(1e-9);
+                    let cap = self.c.cs_fpi_rho_cap;
+                    let lr = (0..self.p.len())
+                        .map(|w| (self.fpi_n[w] as f64 / dt, (self.p[w].busy_s / dt).min(cap)))
+                        .collect();
+                    self.fpi_lr = Some(lr);
+                }
                 Ev::PullDone(r) => self.pull_done(t, r),
                 Ev::DReadDone(r) => self.dread_done(t, r),
                 Ev::DemoteDue(id) => self.demote_due(id),
@@ -1996,6 +2107,7 @@ impl<'a> Sim<'a> {
                     if let Some(s_) = s_ {
                         if hits[s_] >= self.c.pull_min_tokens
                             && hits[s_].saturating_sub(hits[w]) >= self.c.pull_min_incremental_tokens
+                            && self.c.cs_move_mode != "recompute"
                         {
                             hint[w] = Some((s_, hits[s_]));
                         }
@@ -2003,13 +2115,27 @@ impl<'a> Sim<'a> {
                     let hs = hint[w].map(|(_, h)| h).unwrap_or(0);
                     exp[w] = local[w].max(hs).min(l);
                 }
-                let pend: Vec<u64> = if self.c.cs_workload == "true" {
-                    (0..np).map(|w| self.true_backlog(w)).collect()
+                let mut pend: Vec<u64> = if self.c.cs_state_age_s > 0.0 {
+                    self.cs_pend_stale(t)
                 } else {
-                    self.p.iter().map(|p| p.cs_pending).collect()
+                    self.cs_pend_now()
                 };
+                if self.c.cs_noise_queue > 0.0 {
+                    let e = self.c.cs_noise_queue;
+                    for x in pend.iter_mut() {
+                        let u = self.nrng.random();
+                        *x = (*x as f64 * (1.0 + e * (2.0 * u - 1.0))).max(0.0).round() as u64;
+                    }
+                }
                 let act: Vec<u64> = self.p.iter().map(|p| p.cs_active).collect();
-                let after: Vec<u64> = (0..np).map(|w| pend[w] + (l - exp[w])).collect();
+                let mut after: Vec<u64> = (0..np).map(|w| pend[w] + (l - exp[w])).collect();
+                if self.c.cs_noise_sigma > 0.0 {
+                    let s = self.c.cs_noise_sigma;
+                    for x in after.iter_mut() {
+                        let z = self.ngauss();
+                        *x = (*x as f64 * (s * z).exp()).round() as u64;
+                    }
+                }
                 own = (0..np)
                     .min_by(|&a, &b| {
                         local[b].cmp(&local[a]).then(gpu[b].cmp(&gpu[a])).then(pend[a].cmp(&pend[b]))
@@ -2092,6 +2218,14 @@ impl<'a> Sim<'a> {
                 self.p[tgt].cs_pending += cost;
                 self.p[tgt].cs_active += 1;
                 self.reqs[r as usize].cs_cost = Some(cost);
+                if self.c.cs_state_age_s > 0.0 {
+                    let keep = self.c.cs_state_age_s + 1.0;
+                    let q = &mut self.st_routed[tgt];
+                    q.push_back((t, cost));
+                    while q.front().is_some_and(|x| x.0 < t - keep) {
+                        q.pop_front();
+                    }
+                }
                 if self.c.pull_enabled {
                     if let Some((src, hs)) = hint[tgt] {
                         self.reqs[r as usize].pull_src = Some(src as u16);
@@ -2190,18 +2324,32 @@ impl<'a> Sim<'a> {
                     }
                     _ => None,
                 };
-                let (t_, why) = eft_choose(
-                    &wait,
-                    &own_s,
-                    &pull_s,
-                    &dup,
-                    &pulled,
-                    own,
-                    excluded,
-                    self.c.cs_eft_burst_wait_s,
-                    self.c.cs_eft_max_pull_tokens,
-                    self.c.cs_eft_margin_s,
-                );
+                // S5 FPI family: (target, pull allowed) replaces the greedy EFT choice.
+                let mut fpi_pull = true;
+                let (t_, why) = if self.c.cs_fpi != "off" {
+                    let rec_s: Vec<f64> = (0..np)
+                        .map(|w| {
+                            let host_local = local[w].saturating_sub(gpu[w].min(local[w]));
+                            eft_secs(&self.p[w].beta, ch, l - local[w], local[w], host_local, 0)
+                        })
+                        .collect();
+                    let (k, use_pull) = self.fpi_route(t, r, own, l, &local, &wait, &own_s, &pull_s, &pulled, &rec_s);
+                    fpi_pull = use_pull;
+                    (k, if k != own { 1 } else { 0 })
+                } else {
+                    eft_choose(
+                        &wait,
+                        &own_s,
+                        &pull_s,
+                        &dup,
+                        &pulled,
+                        own,
+                        excluded,
+                        self.c.cs_eft_burst_wait_s,
+                        self.c.cs_eft_max_pull_tokens,
+                        self.c.cs_eft_margin_s,
+                    )
+                };
                 tgt = t_;
                 match why {
                     1 => self.eft_counts[0] += 1,
@@ -2212,11 +2360,11 @@ impl<'a> Sim<'a> {
                 }
                 let nh = if tgt != own { (Some(tgt as u16), Some(own as u16)) } else { (Some(tgt as u16), prev) };
                 self.eft_home.insert(ckey, nh);
-                let cost = l - exp[tgt];
+                let cost = if fpi_pull { l - exp[tgt] } else { l - local[tgt] };
                 self.p[tgt].cs_pending += cost;
                 self.p[tgt].cs_active += 1;
                 self.reqs[r as usize].cs_cost = Some(cost);
-                if self.c.pull_enabled {
+                if self.c.pull_enabled && fpi_pull {
                     if let Some((src, hs)) = hint[tgt] {
                         self.reqs[r as usize].pull_src = Some(src as u16);
                         self.reqs[r as usize].pull_hint = hs.saturating_sub(hits[tgt]);
@@ -3880,6 +4028,174 @@ impl<'a> Sim<'a> {
         self.kv_log.push((t, sid, p as u16, ver, op));
     }
 
+    /// S5: standard normal draw from the noise stream (Box-Muller).
+    fn ngauss(&mut self) -> f64 {
+        let u1 = self.nrng.random().max(1e-300);
+        let u2 = self.nrng.random();
+        (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+    }
+
+    /// S5: co_schedule backlog signal now (cs_workload "true" = live backlog, else the ledger).
+    fn cs_pend_now(&self) -> Vec<u64> {
+        if self.c.cs_workload == "true" {
+            (0..self.p.len()).map(|w| self.true_backlog(w)).collect()
+        } else {
+            self.p.iter().map(|p| p.cs_pending).collect()
+        }
+    }
+
+    /// S5: backlog as sampled cs_state_age_s ago (0.1 s samples) + own charges routed since.
+    fn cs_pend_stale(&self, t: f64) -> Vec<u64> {
+        let due = t - self.c.cs_state_age_s;
+        let Some(&(ts, ref v)) = self.st_hist.iter().rev().find(|x| x.0 <= due).or(self.st_hist.front()) else {
+            return self.cs_pend_now();
+        };
+        let mut out = v.clone();
+        if self.c.cs_state_own_fix {
+            for (w, q) in self.st_routed.iter().enumerate() {
+                out[w] += q.iter().filter(|x| x.0 > ts).map(|x| x.1).sum::<u64>();
+            }
+        }
+        out
+    }
+
+    /// S5 FPI family on the EFT path. Returns (target, pull allowed for a move). Before the pilot ends
+    /// the router is owner-always and counts arrivals per P.
+    #[allow(clippy::too_many_arguments)]
+    fn fpi_route(
+        &mut self,
+        t: f64,
+        r: u32,
+        own: usize,
+        l: u64,
+        local: &[u64],
+        wait: &[f64],
+        own_s: &[f64],
+        pull_s: &[f64],
+        pulled: &[u64],
+        rec_s: &[f64],
+    ) -> (usize, bool) {
+        let np = local.len();
+        let Some(lr) = self.fpi_lr.clone() else {
+            if !self.reqs[r as usize].warm {
+                self.fpi_n[own] += 1;
+            }
+            return (own, false);
+        };
+        self.fpi_counts[3] += 1;
+        let cap = self.c.cs_eft_max_pull_tokens;
+        let a = |w: usize, start: f64, x: f64| fpi_score(start, x, wait[w], lr[w].0, lr[w].1);
+        // Best variant on each P: owner local; other P: pull (within the cap) or recompute.
+        let mut best: Vec<(f64, bool)> = vec![(f64::INFINITY, false); np];
+        for w in 0..np {
+            if w == own {
+                best[w] = (a(w, wait[w], own_s[w]), false);
+                continue;
+            }
+            let rec = a(w, wait[w], rec_s[w]);
+            best[w] = (rec, false);
+            if pulled[w] > 0 && (cap == 0 || pulled[w] <= cap) {
+                let pv = a(w, wait[w].max(pull_s[w]), own_s[w]);
+                if pv < rec {
+                    best[w] = (pv, true);
+                }
+            }
+        }
+        let fpi_pick = |best: &[(f64, bool)]| -> usize {
+            let mut k = own;
+            for w in 0..np {
+                if w != own && best[w].0 < best[k].0 {
+                    k = w;
+                }
+            }
+            k
+        };
+        let mode = self.c.cs_fpi.clone();
+        let (k, use_pull) = if mode == "fpi" {
+            let k = fpi_pick(&best);
+            (k, best[k].1)
+        } else {
+            // As-if-local FPI cost c(k) on every P (the chain's prefix L = owner hit already on k) and
+            // the move cost M(k) = min(pull wait beyond the backlog + restore, recompute extra).
+            let lmax = local[own];
+            let ch = self.c.chunk_tokens;
+            let mut c = vec![0.0; np];
+            let mut m = vec![0.0; np];
+            for w in 0..np {
+                let b = self.p[w].beta;
+                let x_loc = eft_secs(&b, ch, l - lmax, lmax, 0, 0);
+                c[w] = a(w, wait[w], x_loc);
+                if w == own {
+                    continue;
+                }
+                let mv = lmax.saturating_sub(local[w]);
+                let rec_extra = (rec_s[w] - x_loc).max(0.0);
+                let mut mm = rec_extra;
+                if mv > 0 && (cap == 0 || mv <= cap) {
+                    let tp = self.c.cs_eft_pull_fixed_s + self.c.cs_eft_pull_s_per_100k * mv as f64 / 1e5;
+                    let pull_cost = (tp - wait[w]).max(0.0) + b[4] * mv as f64 / 1e5;
+                    mm = mm.min(pull_cost);
+                }
+                m[w] = mm;
+            }
+            let key = self.chain_key(r);
+            // Start: w = 0 at the holder, M at the other P (OR-MODELS S2).
+            let w0: Vec<f64> = (0..np).map(|kk| if kk == own { 0.0 } else { m[kk] }).collect();
+            let u0 = self.nrng.random();
+            let mut st = self.wf.remove(&key).unwrap_or_else(|| WfState { w: w0.clone(), h: own, r: 0.0, u: u0, last: t });
+            if st.h != own && !(st.h < np && local[st.h] + self.c.pull_min_tokens > lmax) {
+                // The holder lost the prefix: reset, as a cold session on the current owner.
+                self.fpi_counts[2] += 1;
+                st = WfState { w: w0, h: own, r: 0.0, u: st.u, last: t };
+            }
+            let h = st.h;
+            let k = if mode == "wfa" {
+                let prev = st.w.clone();
+                for kk in 0..np {
+                    let via = (0..np).filter(|&y| y != kk).map(|y| prev[y] + m[kk]).fold(f64::INFINITY, f64::min);
+                    st.w[kk] = c[kk] + prev[kk].min(via);
+                }
+                let mn = st.w.iter().cloned().fold(f64::INFINITY, f64::min);
+                for x in st.w.iter_mut() {
+                    *x -= mn;
+                }
+                let mut k = h;
+                for kk in 0..np {
+                    if kk != h && st.w[kk] + m[kk] < st.w[k] {
+                        k = kk;
+                    }
+                }
+                k
+            } else {
+                let dt = (t - st.last).max(0.0);
+                let alt = (0..np).filter(|&kk| kk != h).min_by(|&x, &y| c[x].total_cmp(&c[y]).then(x.cmp(&y)));
+                let mut k = h;
+                if let Some(j) = alt {
+                    st.r = st.r * (-dt / self.c.cs_ski_tau_s.max(1e-9)).exp() + (c[h] - c[j]).max(0.0);
+                    let theta = if mode == "skir" {
+                        m[j] * (1.0 + (std::f64::consts::E - 1.0) * st.u).ln()
+                    } else {
+                        m[j]
+                    };
+                    if st.r >= theta && c[j] < c[h] {
+                        k = j;
+                        st.r = 0.0;
+                        st.u = self.nrng.random();
+                    }
+                }
+                k
+            };
+            st.last = t;
+            st.h = k;
+            self.wf.insert(key, st);
+            (k, best[k].1)
+        };
+        if k != own {
+            self.fpi_counts[if use_pull { 0 } else { 1 }] += 1;
+        }
+        (k, use_pull)
+    }
+
     /// S4: the idle timer of (session, version) expired; END unless a newer request was routed.
     fn kv_idle(&mut self, t: f64, sid: u32, ver: u32) {
         let Some(s) = self.kv_sess.get(&sid) else { return };
@@ -4674,6 +4990,47 @@ impl<'a> Sim<'a> {
                     rep.agent_gap_gt[j] = g.iter().filter(|&&x| x > *th).count() as f64 / k;
                 }
             }
+            if let Some(lr) = &self.fpi_lr {
+                rep.fpi_lambda_rho = lr.iter().map(|&(a, b)| [a, b]).collect();
+            }
+            rep.fpi_counts = self.fpi_counts;
+            {
+                let nb = (self.c.duration_s / 300.0).ceil().max(1.0) as usize;
+                let mut s = vec![[0.0f64; 5]; nb];
+                let mut cnt = vec![0.0f64; nb];
+                let mut pt_ = vec![0.0f64; nb];
+                let mut ev_win = 0u64;
+                for w in &self.p {
+                    for e in &w.radix.evictions {
+                        let b = ((e.t / 300.0) as usize).min(nb - 1);
+                        s[b][1] += e.blocks as f64 * bt as f64;
+                        if inw(e.t) {
+                            ev_win += e.blocks as u64 * bt;
+                        }
+                    }
+                }
+                for q in &self.reqs {
+                    if q.warm || q.cancel {
+                        continue;
+                    }
+                    let Some(d) = q.done else { continue };
+                    let b = ((q.start / 300.0) as usize).min(nb - 1);
+                    s[b][2] += d - q.start;
+                    cnt[b] += 1.0;
+                    s[b][3] += (q.dev + q.host + q.stor + q.drd) as f64;
+                    pt_[b] += q.pt as f64;
+                    let bd = ((d / 300.0) as usize).min(nb - 1);
+                    s[bd][4] += 1.0 / 300.0;
+                }
+                for b in 0..nb {
+                    s[b][0] = b as f64 * 300.0;
+                    s[b][1] /= 300.0;
+                    s[b][2] = if cnt[b] > 0.0 { s[b][2] / cnt[b] } else { f64::NAN };
+                    s[b][3] = if pt_[b] > 0.0 { s[b][3] / pt_[b] } else { f64::NAN };
+                }
+                rep.series_300s = s;
+                rep.host_evicted_tok_s_win = ev_win as f64 / (self.hi - self.lo).max(1e-9);
+            }
             for w in &self.p {
                 rep.pull_free_tokens[0] += w.radix.stats.pf_added_blocks * bt;
                 rep.pull_free_tokens[1] += w.radix.stats.pf_removed_blocks * bt;
@@ -4800,6 +5157,76 @@ mod tests {
         assert_eq!((t, why), (0, 4));
         let (t, why) = eft_choose(&wait, &own_s, &z, &z, &[0, 10, 10], 0, None, 8.0, 0, 0.0);
         assert_eq!((t, why), (1, 1));
+    }
+
+    #[test]
+    fn fpi_score_matches_the_worked_example() {
+        // OR-MODELS section 2(a): lambda 1/s, rho 0.6; owner u 6 s, x 0.5 s; target u 1 s, pull 1.2 s.
+        let owner = fpi_score(6.0, 0.5, 6.0, 1.0, 0.6);
+        let pull = fpi_score(1.2, 0.5, 1.0, 1.0, 0.6);
+        let rec = fpi_score(1.0, 4.0, 1.0, 1.0, 0.6);
+        assert!((owner - 14.3125).abs() < 1e-9 && (pull - 3.2625).abs() < 1e-9 && (rec - 35.0).abs() < 1e-9);
+        // lambda = 0 is greedy EFT.
+        assert_eq!(fpi_score(1.0, 4.0, 1.0, 0.0, 0.6), 5.0);
+    }
+
+    #[test]
+    fn s5_router_options_run_and_keep_counts_consistent() {
+        let wl = synth_workload(12, 30);
+        let ct = FxHashMap::default();
+        let base = SimConfig {
+            cs_workload: "true".into(),
+            p_dev_tokens: 131_072,
+            p_host_tokens: 262_144,
+            kv_retention: true,
+            cs_margin_tokens: 0,
+            ..kv_cfg("cosched")
+        };
+        let go = |c: SimConfig| {
+            let mut s = Sim::new(c, &wl, &ct);
+            s.run();
+            for w in &s.p {
+                w.radix.check().unwrap();
+            }
+            let (rep, _) = s.report(0.0);
+            assert!(rep.n_scored > 100, "scored {}", rep.n_scored);
+            for a in &rep.kv_audit {
+                assert_eq!(a[..3], [0, 0, 0], "{:?}", rep.kv_audit);
+            }
+            // 300-s series cover the run (400 s -> 2 bins) and count every completion once.
+            assert_eq!(rep.series_300s.len(), 2);
+            let done: f64 = rep.series_300s.iter().map(|x| x[4] * 300.0).sum();
+            let want = s.reqs.iter().filter(|q| !q.warm && !q.cancel && q.done.is_some()).count() as f64;
+            assert!((done - want).abs() < 1e-6, "{done} vs {want}");
+            assert!(rep.host_evicted_tok_s_win >= 0.0);
+            rep
+        };
+        let r0 = go(base.clone());
+        assert!(r0.pulls_all > 0, "co-schedule base never pulled");
+        // Recompute moves: no pull at all.
+        let rr = go(SimConfig { cs_move_mode: "recompute".into(), ..base.clone() });
+        assert_eq!(rr.pulls_all, 0);
+        // Noise and stale state run; zero settings are inert.
+        let z = go(SimConfig { cs_noise_queue: 0.0, cs_noise_sigma: 0.0, cs_state_age_s: 0.0, ..base.clone() });
+        assert_eq!(serde_json::to_string(&z).unwrap(), serde_json::to_string(&r0).unwrap());
+        go(SimConfig { cs_noise_queue: 0.5, cs_noise_sigma: 0.25, ..base.clone() });
+        go(SimConfig { cs_state_age_s: 1.0, ..base.clone() });
+        go(SimConfig { cs_state_age_s: 2.0, cs_state_own_fix: false, ..base.clone() });
+        // FPI family on the EFT path: the pilot measures lambda and rho, then moves are counted.
+        for mode in ["fpi", "wfa", "ski", "skir"] {
+            let rep = go(SimConfig {
+                p_policy: "eft".into(),
+                cs_eft_one_way: false,
+                cs_eft_dup_rho: 0.0,
+                cs_fpi: mode.into(),
+                cs_fpi_pilot_s: 60.0,
+                cs_eft_max_pull_tokens: 25_000,
+                ..base.clone()
+            });
+            assert_eq!(rep.fpi_lambda_rho.len(), 3, "{mode}");
+            assert!(rep.fpi_lambda_rho.iter().all(|x| x[0] > 0.0 && x[1] > 0.0 && x[1] <= 0.95), "{mode} {:?}", rep.fpi_lambda_rho);
+            assert!(rep.fpi_counts[3] > 0, "{mode}");
+        }
     }
 
     #[test]
