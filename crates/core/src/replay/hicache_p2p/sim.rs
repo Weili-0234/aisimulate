@@ -804,6 +804,8 @@ struct Req {
     pred_c: f64,
     pred_c0: f64,
     pred_idle: bool,
+    pred_b0: f64,
+    pred_s0: f64,
     unc_est: u64,
     ideal: u64,
     // routing / gap cause
@@ -1274,6 +1276,8 @@ pub struct SimReport {
     pub pred_err: Vec<[f64; 8]>,
     pub pred_kq: Vec<[f64; 4]>,
     pub pred_gate: [u64; 3],
+    /// S8: share of scored requests sent to a P other than their owner (most cached prefix).
+    pub moved_share: f64,
     /// S7 B1 debug at the end of the run: held count, then per P [backlog s without ledger, ledger s,
     /// waiting, bootstrap, prefilling counts].
     pub hold_end: Vec<f64>,
@@ -1315,6 +1319,18 @@ pub struct Row {
     /// S2: D prefix at prealloc and the D-read part of `actual` (tokens; 0 without d_cache).
     pub d_prefix: u64,
     pub dread: u64,
+    /// S8 (pred_metric; -1 = n/a): actual decision -> prefill done; forecasts (noisy, noise-free), the
+    /// noise-free backlog and own-service parts, P idle at the decision; decision -> P receive, P receive
+    /// -> ready, owner P.
+    pub pred_lab: f64,
+    pub pred_c: f64,
+    pub pred_c0: f64,
+    pub pred_b0: f64,
+    pub pred_s0: f64,
+    pub pred_idle: bool,
+    pub recv_s: f64,
+    pub ready_s: f64,
+    pub owner: u16,
 }
 
 pub struct Sim<'a> {
@@ -2797,6 +2813,8 @@ impl<'a> Sim<'a> {
                     rq.pred_c = ing + wait[tgt].max(pull_s[tgt]) + own_s[tgt];
                     rq.pred_c0 = ing + wait0[tgt].max(pull_s[tgt]) + own0[tgt];
                     rq.pred_idle = pidle[tgt];
+                    rq.pred_b0 = wait0[tgt];
+                    rq.pred_s0 = own0[tgt];
                 }
                 let nh = if tgt != own { (Some(tgt as u16), Some(own as u16)) } else { (Some(tgt as u16), prev) };
                 self.eft_home.insert(ckey, nh);
@@ -5769,6 +5787,7 @@ impl<'a> Sim<'a> {
                 }
                 rep.e2e_by_move = em;
                 rep.pred_gate = self.pred_stats;
+                rep.moved_share = cmp.iter().filter(|q| q.owner != q.p).count() as f64 / ns;
                 if self.c.pred_metric {
                     let rows: Vec<(f64, f64, f64, bool)> = cmp
                         .iter()
@@ -5980,6 +5999,18 @@ impl<'a> Sim<'a> {
                     },
                     d_prefix: r.d_prefix,
                     dread: r.drd,
+                    pred_lab: match r.t_pd {
+                        Some(d) if r.pred_t > 0.0 && d > r.pred_t => d - r.pred_t,
+                        _ => -1.0,
+                    },
+                    pred_c: if r.pred_t > 0.0 { r.pred_c } else { -1.0 },
+                    pred_c0: if r.pred_t > 0.0 { r.pred_c0 } else { -1.0 },
+                    pred_b0: if r.pred_t > 0.0 { r.pred_b0 } else { -1.0 },
+                    pred_s0: if r.pred_t > 0.0 { r.pred_s0 } else { -1.0 },
+                    pred_idle: r.pred_idle,
+                    recv_s: if r.pred_t > 0.0 { r.p_recv - r.pred_t } else { -1.0 },
+                    ready_s: r.p_ready.map(|x| x - r.p_recv).unwrap_or(-1.0),
+                    owner: r.owner,
                 });
             }
         }
