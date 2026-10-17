@@ -109,6 +109,10 @@ pub struct SimConfig {
     pub smg_rel: f64,
     pub smg_tree_tokens: u64,
     pub smg_evict_interval_s: f64,
+    /// Attribution option (NOT the SMG gateway): cache-aware matches each P's actual radix (device +
+    /// host, exact and current, like the co-schedule / EFT routers here) instead of the SMG
+    /// approximate tree. Threshold, balance rule and load counter unchanged. false = SMG tree.
+    pub smg_exact_hits: bool,
     /// SMG low-match target: "smallest_tenant" (SMG code) or "min_load".
     pub smg_low_match: String,
     /// SMG load decrement point: "prefill_done" or "request_done".
@@ -374,6 +378,7 @@ impl Default for SimConfig {
             smg_rel: 1.5,
             smg_tree_tokens: 12_405_568,
             smg_evict_interval_s: 120.0,
+            smg_exact_hits: false,
             smg_low_match: "min_load".into(),
             smg_load_release: "kv_arrived".into(),
             cs_margin_tokens: 32768,
@@ -1898,8 +1903,11 @@ impl<'a> Sim<'a> {
                 if imbalanced {
                     tgt = min_load(self);
                 } else {
-                    let m: Vec<u64> =
-                        self.smg.iter_mut().map(|tr| tr.match_peek(&runs).total() as u64 * bt).collect();
+                    let m: Vec<u64> = if self.c.smg_exact_hits {
+                        hits.clone()
+                    } else {
+                        self.smg.iter_mut().map(|tr| tr.match_peek(&runs).total() as u64 * bt).collect()
+                    };
                     let mb = *m.iter().max().unwrap();
                     if mb > 0 && (mb as f64) / (pt.max(1) as f64) > self.c.smg_threshold {
                         let c: Vec<usize> = (0..np).filter(|&k| m[k] == mb).collect();
