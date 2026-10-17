@@ -2685,8 +2685,15 @@ impl<'a> Sim<'a> {
         let bt = self.c.block_tokens;
         let runs = self.lkey(r);
         let m = if do_match { self.p[p].radix.match_local(&runs, t) } else { self.p[p].radix.match_peek(&runs) };
-        let depth = m.total() as u64 * bt;
-        let Some(deep) = m.path.last().map(|&(n, _)| n) else { return };
+        let (deep, depth) = if self.p[p].radix.kvret {
+            // Retention: a GPU-backed node may have lost its host copy; the guard locks the deepest node
+            // WITH a host copy (QPG locks host-backed nodes; base: every matched node has one).
+            let (d, b) = self.p[p].radix.host_prefix(&m.path);
+            (d, b * bt)
+        } else {
+            (m.path.last().map(|&(n, _)| n), m.total() as u64 * bt)
+        };
+        let Some(deep) = deep else { return };
         if depth < self.c.guard_min_tokens {
             return;
         }
@@ -2704,8 +2711,13 @@ impl<'a> Sim<'a> {
         let bt = self.c.block_tokens;
         let runs = self.reqs[r as usize].runs.clone();
         let m = self.p[p].radix.match_peek(&runs);
-        let depth = m.total() as u64 * bt;
-        let Some(deep) = m.path.last().map(|&(n, _)| n) else { return };
+        let (deep, depth) = if self.p[p].radix.kvret {
+            let (d, b) = self.p[p].radix.host_prefix(&m.path);
+            (d, b * bt)
+        } else {
+            (m.path.last().map(|&(n, _)| n), m.total() as u64 * bt)
+        };
+        let Some(deep) = deep else { return };
         if depth < self.c.guard_min_tokens {
             return;
         }
@@ -5055,6 +5067,7 @@ mod tests {
             assert_eq!(a[..3], [0, 0, 0], "{:?}", rep.per_p_audit);
         }
         assert!(rep.pulls_all > 0, "no pull");
+        assert!(rep.guard_grants.iter().sum::<u64>() > 0, "guard never locked");
         assert!(rep.kv_evicted_tokens_all[0] + rep.kv_evicted_tokens_all[1] > 0, "{:?}", rep.kv_evicted_tokens_all);
         assert!(rep.kv_end_ops[0] > 0);
     }

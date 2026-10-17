@@ -256,6 +256,7 @@ pub struct CacheStats {
     pub kv_evicted_blocks: [u64; 4],
     pub kv_devonly_deleted_blocks: u64,
     pub kv_devonly_children_skip: u64,
+    pub kv_devonly_hlock_skip: u64,
 }
 
 /// Window-filtered host eviction samples: (evict time, blocks, age since last use, age since write).
@@ -1059,6 +1060,11 @@ impl TwoTierRadix {
                     self.stats.kv_devonly_children_skip += 1;
                     continue;
                 }
+                if n.hlock > 0 {
+                    // A host lock (queued-prefix guard) still references this node: keep it.
+                    self.stats.kv_devonly_hlock_skip += 1;
+                    continue;
+                }
                 let (nb, par, key) = (n.nb, n.par, n.runs[0].0);
                 self.stats.dev_evicted_blocks += nb as u64;
                 self.stats.kv_devonly_deleted_blocks += nb as u64;
@@ -1588,6 +1594,20 @@ impl TwoTierRadix {
             ready += nd.nb as u64;
         }
         (if ready >= req { KV_READY } else { KV_PENDING }, ready.min(req), req)
+    }
+
+    /// Deepest node of a matched path that holds a host copy, and the blocks up to it (host nodes
+    /// form a prefix of any path: a host node's ancestors are host nodes).
+    pub fn host_prefix(&self, path: &[(NodeId, u32)]) -> (Option<NodeId>, u64) {
+        let (mut deep, mut b) = (None, 0u64);
+        for &(n, m) in path {
+            if !self.nodes[n as usize].host {
+                break;
+            }
+            deep = Some(n);
+            b += m as u64;
+        }
+        (deep, b)
     }
 
     /// Host blocks in retention class 0 (known zero), all host nodes.
