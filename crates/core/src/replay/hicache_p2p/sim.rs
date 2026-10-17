@@ -412,6 +412,26 @@ pub struct SimConfig {
     pub cs_eft_gate_theta_s: f64,
     /// Multiplier on the trace's think waits (after the cap; 1.0 = as recorded). Used to match req/s.
     pub wait_scale: f64,
+    /// B1 C7-hold (0 = off; EFT path): dispatch to the owner (most cached prefix, ties -> least backlog)
+    /// when its backlog <= cs_hold_passes full-chunk passes; else hold the request in the router. Every
+    /// cs_hold_tick_s each P releases its own held requests (FIFO) while under that limit; with
+    /// cs_hold_steal a P with backlog <= cs_hold_idle_s takes the held request with the largest gain
+    /// g = B_o + S_o + w S_o min(n_behind, 3) - (T_pull + H + S_j) - lambda x, if g > cs_hold_margin_s.
+    /// Cool-downs: a P that received a steal is no steal source for cs_hold_worker_cd_s; a session
+    /// that moved is not stolen again for cs_hold_sess_cd_s.
+    pub cs_hold_passes: f64,
+    pub cs_hold_steal: bool,
+    pub cs_hold_margin_s: f64,
+    pub cs_hold_w: f64,
+    pub cs_hold_idle_s: f64,
+    pub cs_hold_tick_s: f64,
+    pub cs_hold_worker_cd_s: f64,
+    pub cs_hold_sess_cd_s: f64,
+    /// Output only: share of P queue time (ready -> forward) that overlaps a fully idle other P.
+    pub idle_overlap_metric: bool,
+    /// S7: the copy price lambda applies to every token a candidate would duplicate (best cached
+    /// prefix on any P - its own), pulled or recomputed; false = pulled tokens only.
+    pub cs_eft_dup_on_recompute: bool,
 }
 
 impl Default for SimConfig {
@@ -578,6 +598,16 @@ impl Default for SimConfig {
             cs_eft_gate_big_tokens: 0,
             cs_eft_gate_theta_s: 3.0,
             wait_scale: 1.0,
+            cs_hold_passes: 0.0,
+            cs_hold_steal: true,
+            cs_hold_margin_s: 1.0,
+            cs_hold_w: 0.0,
+            cs_hold_idle_s: 0.3,
+            cs_hold_tick_s: 0.05,
+            cs_hold_worker_cd_s: 10.0,
+            cs_hold_sess_cd_s: 60.0,
+            idle_overlap_metric: false,
+            cs_eft_dup_on_recompute: false,
         }
     }
 }
@@ -623,6 +653,8 @@ enum Ev {
     /// S5: router backlog sample (state age); end of the FPI pilot.
     StateTick,
     FpiPilotEnd,
+    /// S7 B1: router hold queue check.
+    HoldTick,
 }
 
 /// S5 per agent chain router state for the work-function / ski-rental arms: work function per P,
@@ -735,6 +767,9 @@ struct Req {
     lost: u64,
     /// S6: router seconds charged to the target's in-transit ledger (removed at P receive).
     transit_s: f64,
+    /// S7 B1: seconds held in the router; taken by a P other than its owner.
+    hold_s: f64,
+    stolen: bool,
     unc_est: u64,
     ideal: u64,
     // routing / gap cause
@@ -1192,6 +1227,12 @@ pub struct SimReport {
     /// B2 gate fired.
     pub lp_mult_mean: f64,
     pub gate_fire_share: f64,
+    /// S7 B1: share of scored requests held in the router, share taken by a non-owner P (steal),
+    /// mean hold seconds of the held ones; share of P queue time overlapping a fully idle other P.
+    pub held_share: f64,
+    pub stolen_share: f64,
+    pub hold_s_mean: f64,
+    pub idle_overlap_share: f64,
     pub wall_s: f64,
 }
 
@@ -1330,6 +1371,14 @@ pub struct Sim<'a> {
     /// S7: lambda-pressure multipliers used (sum, count) and gate firings (decisions, fired).
     lp_stats: (f64, u64),
     gate_stats: (u64, u64),
+    /// S7 B1: held requests (request, owner, hold time), tick scheduled, forced dispatch target,
+    /// last steal received per P, last move per session; idle intervals (start, end, P).
+    held: Vec<(u32, u16, f64)>,
+    hold_tick_on: bool,
+    force_tgt: Option<usize>,
+    steal_rx_t: Vec<f64>,
+    sess_move_t: FxHashMap<(u64, u32), f64>,
+    idle_log: Vec<(f64, f64, u16)>,
     fpi_n: Vec<u64>,
     fpi_lr: Option<Vec<(f64, f64)>>,
     wf: FxHashMap<(u64, u32), WfState>,
@@ -1363,7 +1412,7 @@ pub(crate) fn eft_secs(beta: &[f64; 5], chunk: u64, unc: u64, pre: u64, host: u6
 /// (one-way), 3 = stay because a better P needs a pull above `max_pull` (cap; 0 = no cap), 4 = stay
 /// because the owner's wait is below `burst_s` (0 = off). A move needs total + margin < owner total.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, dead_code)]
 pub(crate) fn eft_choose(
     wait: &[f64],
     own_s: &[f64],
@@ -1650,6 +1699,12 @@ impl<'a> Sim<'a> {
             eft_routed: vec![VecDeque::new(); s5_np],
             lp_stats: (0.0, 0),
             gate_stats: (0, 0),
+            held: Vec::new(),
+            hold_tick_on: false,
+            force_tgt: None,
+            steal_rx_t: vec![f64::NEG_INFINITY; s5_np],
+            sess_move_t: FxHashMap::default(),
+            idle_log: Vec::new(),
             fpi_n: vec![0; s5_np],
             fpi_lr: None,
             wf: FxHashMap::default(),
@@ -1818,6 +1873,7 @@ impl<'a> Sim<'a> {
                         self.at(t + 0.1, Ev::StateTick);
                     }
                 }
+                Ev::HoldTick => self.hold_tick(t),
                 Ev::FpiPilotEnd => {
                     let dt = self.c.cs_fpi_pilot_s.max(1e-9);
                     let cap = self.c.cs_fpi_rho_cap;
@@ -2166,6 +2222,23 @@ impl<'a> Sim<'a> {
     }
 
     fn route(&mut self, t: f64, r: u32) {
+        if self.c.cs_hold_passes > 0.0 && self.force_tgt.is_none() {
+            let hits = self.actual_hits(r);
+            let bs: Vec<f64> = (0..self.p.len()).map(|w| self.hold_backlog(w)).collect();
+            let o = (0..self.p.len())
+                .min_by(|&a, &b| hits[b].cmp(&hits[a]).then(bs[a].total_cmp(&bs[b])).then(a.cmp(&b)))
+                .unwrap();
+            if bs[o] > self.hold_limit(o) {
+                self.held.push((r, o as u16, t));
+                if !self.hold_tick_on {
+                    self.hold_tick_on = true;
+                    self.at(t + self.c.cs_hold_tick_s, Ev::HoldTick);
+                }
+                return;
+            }
+            self.dispatch_to(t, r, o);
+            return;
+        }
         if !self.reqs[r as usize].warm {
             let a = self.reqs[r as usize].agent_state;
             if let Some(&ld) = self.agent_last_done.get(&a) {
@@ -2522,7 +2595,17 @@ impl<'a> Sim<'a> {
                     } else {
                         self.c.cs_eft_dup_per_token_s
                     };
-                    dup[w] = self.c.cs_eft_dup_rho * eft_secs(&b, ch, pl, 0, 0, 0) + lam * pl as f64;
+                    let dtok = if self.c.cs_eft_dup_on_recompute {
+                        local.iter().copied().max().unwrap_or(0).saturating_sub(local[w])
+                    } else {
+                        pl
+                    };
+                    let lam = if self.c.cs_eft_dup_on_recompute && pl == 0 && dtok > 0 && self.c.cs_eft_lp_ref > 0.0 {
+                        self.c.cs_eft_dup_per_token_s * self.lp_mult(t, w)
+                    } else {
+                        lam
+                    };
+                    dup[w] = self.c.cs_eft_dup_rho * eft_secs(&b, ch, pl, 0, 0, 0) + lam * dtok as f64;
                     if pl > 0 {
                         dup[w] += self.c.cs_eft_handoff_s;
                     }
@@ -2594,6 +2677,10 @@ impl<'a> Sim<'a> {
                     )
                 };
                 tgt = t_;
+                if let Some(f) = self.force_tgt {
+                    tgt = f;
+                    own = own_hit;
+                }
                 match why {
                     1 => self.eft_counts[0] += 1,
                     2 => self.eft_counts[1] += 1,
@@ -3362,6 +3449,9 @@ impl<'a> Sim<'a> {
             let b = t.min(self.hi);
             if b > a {
                 self.p[p].idle_win[cls as usize] += b - a;
+            }
+            if self.c.idle_overlap_metric && cls == 0 && t > t0 {
+                self.idle_log.push((t0, t, p as u16));
             }
         }
         if self.p[p].run_items.is_none() {
@@ -4433,6 +4523,93 @@ impl<'a> Sim<'a> {
         })
     }
 
+    /// S7 B1: router view of a P's backlog seconds (queues + running + in-flight ledger).
+    fn hold_backlog(&self, w: usize) -> f64 {
+        self.backlog_secs(w, true) + self.p[w].transit_s.max(0.0)
+    }
+
+    fn hold_limit(&self, w: usize) -> f64 {
+        let ch = self.c.chunk_tokens;
+        self.c.cs_hold_passes * eft_secs(&self.p[w].beta, ch, ch, 0, 0, 0)
+    }
+
+    /// S7 B1: route request r now, to P w (pull from the best other holder as the EFT path hints).
+    fn dispatch_to(&mut self, t: f64, r: u32, w: usize) {
+        self.force_tgt = Some(w);
+        self.route(t, r);
+        self.force_tgt = None;
+    }
+
+    /// S7 B1: release own held requests while the owner is under its limit, then let near-idle P steal.
+    fn hold_tick(&mut self, t: f64) {
+        let np = self.p.len();
+        for w in 0..np {
+            while let Some(i) = self.held.iter().position(|h| h.1 as usize == w) {
+                if self.hold_backlog(w) > self.hold_limit(w) {
+                    break;
+                }
+                let (r, _, t0) = self.held.remove(i);
+                self.reqs[r as usize].hold_s = t - t0;
+                self.dispatch_to(t, r, w);
+            }
+        }
+        if self.c.cs_hold_steal {
+            let ch = self.c.chunk_tokens;
+            for j in 0..np {
+                while !self.held.is_empty() && self.hold_backlog(j) <= self.c.cs_hold_idle_s {
+                    let mut best: Option<(usize, f64)> = None;
+                    for i in 0..self.held.len() {
+                        let (r, o, t0) = self.held[i];
+                        let o = o as usize;
+                        if o == j || self.steal_rx_t[o] + self.c.cs_hold_worker_cd_s > t {
+                            continue;
+                        }
+                        let ck = self.chain_key(r);
+                        if self.sess_move_t.get(&ck).is_some_and(|&x| x + self.c.cs_hold_sess_cd_s > t) {
+                            continue;
+                        }
+                        let hits = self.actual_hits(r);
+                        let pt = self.reqs[r as usize].pt;
+                        let (mo, mj) = (hits[o].min(pt), hits[j].min(pt));
+                        let x = if mo > mj && mo - mj >= self.c.pull_min_incremental_tokens && mo >= self.c.pull_min_tokens {
+                            mo - mj
+                        } else {
+                            0
+                        };
+                        let so = eft_secs(&self.p[o].beta, ch, pt - mo, mo, 0, 0);
+                        let have = mj + x;
+                        let sj = eft_secs(&self.p[j].beta, ch, pt - have, have, 0, x);
+                        let behind = self.held.iter().filter(|h| h.1 as usize == o && h.2 > t0).count().min(3) as f64;
+                        let tp = if x > 0 {
+                            self.c.cs_eft_pull_fixed_s + self.c.cs_eft_pull_s_per_100k * x as f64 / 1e5 + self.c.cs_eft_handoff_s
+                        } else {
+                            0.0
+                        };
+                        let g = self.hold_backlog(o) + so + self.c.cs_hold_w * so * behind
+                            - (tp + sj)
+                            - self.c.cs_eft_dup_per_token_s * x as f64;
+                        if g > self.c.cs_hold_margin_s && best.map_or(true, |b| g > b.1) {
+                            best = Some((i, g));
+                        }
+                    }
+                    let Some((i, _)) = best else { break };
+                    let (r, _, t0) = self.held.remove(i);
+                    self.reqs[r as usize].hold_s = t - t0;
+                    self.reqs[r as usize].stolen = true;
+                    self.steal_rx_t[j] = t;
+                    let ck = self.chain_key(r);
+                    self.sess_move_t.insert(ck, t);
+                    self.dispatch_to(t, r, j);
+                }
+            }
+        }
+        if !self.held.is_empty() && t < self.c.duration_s {
+            self.at(t + self.c.cs_hold_tick_s, Ev::HoldTick);
+        } else {
+            self.hold_tick_on = false;
+        }
+    }
+
     /// S5: backlog as sampled cs_state_age_s ago (0.1 s samples) + own charges routed since.
     fn cs_pend_stale(&self, t: f64) -> Vec<u64> {
         let due = t - self.c.cs_state_age_s;
@@ -5481,6 +5658,47 @@ impl<'a> Sim<'a> {
                     row[0] /= ns;
                 }
                 rep.e2e_by_move = em;
+                if self.c.cs_hold_passes > 0.0 {
+                    let h: Vec<&&Req> = cmp.iter().filter(|q| q.hold_s > 0.0).collect();
+                    rep.held_share = h.len() as f64 / ns;
+                    rep.stolen_share = cmp.iter().filter(|q| q.stolen).count() as f64 / ns;
+                    rep.hold_s_mean = h.iter().map(|q| q.hold_s).sum::<f64>() / (h.len().max(1) as f64);
+                }
+                if self.c.idle_overlap_metric {
+                    // Union of idle intervals of the P other than p, per p (sorted, merged).
+                    let mut uni: Vec<Vec<(f64, f64)>> = Vec::new();
+                    for p in 0..self.p.len() {
+                        let mut v: Vec<(f64, f64)> =
+                            self.idle_log.iter().filter(|x| x.2 as usize != p).map(|x| (x.0, x.1)).collect();
+                        v.sort_by(|a, b| a.0.total_cmp(&b.0));
+                        let mut m: Vec<(f64, f64)> = Vec::new();
+                        for (a, b) in v {
+                            if let Some(l) = m.last_mut() {
+                                if a <= l.1 {
+                                    l.1 = l.1.max(b);
+                                    continue;
+                                }
+                            }
+                            m.push((a, b));
+                        }
+                        uni.push(m);
+                    }
+                    let (mut tot, mut ov) = (0.0, 0.0);
+                    for q in &cmp {
+                        let (Some(a), Some(b)) = (q.p_ready, q.t_fwd) else { continue };
+                        if b <= a {
+                            continue;
+                        }
+                        tot += b - a;
+                        let u = &uni[q.p as usize];
+                        let mut i = u.partition_point(|x| x.1 <= a);
+                        while i < u.len() && u[i].0 < b {
+                            ov += u[i].1.min(b) - u[i].0.max(a);
+                            i += 1;
+                        }
+                    }
+                    rep.idle_overlap_share = if tot > 0.0 { ov / tot } else { 0.0 };
+                }
                 rep.lp_mult_mean = if self.lp_stats.1 > 0 { self.lp_stats.0 / self.lp_stats.1 as f64 } else { 0.0 };
                 rep.gate_fire_share =
                     if self.gate_stats.0 > 0 { self.gate_stats.1 as f64 / self.gate_stats.0 as f64 } else { 0.0 };
@@ -5846,6 +6064,21 @@ mod tests {
         // A huge noise-aware margin also stops every move with a pull.
         let m = go(SimConfig { cs_eft_margin_k: 1e9, cs_eft_margin_s: 1e9, ..base.clone() });
         assert_eq!(m.pulls_all, 0);
+        // A copy price on recomputed duplicates too: with no pulls and a huge price nothing moves to a P
+        // with less cache than the best.
+        let dr = go(SimConfig {
+            cs_eft_dup_on_recompute: true,
+            cs_eft_dup_per_token_s: 1.0,
+            pull_min_incremental_tokens: 1 << 50,
+            ..base.clone()
+        });
+        assert_eq!(dr.pulls_all, 0);
+        assert_eq!(dr.lost_share, 0.0);
+        // B1 hold: runs with and without steals; every held request is dispatched in the end.
+        let h = go(SimConfig { cs_hold_passes: 1.0, cs_eft_handoff_s: 0.32, cs_hold_margin_s: 0.0, idle_overlap_metric: true, ..base.clone() });
+        assert!(h.held_share >= h.stolen_share && h.idle_overlap_share >= 0.0 && h.idle_overlap_share <= 1.0 + 1e-9);
+        let h0 = go(SimConfig { cs_hold_passes: 1.0, cs_hold_steal: false, ..base.clone() });
+        assert_eq!(h0.stolen_share, 0.0);
         // Slower think time lowers throughput.
         let s1 = go(base.clone());
         let s2 = go(SimConfig { wait_scale: 4.0, ..base.clone() });
