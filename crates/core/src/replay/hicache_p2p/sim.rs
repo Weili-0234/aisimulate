@@ -327,6 +327,14 @@ pub struct SimConfig {
     pub kvret_ctl_s: f64,
     pub kvret_dup_reclaim: bool,
     pub kvret_end: bool,
+    /// S4 idle END (option; 0 = off): with session tags, an agent whose last request completed
+    /// kvret_idle_s seconds ago and that sent no newer request is treated as ended (END to every P
+    /// the session used, as the trajectory END). A later request of the same agent starts a new
+    /// session identity (version 1), so its references come back on the P it is placed on.
+    pub kvret_idle_s: f64,
+    /// S3 (d) attribution option (default off): pull landings do not displace anything; the host
+    /// blocks a pull adds on the destination are outside its host capacity while they stay resident.
+    pub pull_free_capacity: bool,
 }
 
 impl Default for SimConfig {
@@ -462,6 +470,8 @@ impl Default for SimConfig {
             kvret_ctl_s: 0.01,
             kvret_dup_reclaim: true,
             kvret_end: true,
+            kvret_idle_s: 0.0,
+            pull_free_capacity: false,
         }
     }
 }
@@ -502,6 +512,8 @@ enum Ev {
     /// 0 release / 1 end).
     KvTick,
     KvCtl(u32, u16, u32, u8),
+    /// S4 idle END check for (session, version of the completed request).
+    KvIdle(u32, u32),
 }
 
 struct Item {
@@ -632,8 +644,10 @@ struct Req {
     dread_src: Option<u16>,
     dread_lease: Option<NodeId>,
     dread_upto: u32,
-    /// Session retention: the version the router registered for this request.
+    /// Session retention: the version the router registered for this request, and the session
+    /// identity (the agent state; a new identity after an S4 idle END).
     kv_ver: u32,
+    kv_sid: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -998,6 +1012,17 @@ pub struct SimReport {
     /// admitted in the score window): [sessions with a window request, mean moves, share with >= 1
     /// move, p90 moves, moves per 100 window requests].
     pub sess_moves: [f64; 5],
+    /// S4 idle END: [sessions ended by the idle rule (whole run), the same in the window, new
+    /// session identities after an idle END (whole run)].
+    pub kv_idle: [u64; 3],
+    /// Agent idle gaps (all arms): route time of an agent's request in the score window - completion
+    /// of the same agent's previous request: [count, mean, p10, p25, p50, p75, p90, p95, p99, max] (s)
+    /// and the share of gaps > 30, 60, 120, 300, 600 s.
+    pub agent_gap_s: [f64; 10],
+    pub agent_gap_gt: [f64; 5],
+    /// S3 (d) pull_free_capacity (tokens, all P): added by pull landings outside the capacity, removed
+    /// later, still resident at the end.
+    pub pull_free_tokens: [u64; 3],
     pub wall_s: f64,
 }
 
@@ -1114,6 +1139,16 @@ pub struct Sim<'a> {
     kv_lastgen: FxHashMap<(u32, u32), u32>,
     /// Duplicate census (t, dup blocks, extra-copy blocks, union blocks, class-0 host blocks).
     dupc: Vec<(f64, u64, u64, u64, u64)>,
+    /// S4: current session identity per agent state (absent = the agent state), next new identity,
+    /// sessions ended by the idle rule, new identities after an idle END.
+    kv_sid_of: FxHashMap<u32, u32>,
+    kv_sid_next: u32,
+    kv_idle_ends: Vec<f64>,
+    kv_idle_new: u64,
+    /// Per agent state: completion time of its latest (non-warm) request; idle gaps (route time of
+    /// the next request - that completion) of requests routed in the score window.
+    agent_last_done: FxHashMap<u32, f64>,
+    agent_gaps: Vec<f64>,
     lo: f64,
     hi: f64,
 }
@@ -1258,6 +1293,11 @@ impl<'a> Sim<'a> {
                 "kvret_mode: ready_end | transfer_end | end_only | recency_only"
             );
         }
+        assert!(
+            c.kvret_idle_s <= 0.0 || (c.kv_retention && c.kvret_mode != "recency_only"),
+            "kvret_idle_s needs kv_retention with session tags"
+        );
+        assert!(!(c.pull_free_capacity && c.shared_pool), "pull_free_capacity needs per-P pools");
         if c.shared_pool {
             // IDEAL bound: P 0's tree is the one pool of all P (sizes x n_p); the others stay empty.
             assert!(
@@ -1365,6 +1405,12 @@ impl<'a> Sim<'a> {
             kv_log: Vec::new(),
             kv_lastgen: FxHashMap::default(),
             dupc: Vec::new(),
+            kv_sid_of: FxHashMap::default(),
+            kv_sid_next: 0x8000_0000,
+            kv_idle_ends: Vec::new(),
+            kv_idle_new: 0,
+            agent_last_done: FxHashMap::default(),
+            agent_gaps: Vec::new(),
             lo,
             hi,
         }
@@ -1496,6 +1542,7 @@ impl<'a> Sim<'a> {
                     }
                 }
                 Ev::KvCtl(sid, p, ver, op) => self.kv_ctl(t, sid, p as usize, ver, op),
+                Ev::KvIdle(sid, ver) => self.kv_idle(t, sid, ver),
                 Ev::PullDone(r) => self.pull_done(t, r),
                 Ev::DReadDone(r) => self.dread_done(t, r),
                 Ev::DemoteDue(id) => self.demote_due(id),
@@ -1836,6 +1883,14 @@ impl<'a> Sim<'a> {
     }
 
     fn route(&mut self, t: f64, r: u32) {
+        if !self.reqs[r as usize].warm {
+            let a = self.reqs[r as usize].agent_state;
+            if let Some(&ld) = self.agent_last_done.get(&a) {
+                if t >= self.lo && t < self.hi {
+                    self.agent_gaps.push(t - ld);
+                }
+            }
+        }
         self.pick_p(t, r);
         if self.c.d_mode != "choose" {
             self.pick_d(r);
@@ -2676,7 +2731,7 @@ impl<'a> Sim<'a> {
         self.reqs[r as usize].qp_seq = self.p[p].qp_next;
         if self.kv_tagged() {
             // #49 note_kv_session_arrival: register (session, version) with the FULL input.
-            let (sid, ver) = (self.reqs[r as usize].agent_state, self.reqs[r as usize].kv_ver);
+            let (sid, ver) = (self.reqs[r as usize].kv_sid, self.reqs[r as usize].kv_ver);
             let key = self.reqs[r as usize].runs.clone();
             self.p[p].radix.kv_admit(sid, ver, &key);
         }
@@ -3025,11 +3080,14 @@ impl<'a> Sim<'a> {
         let host_only = self.c.pull_landing == "host";
         let before = self.p[dst].radix.stats.host_inserted_blocks;
         let tag = if self.kv_tagged() {
-            Some((self.reqs[r as usize].agent_state, self.reqs[r as usize].kv_ver, KV_PREFETCH))
+            Some((self.reqs[r as usize].kv_sid, self.reqs[r as usize].kv_ver, KV_PREFETCH))
         } else {
             None
         };
+        // S3 (d): the pulled pages are outside the destination's host capacity (no displacement).
+        self.p[dst].radix.pf_mark = self.c.pull_free_capacity;
         self.p[dst].radix.insert_kv(&runs, t, host_only, tag);
+        self.p[dst].radix.pf_mark = false;
         if self.c.kv_retention && self.c.kvret_mode == "transfer_end" {
             // The destination took its +1 at this commit (insert_kv tag); release the source now.
             self.kv_transfer_release(t, r, src);
@@ -3518,7 +3576,7 @@ impl<'a> Sim<'a> {
         let x = self.rx(p);
         let before = self.p[x].radix.stats.host_inserted_blocks;
         let tag = if self.kv_tagged() {
-            Some((self.reqs[r as usize].agent_state, self.reqs[r as usize].kv_ver, KV_FINISHED))
+            Some((self.reqs[r as usize].kv_sid, self.reqs[r as usize].kv_ver, KV_FINISHED))
         } else {
             None
         };
@@ -3684,8 +3742,16 @@ impl<'a> Sim<'a> {
             }
             return;
         }
+        if !self.reqs[r as usize].warm {
+            self.agent_last_done.insert(a, t);
+        }
+        let sid = self.reqs[r as usize].kv_sid;
+        if self.kv_tagged() && self.c.kvret_idle_s > 0.0 {
+            let ver = self.reqs[r as usize].kv_ver;
+            self.at(t + self.c.kvret_idle_s, Ev::KvIdle(sid, ver));
+        }
         if self.kv_tagged() && self.c.kvret_end && self.kv_is_last(r) {
-            self.kv_end_session(t, a);
+            self.kv_end_session(t, sid);
         }
         let (task, agent) = {
             let s = &self.agents[a as usize];
@@ -3707,7 +3773,19 @@ impl<'a> Sim<'a> {
     }
 
     fn kv_route(&mut self, t: f64, r: u32) {
-        let sid = self.reqs[r as usize].agent_state;
+        let a = self.reqs[r as usize].agent_state;
+        let mut sid = a;
+        if self.c.kvret_idle_s > 0.0 {
+            // S4: after an idle END the agent's next request starts a new session identity.
+            sid = self.kv_sid_of.get(&a).copied().unwrap_or(a);
+            if self.kv_sess.get(&sid).is_some_and(|s| s.ended) {
+                sid = self.kv_sid_next;
+                self.kv_sid_next += 1;
+                self.kv_sid_of.insert(a, sid);
+                self.kv_idle_new += 1;
+            }
+        }
+        self.reqs[r as usize].kv_sid = sid;
         let p = self.reqs[r as usize].p;
         let end_only = self.c.kvret_mode == "end_only";
         let s = self.kv_sess.entry(sid).or_default();
@@ -3779,7 +3857,7 @@ impl<'a> Sim<'a> {
     fn kv_transfer_release(&mut self, t: f64, r: u32, src: usize) {
         let (sid, ver, dst) = {
             let rq = &self.reqs[r as usize];
-            (rq.agent_state, rq.kv_ver, rq.p)
+            (rq.kv_sid, rq.kv_ver, rq.p)
         };
         let Some(s) = self.kv_sess.get_mut(&sid) else { return };
         if s.ended || s.ver != ver || s.cur != Some(dst) {
@@ -3800,6 +3878,16 @@ impl<'a> Sim<'a> {
             self.p[p].radix.kv_end(sid, ver);
         }
         self.kv_log.push((t, sid, p as u16, ver, op));
+    }
+
+    /// S4: the idle timer of (session, version) expired; END unless a newer request was routed.
+    fn kv_idle(&mut self, t: f64, sid: u32, ver: u32) {
+        let Some(s) = self.kv_sess.get(&sid) else { return };
+        if s.ended || s.ver != ver {
+            return;
+        }
+        self.kv_idle_ends.push(t);
+        self.kv_end_session(t, sid);
     }
 
     /// Whether `r` is its agent's last generate (trajectory END follows its completion).
@@ -4568,6 +4656,29 @@ impl<'a> Sim<'a> {
                 let share = mv.iter().filter(|&&x| x >= 1.0).count() as f64 / k;
                 rep.sess_moves = [k, mean, share, percentile_in_place(&mut mv, 90.0), 100.0 * moves as f64 / nreq.max(1) as f64];
             }
+            rep.kv_idle = [
+                self.kv_idle_ends.len() as u64,
+                self.kv_idle_ends.iter().filter(|&&x| inw(x)).count() as u64,
+                self.kv_idle_new,
+            ];
+            let mut g = self.agent_gaps.clone();
+            if !g.is_empty() {
+                let k = g.len() as f64;
+                let mean = g.iter().sum::<f64>() / k;
+                let mut v = [k, mean, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+                for (j, q) in [10.0, 25.0, 50.0, 75.0, 90.0, 95.0, 99.0, 100.0].iter().enumerate() {
+                    v[2 + j] = percentile_in_place(&mut g, *q);
+                }
+                rep.agent_gap_s = v;
+                for (j, th) in [30.0, 60.0, 120.0, 300.0, 600.0].iter().enumerate() {
+                    rep.agent_gap_gt[j] = g.iter().filter(|&&x| x > *th).count() as f64 / k;
+                }
+            }
+            for w in &self.p {
+                rep.pull_free_tokens[0] += w.radix.stats.pf_added_blocks * bt;
+                rep.pull_free_tokens[1] += w.radix.stats.pf_removed_blocks * bt;
+                rep.pull_free_tokens[2] += w.radix.pf_blocks * bt;
+            }
         }
         let mut rows = Vec::new();
         if self.c.record_rows {
@@ -5194,6 +5305,69 @@ mod tests {
         let (rc, _) = sim.report(0.0);
         let (r0, _) = run(base, &wl, &ct);
         assert!(rc.cs_cap_kept > 0 && r0.cs_cap_kept == 0);
+    }
+
+    #[test]
+    fn pull_free_capacity_raises_the_capacity_only_by_resident_pulled_pages() {
+        let wl = synth_workload(12, 30);
+        let ct = FxHashMap::default();
+        for kv in [false, true] {
+            let c = SimConfig {
+                cs_workload: "true".into(),
+                pull_start: "p_recv".into(),
+                queued_prefix_protect: true,
+                p_dev_tokens: 131_072,
+                p_host_tokens: 262_144,
+                pull_free_capacity: true,
+                kv_retention: kv,
+                ..kv_cfg("eft")
+            };
+            let mut sim = Sim::new(c, &wl, &ct);
+            sim.run();
+            for w in &sim.p {
+                w.radix.check().unwrap();
+                assert_eq!(w.radix.host_cap, 262_144 / 64 + w.radix.pf_blocks);
+            }
+            let (rep, _) = sim.report(0.0);
+            assert!(rep.pulls_all > 0, "no pull");
+            assert!(rep.pull_free_tokens[0] > 0, "{:?}", rep.pull_free_tokens);
+            assert_eq!(rep.pull_free_tokens[0] - rep.pull_free_tokens[1], rep.pull_free_tokens[2]);
+        }
+    }
+
+    #[test]
+    fn kv_idle_end_ends_quiet_sessions_and_a_returning_agent_gets_a_new_identity() {
+        let wl = synth_workload(12, 40);
+        let ct = FxHashMap::default();
+        // Waits are 3 s: a 2 s idle rule ends every session between two turns.
+        let mut sim = Sim::new(SimConfig { kvret_end: false, kvret_idle_s: 2.0, ..kv_cfg("rr") }, &wl, &ct);
+        sim.run();
+        let (rep, _) = sim.report(0.0);
+        assert!(rep.kv_idle[0] > 100 && rep.kv_idle[2] > 100, "{:?}", rep.kv_idle);
+        assert!(rep.kv_idle[2] <= rep.kv_idle[0]);
+        assert!(sim.kv_sess.iter().any(|(&s, k)| s >= 0x8000_0000 && k.ended));
+        // A new identity starts at version 1 and holds one request per turn here.
+        assert!(sim.kv_sess.iter().filter(|&(&s, _)| s >= 0x8000_0000).all(|(_, k)| k.ver == 1));
+        for w in &sim.p {
+            w.radix.check().unwrap();
+        }
+        for a in &rep.kv_audit {
+            assert_eq!(a[..3], [0, 0, 0], "{:?}", rep.kv_audit);
+        }
+        assert!(rep.agent_gap_s[0] > 100.0 && rep.agent_gap_s[4] >= 2.99, "{:?}", rep.agent_gap_s);
+        assert_eq!(rep.agent_gap_gt[0], 0.0);
+        // A rule longer than every gap ends only finished trajectories and makes no new identity.
+        let mut sim = Sim::new(SimConfig { kvret_end: false, kvret_idle_s: 30.0, ..kv_cfg("rr") }, &wl, &ct);
+        sim.run();
+        let (rep2, _) = sim.report(0.0);
+        assert_eq!(rep2.kv_idle[2], 0, "{:?}", rep2.kv_idle);
+        assert!(rep2.kv_idle[0] > 0);
+        assert!(sim.kv_sess.keys().all(|&s| s < 0x8000_0000));
+        // Idle gaps are measured in every arm (also without retention) and equal across the two rules.
+        let mut sim = Sim::new(small_cfg(), &wl, &ct);
+        sim.run();
+        let (rep3, _) = sim.report(0.0);
+        assert!(rep3.agent_gap_s[0] > 100.0 && rep3.kv_idle == [0, 0, 0]);
     }
 
     #[test]

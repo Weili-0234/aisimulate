@@ -62,6 +62,9 @@ pub struct Node {
     /// Retention: distinct sessions whose anchor path covers this node; a session covered it once.
     pub sc: u32,
     pub known: bool,
+    /// S3 (d) pull_free_capacity: host blocks of this node were added by a pull landing and do not
+    /// count against the host capacity (the tree's host_cap is raised by them while resident).
+    pub pf: bool,
 }
 
 impl Node {
@@ -85,6 +88,7 @@ impl Node {
             hlast: 0.0,
             sc: 0,
             known: false,
+            pf: false,
         }
     }
 
@@ -257,6 +261,10 @@ pub struct CacheStats {
     pub kv_devonly_deleted_blocks: u64,
     pub kv_devonly_children_skip: u64,
     pub kv_devonly_hlock_skip: u64,
+    /// pull_free_capacity: host blocks added by pull landings outside the capacity, and such blocks
+    /// whose host copy was later removed (the capacity drops with them).
+    pub pf_added_blocks: u64,
+    pub pf_removed_blocks: u64,
 }
 
 /// Window-filtered host eviction samples: (evict time, blocks, age since last use, age since write).
@@ -330,6 +338,11 @@ pub struct TwoTierRadix {
     pub kv: Option<KvRet>,
     rh: BinaryHeap<RKey>,
     uid_next: u64,
+    /// pull_free_capacity: while set, host blocks that an insert adds are marked `pf` and raise
+    /// host_cap by the same amount (the caller sets it around a pull-landing insert only);
+    /// pf_blocks = resident pf host blocks (host_cap = base capacity + pf_blocks).
+    pub pf_mark: bool,
+    pub pf_blocks: u64,
 }
 
 /// Longest common prefix of node runs `eruns` and prompt runs `pruns[ri..]` (offset `off` into
@@ -418,6 +431,8 @@ impl TwoTierRadix {
             kv: None,
             rh: BinaryHeap::new(),
             uid_next: 0,
+            pf_mark: false,
+            pf_blocks: 0,
         }
     }
 
@@ -447,6 +462,29 @@ impl TwoTierRadix {
         } else {
             self.nodes.push(node);
             (self.nodes.len() - 1) as NodeId
+        }
+    }
+
+    /// pull_free_capacity: a host copy just added under pf_mark is outside the capacity.
+    fn pf_on(&mut self, id: NodeId) {
+        if self.pf_mark {
+            let nb = self.nodes[id as usize].nb as u64;
+            self.nodes[id as usize].pf = true;
+            self.pf_blocks += nb;
+            self.host_cap += nb;
+            self.stats.pf_added_blocks += nb;
+        }
+    }
+
+    /// pull_free_capacity: the host copy of a pf node is removed; its capacity goes with it.
+    fn pf_off(&mut self, id: NodeId) {
+        let n = &mut self.nodes[id as usize];
+        if n.pf {
+            n.pf = false;
+            let nb = n.nb as u64;
+            self.pf_blocks -= nb;
+            self.host_cap -= nb;
+            self.stats.pf_removed_blocks += nb;
         }
     }
 
@@ -877,6 +915,7 @@ impl TwoTierRadix {
         }
         if host {
             self.host_used -= nb as u64;
+            self.pf_off(id);
         }
         if self.nodes[par as usize].ch.get(&key) == Some(&id) {
             self.nodes[par as usize].ch.remove(&key);
@@ -927,6 +966,7 @@ impl TwoTierRadix {
                 self.nodes[node as usize].ch.insert(key, id);
                 self.host_used += nb as u64;
                 self.stats.host_inserted_blocks += nb as u64;
+                self.pf_on(id);
                 if !host_only {
                     self.set_dev(id, true);
                 }
@@ -946,6 +986,7 @@ impl TwoTierRadix {
                     self.nodes[ch as usize].host_t = t;
                     self.host_used += cnb as u64;
                     self.stats.host_inserted_blocks += cnb as u64;
+                    self.pf_on(ch);
                 }
                 if !host_only && !cdev {
                     self.set_dev(ch, true);
@@ -997,9 +1038,9 @@ impl TwoTierRadix {
             let c = &self.nodes[ch as usize];
             (c.dev, c.host, c.last, c.lock, c.lease, c.hlock, c.demoted, c.host_t)
         };
-        let (chl, csc, ckn) = {
+        let (chl, csc, ckn, cpf) = {
             let c = &self.nodes[ch as usize];
-            (c.hlast, c.sc, c.known)
+            (c.hlast, c.sc, c.known, c.pf)
         };
         let mut mid = Node::new(a, m, parent);
         mid.dev = cdev;
@@ -1015,6 +1056,7 @@ impl TwoTierRadix {
         mid.hlast = chl;
         mid.sc = csc;
         mid.known = ckn;
+        mid.pf = cpf;
         mid.ndev = if cdev { 1 } else { 0 };
         let bkey = b[0].0;
         let mid_id = self.alloc(mid);
@@ -1151,6 +1193,7 @@ impl TwoTierRadix {
                 self.nodes[par as usize].ch.remove(&key);
             }
             self.host_used -= nb as u64;
+            self.pf_off(id);
             self.release(id);
             let p = &self.nodes[par as usize];
             if par != ROOT && p.ch.is_empty() && !p.dev && !p.host_pinned() {
@@ -1245,6 +1288,7 @@ impl TwoTierRadix {
                 });
             }
             self.host_used -= nb as u64;
+            self.pf_off(id);
             if leaf {
                 if self.nodes[par as usize].ch.get(&key) == Some(&id) {
                     self.nodes[par as usize].ch.remove(&key);
@@ -1790,6 +1834,18 @@ impl TwoTierRadix {
                 }
             }
         }
+        let mut pf = 0u64;
+        for (i, n) in self.nodes.iter().enumerate() {
+            if n.alive && n.pf {
+                if !n.host {
+                    return Err(format!("pf node {i} without a host copy"));
+                }
+                pf += n.nb as u64;
+            }
+        }
+        if pf != self.pf_blocks {
+            return Err(format!("pf mismatch {pf}/{}", self.pf_blocks));
+        }
         if dev != self.dev_used || host != self.host_used {
             return Err(format!(
                 "usage mismatch dev {dev}/{} host {host}/{}",
@@ -2267,6 +2323,35 @@ mod tests {
         assert_eq!(c.node(lo).sc, 1);
         assert_eq!(c.kv.as_ref().unwrap().stats.wakes, 1);
         assert_eq!(c.kv_audit()[..3], [0, 0, 0]);
+    }
+
+    #[test]
+    fn pull_free_pages_do_not_count_against_the_host_capacity() {
+        for kv in [false, true] {
+            let mut c = TwoTierRadix::new(0, 10);
+            if kv {
+                c.enable_kvret(true);
+            }
+            c.insert(&runs(0, 10), 1.0, true);
+            c.pf_mark = true;
+            c.insert(&runs(1000, 5), 2.0, true);
+            c.pf_mark = false;
+            c.check().unwrap();
+            assert_eq!((c.host_used, c.host_cap, c.pf_blocks, c.stats.host_evicted_blocks), (15, 15, 5, 0));
+            // An ordinary insert evicts by recency: the oldest (not pulled) chain goes.
+            c.insert(&runs(2000, 5), 3.0, true);
+            c.check().unwrap();
+            assert_eq!(c.match_peek(&runs(0, 10)).total(), 0, "kv {kv}");
+            assert_eq!(c.match_peek(&runs(1000, 5)).total(), 5, "kv {kv}");
+            assert_eq!((c.host_used, c.host_cap), (10, 15));
+            // Evicting the pulled chain frees no capacity: the next chain goes too.
+            c.insert(&runs(3000, 6), 4.0, true);
+            c.check().unwrap();
+            assert_eq!(c.match_peek(&runs(1000, 5)).total(), 0);
+            assert_eq!(c.match_peek(&runs(2000, 5)).total(), 0);
+            assert_eq!((c.host_used, c.host_cap, c.pf_blocks), (6, 10, 0));
+            assert_eq!((c.stats.pf_added_blocks, c.stats.pf_removed_blocks), (5, 5));
+        }
     }
 
     #[test]
