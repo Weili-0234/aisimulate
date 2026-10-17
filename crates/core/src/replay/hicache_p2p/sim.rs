@@ -451,6 +451,49 @@ pub struct SimConfig {
     /// Output only: record the routing-time forecast of the selected P (ingress base + max(B, T_pull) + S;
     /// noisy and noise-free) and score it against the actual decision -> prefill-done time.
     pub pred_metric: bool,
+    /// LATE-P (late P binding, 2026-10-17; all default off = every older arm bit-identical; needs p_policy "eft").
+    /// Requests wait in one router queue. The router dispatches request r to P w only when w is predicted to be
+    /// nearly free: D_lo(w) = D(w) - lpb_bnd_scale x b_busy(D(w)) <= lead(w, r) = recv(r) + max(boot, T_pull(r, w))
+    /// + T_iter(w). D(w) = backlog seconds incl. bootstrap queue + in-flight ledger - elapsed part of the running
+    /// pass, x the forecast-error factor of w (redrawn from cs_pred_noise at every pass end of w = one push
+    /// message). recv = ingress fit + online residual (EWMA mean + lpb_rx_k x EWMA |dev|); boot = receive ->
+    /// waiting-queue entry (same calibration; before samples: handshake + late-D latencies); T_iter = EWMA of
+    /// back-to-back passes. Queue order lpb_order: "fifo" (arrival) or "hrrn" (highest (wait + S_own) / S_own).
+    /// A request goes to its owner (most cached prefix) when the owner is open; a cold request (best hit < the
+    /// pull floor) to the open P with the earliest predicted finish; with lpb_moves to an open non-owner w only if
+    /// (C_o - C_w - dup_w) - sqrt(b_o^2 + b_w^2) > cs_pred_gmin_s, C_o = completion when waiting for the owner
+    /// behind the owner's older queued requests. dup_w = cs_eft_dup_per_token_s x duplicated tokens.
+    pub lpb: bool,
+    pub lpb_order: String,
+    pub lpb_moves: bool,
+    pub lpb_rx_k: f64,
+    pub lpb_tick_s: f64,
+    /// Sensitivity: receipt-delay forecast x scale; dispatch bound x scale (0 = trust the forecast).
+    pub lpb_rx_scale: f64,
+    pub lpb_bnd_scale: f64,
+    /// r5 bound curves (deploy mode, level 0.8): knots (s) and bounds (s) per bucket (idle, busy). Used by LATE-P
+    /// and, with cs_pred_curve, by the PRED-GATE instead of k x forecast. Empty = 0.
+    pub bnd_idle_k: Vec<f64>,
+    pub bnd_idle_b: Vec<f64>,
+    pub bnd_busy_k: Vec<f64>,
+    pub bnd_busy_b: Vec<f64>,
+    pub cs_pred_curve: bool,
+    /// PRED-EFT+HOL: each candidate's cost gets mu x a_w x S_w x (B_w + S_w / 2) (head-of-line externality on the
+    /// requests that arrive at w while the request waits and runs); a_w = requests routed to w per second over the
+    /// last cs_hol_window_s. 0 = off.
+    pub cs_hol_mu: f64,
+    pub cs_hol_window_s: f64,
+    /// HOL form: "light" = a_w S (B + S / 2) (one delay per later arrival, light load); "bp" = a_w S (B + S) /
+    /// (1 - rho_w) (the delay propagates through the busy period), rho_w = (sum of the predicted S of requests routed
+    /// to w in the window) / window, capped at cs_hol_rho_cap. Both are computed every decision (shadow counters).
+    pub cs_hol_form: String,
+    pub cs_hol_rho_cap: f64,
+    /// HOL arrival-rate input: "routed" (requests the router sent to w; feeds back on routing) or "uniform" (all
+    /// routed requests / n_p for every P, same for rho: no feedback from the router's own placements).
+    pub cs_hol_rate: String,
+    /// Output only: every 0.1 s of the score window, P idle while work waits elsewhere (router queue or another
+    /// P's waiting queue) and the per-P outstanding uncached tokens max / mean.
+    pub iww_metric: bool,
 }
 
 impl Default for SimConfig {
@@ -637,6 +680,24 @@ impl Default for SimConfig {
             cs_pred_k_busy: 0.0,
             cs_pred_floor_s: 0.0,
             pred_metric: false,
+            lpb: false,
+            lpb_order: "fifo".into(),
+            lpb_moves: true,
+            lpb_rx_k: 2.0,
+            lpb_tick_s: 0.02,
+            lpb_rx_scale: 1.0,
+            lpb_bnd_scale: 1.0,
+            bnd_idle_k: Vec::new(),
+            bnd_idle_b: Vec::new(),
+            bnd_busy_k: Vec::new(),
+            bnd_busy_b: Vec::new(),
+            cs_pred_curve: false,
+            cs_hol_mu: 0.0,
+            cs_hol_window_s: 60.0,
+            cs_hol_form: "light".into(),
+            cs_hol_rho_cap: 0.95,
+            cs_hol_rate: "routed".into(),
+            iww_metric: false,
         }
     }
 }
@@ -684,6 +745,9 @@ enum Ev {
     FpiPilotEnd,
     /// S7 B1: router hold queue check.
     HoldTick,
+    /// LATE-P: router queue timer; idle-while-waiting sample (output only).
+    LpbTick,
+    IwwTick,
 }
 
 /// S5 per agent chain router state for the work-function / ski-rental arms: work function per P,
@@ -799,6 +863,10 @@ struct Req {
     /// S7 B1: seconds held in the router; taken by a P other than its owner.
     hold_s: f64,
     stolen: bool,
+    /// LATE-P: router-queue entry and dispatch times; dispatch class (1 owner, 2 cold, 3 move).
+    lpb_arr: f64,
+    lpb_disp: f64,
+    lpb_cls: u8,
     /// S8: routing time and forecast of the selected P (noisy, noise-free), P idle at the decision.
     pred_t: f64,
     pred_c: f64,
@@ -879,6 +947,21 @@ struct KvSess {
     ended: bool,
 }
 
+/// LATE-P cached candidate view of a queued request (see Sim::lpb_cand).
+#[derive(Debug, Clone)]
+struct LpbC {
+    t: f64,
+    own: usize,
+    cold: bool,
+    s0: Vec<f64>,
+    ps: Vec<f64>,
+    dup: Vec<f64>,
+    pt: u64,
+}
+
+/// LATE-P: a queued request's candidate view (cache matches, pull hints) is recomputed after this many seconds.
+const LPB_CACHE_S: f64 = 0.2;
+
 #[derive(Debug, Clone, Copy)]
 struct BItem {
     r: u32,
@@ -940,6 +1023,9 @@ struct PW {
     lp_rate: f64,
     lp_t: f64,
     lp_cur: usize,
+    /// LATE-P: forecast-error factor of this P (redrawn per pass); start time of the running pass.
+    lpb_nf: f64,
+    pass_t0: f64,
 }
 
 struct DW {
@@ -1281,6 +1367,18 @@ pub struct SimReport {
     /// S7 B1 debug at the end of the run: held count, then per P [backlog s without ledger, ledger s,
     /// waiting, bootstrap, prefilling counts].
     pub hold_end: Vec<f64>,
+    /// LATE-P (scored requests): [router wait mean, p50, p95 (s), share dispatched to the owner, cold, moved,
+    /// calibrated recv residual mean (s), calibrated boot mean (s)]; counters (whole run) [dispatches, owner, cold,
+    /// move with pull, move without pull, full scans].
+    pub lpb_stats: [f64; 8],
+    pub lpb_counts: [u64; 6],
+    /// PRED-EFT+HOL shadow (whole run): [gate decisions, the other HOL form picks another P, big cold requests
+    /// (uncached on the owner >= 32,768 and best hit < the pull floor), big cold and differ, differ with the selected
+    /// form's P less loaded, differ with the selected form keeping the owner].
+    pub hol_shadow: [u64; 6],
+    /// iww_metric: [share of P-samples idle while work waits elsewhere, samples, per-P outstanding uncached max /
+    /// mean p50, p90].
+    pub iww: [f64; 4],
     pub wall_s: f64,
 }
 
@@ -1445,6 +1543,19 @@ pub struct Sim<'a> {
     fpi_lr: Option<Vec<(f64, f64)>>,
     wf: FxHashMap<(u64, u32), WfState>,
     fpi_counts: [u64; 4],
+    /// LATE-P: router queue, timer flag, receipt calibration [recv residual mean, |dev|, boot mean, |dev|] and sample
+    /// counts, counters [dispatches, owner, cold, move with pull, move without pull, full scans]; HOL routing times per
+    /// P; idle-while-waiting samples [ticks, idle-while-waiting P-samples, P-samples] and per-sample load max / mean.
+    lpb_q: Vec<u32>,
+    lpb_cache: FxHashMap<u32, LpbC>,
+    lpb_tick_on: bool,
+    lpb_rx: [f64; 4],
+    lpb_rx_n: [u64; 2],
+    lpb_counts: [u64; 6],
+    hol_hist: Vec<VecDeque<(f64, f64)>>,
+    hol_sh: [u64; 6],
+    iww: [f64; 3],
+    lmm: Vec<f64>,
     lo: f64,
     hi: f64,
 }
@@ -1535,6 +1646,24 @@ pub(crate) fn eft_choose_k(
     (own, 3)
 }
 
+/// r5 bound curve (router_e3.bound_curve): values[0] at and below knots[0]; linear between knots; values[-1] x
+/// x / knots[-1] above the last knot. Empty = 0.
+pub(crate) fn bound_curve(knots: &[f64], values: &[f64], x: f64) -> f64 {
+    let n = knots.len().min(values.len());
+    if n == 0 {
+        return 0.0;
+    }
+    if x <= knots[0] {
+        return values[0];
+    }
+    if x >= knots[n - 1] {
+        return values[n - 1] * x / knots[n - 1];
+    }
+    let i = knots[..n].partition_point(|&k| k <= x);
+    let (x0, x1, y0, y1) = (knots[i - 1], knots[i], values[i - 1], values[i]);
+    y0 + (y1 - y0) * (x - x0) / (x1 - x0)
+}
+
 /// S8: inverse-CDF draw from a table of n >= 2 quantiles at uniform probabilities 0..1 (linear).
 pub(crate) fn table_draw(tab: &[f64], u: f64) -> f64 {
     let n = tab.len();
@@ -1621,6 +1750,8 @@ impl<'a> Sim<'a> {
                 lp_rate: 0.0,
                 lp_t: 0.0,
                 lp_cur: 0,
+                lpb_nf: 1.0,
+                pass_t0: 0.0,
             });
         }
         if c.kv_retention {
@@ -1786,6 +1917,16 @@ impl<'a> Sim<'a> {
             fpi_lr: None,
             wf: FxHashMap::default(),
             fpi_counts: [0; 4],
+            lpb_q: Vec::new(),
+            lpb_cache: FxHashMap::default(),
+            lpb_tick_on: false,
+            lpb_rx: [0.0; 4],
+            lpb_rx_n: [0; 2],
+            lpb_counts: [0; 6],
+            hol_hist: vec![VecDeque::new(); s5_np],
+            hol_sh: [0; 6],
+            iww: [0.0; 3],
+            lmm: Vec::new(),
             lo,
             hi,
         }
@@ -1878,6 +2019,13 @@ impl<'a> Sim<'a> {
         if self.c.cs_fpi != "off" {
             self.at(self.c.cs_fpi_pilot_s, Ev::FpiPilotEnd);
         }
+        if self.c.lpb {
+            assert!(self.c.p_policy == "eft" && self.c.cs_hold_passes <= 0.0, "lpb needs p_policy eft and no B1 hold");
+            assert!(matches!(self.c.lpb_order.as_str(), "fifo" | "hrrn"), "lpb_order: fifo | hrrn");
+        }
+        if self.c.iww_metric {
+            self.at(self.lo, Ev::IwwTick);
+        }
         while let Some(it) = self.heap.pop() {
             if it.t > self.c.duration_s + 1.0 {
                 break;
@@ -1951,6 +2099,11 @@ impl<'a> Sim<'a> {
                     }
                 }
                 Ev::HoldTick => self.hold_tick(t),
+                Ev::LpbTick => {
+                    self.lpb_tick_on = false;
+                    self.lpb_dispatch(t);
+                }
+                Ev::IwwTick => self.iww_tick(t),
                 Ev::FpiPilotEnd => {
                     let dt = self.c.cs_fpi_pilot_s.max(1e-9);
                     let cap = self.c.cs_fpi_rho_cap;
@@ -2299,6 +2452,21 @@ impl<'a> Sim<'a> {
     }
 
     fn route(&mut self, t: f64, r: u32) {
+        if self.c.lpb && self.force_tgt.is_none() {
+            // LATE-P: the request enters the router queue; the dispatcher decides when and where.
+            if !self.reqs[r as usize].warm {
+                let a = self.reqs[r as usize].agent_state;
+                if let Some(&ld) = self.agent_last_done.get(&a) {
+                    if t >= self.lo && t < self.hi {
+                        self.agent_gaps.push(t - ld);
+                    }
+                }
+            }
+            self.reqs[r as usize].lpb_arr = t;
+            self.lpb_q.push(r);
+            self.lpb_dispatch(t);
+            return;
+        }
         if self.c.cs_hold_passes > 0.0 && self.force_tgt.is_none() {
             let hits = self.actual_hits(r);
             let bs: Vec<f64> = (0..self.p.len()).map(|w| self.hold_backlog(w)).collect();
@@ -2316,7 +2484,7 @@ impl<'a> Sim<'a> {
             self.dispatch_to(t, r, o);
             return;
         }
-        if !self.reqs[r as usize].warm {
+        if !self.reqs[r as usize].warm && !(self.c.lpb && self.force_tgt.is_some()) {
             let a = self.reqs[r as usize].agent_state;
             if let Some(&ld) = self.agent_last_done.get(&a) {
                 if t >= self.lo && t < self.hi {
@@ -2705,6 +2873,23 @@ impl<'a> Sim<'a> {
                     }
                     pulled[w] = pl;
                 }
+                let mut hol_alt = vec![0.0; np];
+                if self.c.cs_hol_mu > 0.0 {
+                    // PRED-EFT+HOL: head-of-line externality of placing the request on w (selected form in the
+                    // cost; the other form's difference kept for the shadow decision).
+                    let cap = self.c.cs_hol_rho_cap.clamp(0.0, 0.999);
+                    for w in 0..np {
+                        let (a, rho) = self.hol_rate(t, w);
+                        let (s_, b_) = (own_s[w], wait[w]);
+                        let light = a * s_ * (b_ + s_ / 2.0);
+                        let bp = a * s_ * (b_ + s_) / (1.0 - rho.min(cap));
+                        let (sel, alt) = if self.c.cs_hol_form == "bp" { (bp, light) } else { (light, bp) };
+                        dup[w] += self.c.cs_hol_mu * sel;
+                        hol_alt[w] = self.c.cs_hol_mu * (alt - sel);
+                    }
+                }
+                let big_cold = l.saturating_sub(local[own_hit]) >= 32_768
+                    && local[own_hit] < self.c.pull_min_incremental_tokens.max(self.c.pull_min_tokens);
                 let tot_w = |w: usize| wait[w].max(pull_s[w]) + own_s[w] + dup[w];
                 if self.c.cs_eft_owner_near_tokens > 0 && !self.c.cs_eft_one_way {
                     let best = local[own_hit];
@@ -2749,11 +2934,19 @@ impl<'a> Sim<'a> {
                     let fc = |w: usize| wait[w].max(pull_s[w]) + own_s[w];
                     let tot = |w: usize| fc(w) + dup[w];
                     let bnd = |w: usize| {
+                        if self.c.cs_pred_curve {
+                            let (kn, bv) = if pidle[w] && !self.c.bnd_idle_k.is_empty() {
+                                (&self.c.bnd_idle_k, &self.c.bnd_idle_b)
+                            } else {
+                                (&self.c.bnd_busy_k, &self.c.bnd_busy_b)
+                            };
+                            return bound_curve(kn, bv, fc(w));
+                        }
                         let k = if pidle[w] { self.c.cs_pred_k_idle } else { self.c.cs_pred_k_busy };
                         k * fc(w) + self.c.cs_pred_floor_s
                     };
                     self.pred_stats[0] += 1;
-                    match (0..np).filter(|&w| w != own).min_by(|&a, &b| tot(a).total_cmp(&tot(b)).then(a.cmp(&b))) {
+                    let res = match (0..np).filter(|&w| w != own).min_by(|&a, &b| tot(a).total_cmp(&tot(b)).then(a.cmp(&b))) {
                         Some(w) => {
                             let gain = tot(own) - tot(w);
                             if gain > 0.0 {
@@ -2768,7 +2961,38 @@ impl<'a> Sim<'a> {
                             }
                         }
                         None => (own, 0),
+                    };
+                    if self.c.cs_hol_mu > 0.0 {
+                        // Shadow: the same gate with the other HOL form; counters [decisions, differ, big cold,
+                        // big cold and differ, differ with the selected P less loaded (B), differ with the selected
+                        // form keeping the owner].
+                        let tot2 = |w: usize| tot(w) + hol_alt[w];
+                        let alt = match (0..np).filter(|&w| w != own).min_by(|&a, &b| tot2(a).total_cmp(&tot2(b)).then(a.cmp(&b))) {
+                            Some(w) => {
+                                let need =
+                                    self.c.cs_pred_m * (bnd(own).powi(2) + bnd(w).powi(2)).sqrt() + self.c.cs_pred_gmin_s;
+                                if tot2(own) - tot2(w) - need > 0.0 { w } else { own }
+                            }
+                            None => own,
+                        };
+                        self.hol_sh[0] += 1;
+                        if big_cold {
+                            self.hol_sh[2] += 1;
+                        }
+                        if alt != res.0 {
+                            self.hol_sh[1] += 1;
+                            if big_cold {
+                                self.hol_sh[3] += 1;
+                            }
+                            if wait[res.0] < wait[alt] {
+                                self.hol_sh[4] += 1;
+                            }
+                            if res.0 == own {
+                                self.hol_sh[5] += 1;
+                            }
+                        }
                     }
+                    res
                 } else if self.c.cs_fpi != "off" {
                     let rec_s: Vec<f64> = (0..np)
                         .map(|w| {
@@ -2798,6 +3022,9 @@ impl<'a> Sim<'a> {
                 if let Some(f) = self.force_tgt {
                     tgt = f;
                     own = own_hit;
+                }
+                if self.c.cs_hol_mu > 0.0 {
+                    self.hol_hist[tgt].push_back((t, own_s[tgt]));
                 }
                 match why {
                     1 => self.eft_counts[0] += 1,
@@ -3344,6 +3571,13 @@ impl<'a> Sim<'a> {
     // ------------------------------------------------------------------------------ P bootstrap / pulls
     fn on_p_recv(&mut self, t: f64, r: u32) {
         self.reqs[r as usize].p_in = true;
+        if self.c.lpb && self.reqs[r as usize].lpb_disp > 0.0 {
+            // LATE-P receipt calibration: residual of dispatch -> receive over the ingress fit.
+            let pt = self.reqs[r as usize].pt;
+            let base = self.c.ing_p.a + self.c.ing_p.b_per_100k * pt as f64 / 1e5;
+            let x = t - self.reqs[r as usize].lpb_disp - base;
+            self.lpb_ewma(0, x);
+        }
         let p = self.reqs[r as usize].p as usize;
         if self.c.cs_eft_wait_transit {
             let s = std::mem::take(&mut self.reqs[r as usize].transit_s);
@@ -3863,6 +4097,18 @@ impl<'a> Sim<'a> {
             return;
         }
         self.reqs[r as usize].p_ready = Some(t);
+        if self.c.lpb && self.reqs[r as usize].lpb_disp > 0.0 {
+            // LATE-P bootstrap calibration: receive -> waiting-queue entry (handshake, late-D bind latency) without
+            // the late-D binder's queueing wait (P bindable -> bind decision): that wait is P queue time, and the
+            // drain forecast already counts those rooms (bootstrap queue).
+            let rq = &self.reqs[r as usize];
+            let gate = match (rq.ld_bindable_t, rq.ld_bind_t) {
+                (Some(a), Some(b)) if b > a => b - a,
+                _ => 0.0,
+            };
+            let x = (t - rq.p_recv - gate).max(0.0);
+            self.lpb_ewma(1, x);
+        }
         let p = self.reqs[r as usize].p as usize;
         self.p[p].bq_n -= 1;
         self.p[p].bq_tok -= self.reqs[r as usize].pt;
@@ -4161,6 +4407,7 @@ impl<'a> Sim<'a> {
             pw.win_busy += svc;
         }
         pw.run_items = Some(items);
+        pw.pass_t0 = t;
         self.p_idle_update(t, p);
         self.at(t + svc, Ev::EndIter(p as u16));
         let nxt = self.form(t, p);
@@ -4186,6 +4433,20 @@ impl<'a> Sim<'a> {
             self.start_iter(t, p, n);
         }
         self.p_idle_update(t, p);
+        if self.c.lpb {
+            // LATE-P: a pass end = a new P state message; new forecast error draw, then dispatch.
+            if !self.c.cs_pred_noise.is_empty() {
+                let idle = self.p[p].run_items.is_none() && self.p[p].wq.is_empty();
+                let u = self.nrng.random();
+                let tab = if idle && !self.c.cs_pred_noise_idle.is_empty() {
+                    &self.c.cs_pred_noise_idle
+                } else {
+                    &self.c.cs_pred_noise
+                };
+                self.p[p].lpb_nf = (self.c.cs_pred_noise_scale * table_draw(tab, u)).exp();
+            }
+            self.lpb_dispatch(t);
+        }
     }
 
     fn prefill_done(&mut self, t: f64, p: usize, r: u32) {
@@ -4736,6 +4997,271 @@ impl<'a> Sim<'a> {
         } else {
             self.hold_tick_on = false;
         }
+    }
+
+    /// PRED-EFT+HOL: (requests routed to P w per second, utilization = predicted service seconds routed to w per
+    /// second) over the last cs_hol_window_s.
+    fn hol_rate(&mut self, t: f64, w: usize) -> (f64, f64) {
+        let win = self.c.cs_hol_window_s.max(1e-3);
+        let span = win.min(t.max(1e-3));
+        let ks: Vec<usize> = if self.c.cs_hol_rate == "uniform" { (0..self.p.len()).collect() } else { vec![w] };
+        let (mut n, mut s) = (0.0, 0.0);
+        for &k in &ks {
+            let q = &mut self.hol_hist[k];
+            while q.front().is_some_and(|x| x.0 < t - win) {
+                q.pop_front();
+            }
+            n += q.len() as f64;
+            s += q.iter().map(|x| x.1).sum::<f64>();
+        }
+        let m = ks.len() as f64;
+        (n / span / m, s / span / m)
+    }
+
+    /// LATE-P: EWMA calibration (alpha = ld_ewma_alpha) of the receipt residual (k = 0) or the bootstrap delay (1):
+    /// mean and mean absolute deviation.
+    fn lpb_ewma(&mut self, k: usize, x: f64) {
+        let a = self.c.ld_ewma_alpha;
+        let (m, d) = (2 * k, 2 * k + 1);
+        if self.lpb_rx_n[k] == 0 {
+            self.lpb_rx[m] = x;
+            self.lpb_rx[d] = 0.0;
+        } else {
+            self.lpb_rx[d] = (1.0 - a) * self.lpb_rx[d] + a * (x - self.lpb_rx[m]).abs();
+            self.lpb_rx[m] = (1.0 - a) * self.lpb_rx[m] + a * x;
+        }
+        self.lpb_rx_n[k] += 1;
+    }
+
+    /// LATE-P: forecast seconds until P w has no work (router view, with the forecast-error factor).
+    fn lpb_drain(&self, t: f64, w: usize) -> f64 {
+        let p = &self.p[w];
+        let mut d = self.backlog_secs(w, true) + p.transit_s.max(0.0);
+        if p.run_items.is_some() {
+            d -= (t - p.pass_t0).max(0.0);
+        }
+        d.max(0.0) * p.lpb_nf
+    }
+
+    /// LATE-P: predicted dispatch -> receive and receive -> waiting-queue delays of a `pt`-token request (calibrated
+    /// mean + lpb_rx_k x mean absolute deviation; before samples: fit / handshake + late-D latencies).
+    fn lpb_lead_parts(&self, pt: u64) -> (f64, f64) {
+        let k = self.c.lpb_rx_k;
+        let base = self.c.ing_p.a + self.c.ing_p.b_per_100k * pt as f64 / 1e5;
+        let recv = if self.lpb_rx_n[0] > 0 { base + self.lpb_rx[0] + k * self.lpb_rx[1] } else { base };
+        let boot = if self.lpb_rx_n[1] > 0 {
+            self.lpb_rx[2] + k * self.lpb_rx[3]
+        } else {
+            self.c.handshake_s + self.c.ld_admit_latency_s + self.c.ld_choose_latency_s + self.c.ld_meta_latency_s
+        };
+        (recv.max(0.0) * self.c.lpb_rx_scale, boot.max(0.0) * self.c.lpb_rx_scale)
+    }
+
+    fn lpb_titer(&self, w: usize) -> f64 {
+        let ti = self.p[w].ld_ti;
+        if ti > 0.0 { ti } else { eft_secs(&self.p[w].beta, self.c.chunk_tokens, self.c.chunk_tokens, 0, 0, 0) }
+    }
+
+    fn lpb_bound(&self, idle: bool, x: f64) -> f64 {
+        let (kn, bv) = if idle && !self.c.bnd_idle_k.is_empty() {
+            (&self.c.bnd_idle_k, &self.c.bnd_idle_b)
+        } else {
+            (&self.c.bnd_busy_k, &self.c.bnd_busy_b)
+        };
+        bound_curve(kn, bv, x)
+    }
+
+    /// LATE-P candidate view of request r: owner, cold flag, per-P own seconds (noise-free), pull seconds,
+    /// duplicated-token charge (same hints as the EFT path). Cached for LPB_CACHE_S.
+    fn lpb_cand(&mut self, t: f64, r: u32, d: &[f64]) -> LpbC {
+        if let Some(c) = self.lpb_cache.get(&r) {
+            if t - c.t <= LPB_CACHE_S {
+                return c.clone();
+            }
+        }
+        let c = self.lpb_cand_new(t, r, d);
+        self.lpb_cache.insert(r, c.clone());
+        c
+    }
+
+    fn lpb_cand_new(&mut self, t: f64, r: u32, d: &[f64]) -> LpbC {
+        let np = self.p.len();
+        let bt = self.c.block_tokens;
+        let ch = self.c.chunk_tokens;
+        let l = self.reqs[r as usize].pt;
+        let runs = self.reqs[r as usize].runs.clone();
+        let ms: Vec<MatchResult> = (0..np).map(|w| self.p[w].radix.match_peek(&runs)).collect();
+        let hits: Vec<u64> = ms.iter().map(|m| m.total() as u64 * bt).collect();
+        let gpu: Vec<u64> = ms.iter().map(|m| m.dev as u64 * bt).collect();
+        let local: Vec<u64> = hits.iter().map(|&h| h.min(l)).collect();
+        let best = local.iter().copied().max().unwrap_or(0);
+        let own = (0..np)
+            .min_by(|&a, &b| local[b].cmp(&local[a]).then(gpu[b].cmp(&gpu[a])).then(d[a].total_cmp(&d[b])).then(a.cmp(&b)))
+            .unwrap();
+        let cold = best < self.c.pull_min_incremental_tokens.max(self.c.pull_min_tokens);
+        let mut s = vec![0.0; np];
+        let mut ps = vec![0.0; np];
+        let mut dup = vec![0.0; np];
+        for w in 0..np {
+            let s_ = (0..np).filter(|&k| k != w && hits[k] > 0).min_by(|&a, &b| hits[b].cmp(&hits[a]).then(a.cmp(&b)));
+            let mut hs = 0;
+            if let Some(s_) = s_ {
+                if self.c.pull_enabled
+                    && hits[s_] >= self.c.pull_min_tokens
+                    && hits[s_].saturating_sub(hits[w]) >= self.c.pull_min_incremental_tokens
+                {
+                    hs = hits[s_];
+                }
+            }
+            let exp = local[w].max(hs).min(l);
+            let pl = exp.saturating_sub(local[w]);
+            let host_local = local[w].saturating_sub(gpu[w].min(local[w]));
+            s[w] = eft_secs(&self.p[w].beta, ch, l - exp, exp, host_local, pl);
+            ps[w] = if pl > 0 { self.c.cs_eft_pull_fixed_s + self.c.cs_eft_pull_s_per_100k * pl as f64 / 1e5 } else { 0.0 };
+            let dtok = if self.c.cs_eft_dup_on_recompute { best.saturating_sub(local[w]) } else { pl };
+            dup[w] = self.c.cs_eft_dup_per_token_s * dtok as f64;
+        }
+        LpbC { t, own, cold, s0: s, ps, dup, pt: l }
+    }
+
+    /// LATE-P dispatcher (see SimConfig::lpb). Runs on arrivals, pass ends and the router timer.
+    fn lpb_dispatch(&mut self, t: f64) {
+        let np = self.p.len();
+        loop {
+            if self.lpb_q.is_empty() {
+                break;
+            }
+            let d: Vec<f64> = (0..np).map(|w| self.lpb_drain(t, w)).collect();
+            let dlo: Vec<f64> =
+                (0..np).map(|w| (d[w] - self.c.lpb_bnd_scale * self.lpb_bound(false, d[w])).max(0.0)).collect();
+            let ti: Vec<f64> = (0..np).map(|w| self.lpb_titer(w)).collect();
+            // Cheap pre-check: can any P open for the largest lead in the queue (largest prompt, full pull)?
+            let ptmax = self.lpb_q.iter().map(|&r| self.reqs[r as usize].pt).max().unwrap_or(0);
+            let (rm, bm) = self.lpb_lead_parts(ptmax);
+            let pm = self.c.cs_eft_pull_fixed_s + self.c.cs_eft_pull_s_per_100k * ptmax as f64 / 1e5;
+            if (0..np).all(|w| dlo[w] > rm + bm.max(pm) + ti[w]) {
+                break;
+            }
+            self.lpb_counts[5] += 1;
+            let q = self.lpb_q.clone();
+            let nf: Vec<f64> = (0..np).map(|w| self.p[w].lpb_nf).collect();
+            let mut cands = Vec::with_capacity(q.len());
+            for &r in &q {
+                let mut c = self.lpb_cand(t, r, &d);
+                for w in 0..np {
+                    c.s0[w] *= nf[w];
+                }
+                cands.push(c);
+            }
+            let mut order: Vec<usize> = (0..q.len()).collect();
+            if self.c.lpb_order == "hrrn" {
+                let key = |i: usize| {
+                    let so = cands[i].s0[cands[i].own].max(1e-6);
+                    (t - self.reqs[q[i] as usize].lpb_arr + so) / so
+                };
+                order.sort_by(|&a, &b| key(b).total_cmp(&key(a)).then(a.cmp(&b)));
+            }
+            let mut ahead = vec![0.0f64; np];
+            let mut pick: Option<(usize, usize, u8)> = None;
+            for &i in &order {
+                let c = &cands[i];
+                let (o, cold, s, ps, dup, pt) = (c.own, c.cold, &c.s0, &c.ps, &c.dup, c.pt);
+                let (recv, boot) = self.lpb_lead_parts(pt);
+                let lead = |w: usize| recv + boot.max(ps[w]) + ti[w];
+                let open = |w: usize| dlo[w] <= lead(w);
+                let cw = |w: usize| d[w].max(recv + boot.max(ps[w])) + s[w];
+                if cold {
+                    let best = (0..np).filter(|&w| open(w)).min_by(|&a, &b| cw(a).total_cmp(&cw(b)).then(a.cmp(&b)));
+                    if let Some(w) = best {
+                        pick = Some((i, w, 2));
+                        break;
+                    }
+                    continue;
+                }
+                if open(o) {
+                    pick = Some((i, o, 1));
+                    break;
+                }
+                if self.c.lpb_moves {
+                    let co = (d[o] + ahead[o]).max(recv + boot) + s[o];
+                    let bo = self.lpb_bound(d[o] + ahead[o] <= 1e-9, co);
+                    let mut best: Option<(usize, f64)> = None;
+                    for w in (0..np).filter(|&w| w != o && open(w)) {
+                        let c = cw(w);
+                        let bw = self.lpb_bound(d[w] <= 1e-9, c);
+                        let g = (co - c - dup[w]) - (bo * bo + bw * bw).sqrt() - self.c.cs_pred_gmin_s;
+                        if g > 0.0 && best.map_or(true, |x| g > x.1) {
+                            best = Some((w, g));
+                        }
+                    }
+                    if let Some((w, _)) = best {
+                        pick = Some((i, w, 3));
+                        break;
+                    }
+                }
+                ahead[o] += s[o];
+            }
+            let Some((i, w, cls)) = pick else { break };
+            let r = q[i];
+            let pos = self.lpb_q.iter().position(|&x| x == r).unwrap();
+            self.lpb_q.remove(pos);
+            {
+                let rq = &mut self.reqs[r as usize];
+                rq.lpb_disp = t;
+                rq.hold_s = t - rq.lpb_arr;
+                rq.lpb_cls = cls;
+            }
+            self.lpb_cache.remove(&r);
+            self.dispatch_to(t, r, w);
+            // counters: owner, cold, move with a pull hint, move that recomputes (no holder hint on w)
+            let k = if cls == 3 && self.reqs[r as usize].pull_src.is_none() { 4 } else { cls as usize };
+            self.lpb_counts[0] += 1;
+            self.lpb_counts[k] += 1;
+        }
+        if !self.lpb_q.is_empty() && !self.lpb_tick_on && t < self.c.duration_s {
+            self.lpb_tick_on = true;
+            self.at(t + self.c.lpb_tick_s, Ev::LpbTick);
+        }
+    }
+
+    /// Output only (iww_metric): P idle while work waits in the router queue or in another P's waiting queue;
+    /// per-P outstanding uncached tokens (waiting + admitted + bootstrap) max / mean.
+    fn iww_tick(&mut self, t: f64) {
+        if t >= self.hi {
+            return;
+        }
+        let np = self.p.len();
+        let router = !self.lpb_q.is_empty();
+        let runnable: Vec<bool> = (0..np)
+            .map(|k| self.p[k].wq.iter().any(|&r| !self.reqs[r as usize].pull_pending) || self.p[k].chunked.is_some())
+            .collect();
+        self.iww[0] += 1.0;
+        for w in 0..np {
+            let idle = self.p[w].run_items.is_none();
+            let other = router || (0..np).any(|k| k != w && runnable[k]);
+            if idle && other {
+                self.iww[1] += 1.0;
+            }
+            self.iww[2] += 1.0;
+        }
+        let ld: Vec<f64> = (0..np)
+            .map(|w| {
+                let bq: u64 = self.p[w]
+                    .bq
+                    .iter()
+                    .map(|&r| {
+                        let rq = &self.reqs[r as usize];
+                        rq.cs_cost.unwrap_or(rq.unc_est)
+                    })
+                    .sum();
+                (self.true_backlog(w) + bq) as f64
+            })
+            .collect();
+        let mean = ld.iter().sum::<f64>() / np as f64;
+        if mean > 0.0 {
+            self.lmm.push(ld.iter().cloned().fold(0.0, f64::max) / mean);
+        }
+        self.at(t + 0.1, Ev::IwwTick);
     }
 
     /// S5: backlog as sampled cs_state_age_s ago (0.1 s samples) + own charges routed since.
@@ -5838,6 +6364,28 @@ impl<'a> Sim<'a> {
                         }
                     }
                 }
+                if self.c.lpb {
+                    let mut hw: Vec<f64> = cmp.iter().map(|q| q.hold_s).collect();
+                    let m = hw.iter().sum::<f64>() / (hw.len().max(1) as f64);
+                    let (p50, p95) = if hw.is_empty() {
+                        (0.0, 0.0)
+                    } else {
+                        (percentile_in_place(&mut hw, 50.0), percentile_in_place(&mut hw, 95.0))
+                    };
+                    let c = |k: u8| cmp.iter().filter(|q| q.lpb_cls == k).count() as f64 / ns;
+                    rep.lpb_stats = [m, p50, p95, c(1), c(2), c(3), self.lpb_rx[0], self.lpb_rx[2]];
+                    rep.lpb_counts = self.lpb_counts;
+                }
+                rep.hol_shadow = self.hol_sh;
+                if self.c.iww_metric {
+                    let mut v = self.lmm.clone();
+                    let (a, b) = if v.is_empty() {
+                        (0.0, 0.0)
+                    } else {
+                        (percentile_in_place(&mut v, 50.0), percentile_in_place(&mut v, 90.0))
+                    };
+                    rep.iww = [if self.iww[2] > 0.0 { self.iww[1] / self.iww[2] } else { 0.0 }, self.iww[0], a, b];
+                }
                 if self.c.cs_hold_passes > 0.0 {
                     let h: Vec<&&Req> = cmp.iter().filter(|q| q.hold_s > 0.0).collect();
                     rep.held_share = h.len() as f64 / ns;
@@ -6319,6 +6867,89 @@ mod tests {
         let s1 = go(base.clone());
         let s2 = go(SimConfig { wait_scale: 4.0, ..base.clone() });
         assert!(s2.rps <= s1.rps + 1e-9, "{} vs {}", s2.rps, s1.rps);
+    }
+
+    #[test]
+    fn latep_dispatches_every_request_and_keeps_counts_consistent() {
+        let wl = synth_workload(12, 30);
+        let ct = FxHashMap::default();
+        let tab: Vec<f64> = (0..201).map(|i| -0.5 + i as f64 / 200.0).collect();
+        let base = SimConfig {
+            cs_workload: "true".into(),
+            p_dev_tokens: 131_072,
+            p_host_tokens: 262_144,
+            kv_retention: true,
+            kvret_mode: "transfer_end".into(),
+            pull_min_incremental_tokens: 512,
+            p_policy: "eft".into(),
+            cs_eft_one_way: false,
+            cs_eft_dup_rho: 0.0,
+            cs_eft_wait_transit: true,
+            cs_eft_dup_per_token_s: 6.8e-4,
+            bnd_idle_k: vec![0.15, 0.3, 0.6],
+            bnd_idle_b: vec![0.06, 0.18, 0.35],
+            bnd_busy_k: vec![0.3, 0.7, 1.35, 2.8],
+            bnd_busy_b: vec![0.5, 0.55, 0.86, 1.23],
+            cs_pred_gmin_s: 0.1,
+            iww_metric: true,
+            lpb: true,
+            ..kv_cfg("smgca")
+        };
+        let go = |c: SimConfig| {
+            let on = c.lpb;
+            let mut s = Sim::new(c, &wl, &ct);
+            s.run();
+            for w in &s.p {
+                w.radix.check().unwrap();
+            }
+            let (rep, _) = s.report(0.0);
+            assert!(rep.n_scored > 50, "scored {}", rep.n_scored);
+            if !on {
+                return rep;
+            }
+            let k = rep.lpb_counts;
+            assert_eq!(k[0], k[1] + k[2] + k[3] + k[4], "{k:?}");
+            assert!(rep.lpb_stats[0] >= 0.0 && rep.lpb_stats[2] >= rep.lpb_stats[1]);
+            let sh = rep.lpb_stats[3] + rep.lpb_stats[4] + rep.lpb_stats[5];
+            assert!((sh - 1.0).abs() < 1e-9, "{:?}", rep.lpb_stats);
+            assert!(rep.iww[1] > 0.0 && rep.iww[0] >= 0.0 && rep.iww[0] <= 1.0, "{:?}", rep.iww);
+            // Every request sent before the last 60 s left the router queue.
+            assert!(s.lpb_q.iter().all(|&r| s.reqs[r as usize].start > s.c.duration_s - 60.0), "{}", s.lpb_q.len());
+            rep
+        };
+        let f = go(base.clone());
+        let h = go(SimConfig { lpb_order: "hrrn".into(), ..base.clone() });
+        let n = go(SimConfig { cs_pred_noise: tab.clone(), lpb_moves: false, ..base.clone() });
+        assert_eq!(n.lpb_counts[3] + n.lpb_counts[4], 0);
+        assert!(f.rps > 0.0 && h.rps > 0.0);
+        // Zero bound and zero receipt forecast still dispatch everything.
+        go(SimConfig { lpb_bnd_scale: 0.0, lpb_rx_scale: 0.0, ..base.clone() });
+        // PRED-EFT+HOL with the r5 curve bound runs on the EFT path.
+        let c = go(SimConfig {
+            lpb: false,
+            cs_hol_mu: 1.0,
+            cs_pred_gate: true,
+            cs_pred_curve: true,
+            cs_pred_m: 1.0,
+            cs_pred_noise: tab.clone(),
+            ..base.clone()
+        });
+        assert!(c.pred_gate[2] <= c.pred_gate[1]);
+        assert!(c.hol_shadow[0] > 0 && c.hol_shadow[1] <= c.hol_shadow[0] && c.hol_shadow[3] <= c.hol_shadow[2]);
+        let c2 = go(SimConfig {
+            lpb: false,
+            cs_hol_mu: 1.0,
+            cs_hol_form: "bp".into(),
+            cs_pred_gate: true,
+            cs_pred_curve: true,
+            cs_pred_m: 1.0,
+            ..base.clone()
+        });
+        assert!(c2.hol_shadow[0] > 0 && c2.hol_shadow[4] <= c2.hol_shadow[1]);
+        assert_eq!(bound_curve(&[1.0, 2.0], &[0.5, 1.0], 0.5), 0.5);
+        assert!((bound_curve(&[1.0, 2.0], &[0.5, 1.0], 1.5) - 0.75).abs() < 1e-12);
+        assert!((bound_curve(&[1.0, 2.0], &[0.5, 1.0], 4.0) - 2.0).abs() < 1e-12);
+        assert_eq!(bound_curve(&[], &[], 4.0), 0.0);
     }
 
     #[test]
