@@ -1233,6 +1233,9 @@ pub struct SimReport {
     pub stolen_share: f64,
     pub hold_s_mean: f64,
     pub idle_overlap_share: f64,
+    /// S7 B1 debug at the end of the run: held count, then per P [backlog s without ledger, ledger s,
+    /// waiting, bootstrap, prefilling counts].
+    pub hold_end: Vec<f64>,
     pub wall_s: f64,
 }
 
@@ -5663,6 +5666,14 @@ impl<'a> Sim<'a> {
                     rep.held_share = h.len() as f64 / ns;
                     rep.stolen_share = cmp.iter().filter(|q| q.stolen).count() as f64 / ns;
                     rep.hold_s_mean = h.iter().map(|q| q.hold_s).sum::<f64>() / (h.len().max(1) as f64);
+                    rep.hold_end.push(self.held.len() as f64);
+                    for w in 0..self.p.len() {
+                        rep.hold_end.push(self.backlog_secs(w, true));
+                        rep.hold_end.push(self.p[w].transit_s);
+                        rep.hold_end.push(self.p[w].wq.len() as f64);
+                        rep.hold_end.push(self.p[w].bq.len() as f64);
+                        rep.hold_end.push(self.p[w].pf_set.len() as f64);
+                    }
                 }
                 if self.c.idle_overlap_metric {
                     // Union of idle intervals of the P other than p, per p (sorted, merged).
