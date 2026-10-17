@@ -360,6 +360,11 @@ pub struct SimConfig {
     pub cs_fpi_pilot_s: f64,
     pub cs_fpi_rho_cap: f64,
     pub cs_ski_tau_s: f64,
+    /// wfa / ski / skir move cost M(k): "seconds" (default; OR-MODELS S2 as written: min(pull wait
+    /// beyond the target backlog + restore, recompute extra) in plain P seconds) or "fpi" (the FPI
+    /// cost of executing the move minus the as-if-local FPI cost on k, i.e. in the same units as the
+    /// per-turn costs, including the externality of the extra work).
+    pub cs_fpi_move_cost: String,
 }
 
 impl Default for SimConfig {
@@ -506,6 +511,7 @@ impl Default for SimConfig {
             cs_fpi_pilot_s: 900.0,
             cs_fpi_rho_cap: 0.95,
             cs_ski_tau_s: 60.0,
+            cs_fpi_move_cost: "seconds".into(),
         }
     }
 }
@@ -1377,6 +1383,7 @@ impl<'a> Sim<'a> {
             "cs_fpi: off | fpi | wfa | ski | skir"
         );
         assert!(c.cs_fpi == "off" || c.p_policy == "eft", "cs_fpi needs p_policy eft");
+        assert!(matches!(c.cs_fpi_move_cost.as_str(), "seconds" | "fpi"), "cs_fpi_move_cost: seconds | fpi");
         if c.shared_pool {
             // IDEAL bound: P 0's tree is the one pool of all P (sizes x n_p); the others stay empty.
             assert!(
@@ -4136,7 +4143,7 @@ impl<'a> Sim<'a> {
                     let pull_cost = (tp - wait[w]).max(0.0) + b[4] * mv as f64 / 1e5;
                     mm = mm.min(pull_cost);
                 }
-                m[w] = mm;
+                m[w] = if self.c.cs_fpi_move_cost == "fpi" { (best[w].0 - c[w]).max(0.0) } else { mm };
             }
             let key = self.chain_key(r);
             // Start: w = 0 at the holder, M at the other P (OR-MODELS S2).
@@ -5213,12 +5220,13 @@ mod tests {
         go(SimConfig { cs_state_age_s: 1.0, ..base.clone() });
         go(SimConfig { cs_state_age_s: 2.0, cs_state_own_fix: false, ..base.clone() });
         // FPI family on the EFT path: the pilot measures lambda and rho, then moves are counted.
-        for mode in ["fpi", "wfa", "ski", "skir"] {
+        for (mode, mc) in [("fpi", "seconds"), ("wfa", "seconds"), ("ski", "seconds"), ("skir", "seconds"), ("wfa", "fpi"), ("skir", "fpi")] {
             let rep = go(SimConfig {
                 p_policy: "eft".into(),
                 cs_eft_one_way: false,
                 cs_eft_dup_rho: 0.0,
                 cs_fpi: mode.into(),
+                cs_fpi_move_cost: mc.into(),
                 cs_fpi_pilot_s: 60.0,
                 cs_eft_max_pull_tokens: 25_000,
                 ..base.clone()
