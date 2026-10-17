@@ -12,11 +12,19 @@
 //! pull sources) both pin a path from the root. A demoted node (source copy after a completed
 //! pull) is evicted before every non-demoted node of the same tier; a later local match clears
 //! the flag.
+//!
+//! Session retention (option, `enable_kvret`; sglang-private PR #49 engine + Morphosis PR #25
+//! router, adoption plan wf_b21a8cdb-0dc): per node a count of distinct sessions whose anchor path
+//! covers it (one count per session, not per request). Host eviction then runs in two classes:
+//! class 0 = nodes a session covered once and none covers now ("known zero"), class 1 = all others;
+//! LRU by host recency inside a class, ties by node creation order. Class 0 mixes host-only leaves
+//! and GPU-backed host duplicates (#49); class 1 keeps the base order (host-only leaves before
+//! duplicates; the class-1 fix approved by the user). Positive counts are not pins.
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 /// Node index in the arena.
 pub type NodeId = u32;
@@ -47,6 +55,13 @@ pub struct Node {
     /// Time the node (or its oldest part) was first written to the host tier.
     pub host_t: f64,
     pub alive: bool,
+    /// Creation serial (engine node.id analog): tie-break of the retention eviction order.
+    pub uid: u64,
+    /// Host-tier recency (#49 host_last_access_time). Read only by the retention order.
+    pub hlast: f64,
+    /// Retention: distinct sessions whose anchor path covers this node; a session covered it once.
+    pub sc: u32,
+    pub known: bool,
 }
 
 impl Node {
@@ -66,6 +81,10 @@ impl Node {
             demoted: false,
             host_t: 0.0,
             alive: true,
+            uid: 0,
+            hlast: 0.0,
+            sc: 0,
+            known: false,
         }
     }
 
@@ -107,6 +126,91 @@ impl PartialOrd for HeapKey {
     }
 }
 
+/// Retention host-eviction key (#49 host_retention_priority with the approved class-1 fix):
+/// (class, class 1 and GPU-backed duplicate, host recency, creation serial), smallest first.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct RKey {
+    rank: u8,
+    dup: u8,
+    hlast: f64,
+    uid: u64,
+    node: NodeId,
+}
+
+impl Eq for RKey {}
+
+impl Ord for RKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .rank
+            .cmp(&self.rank)
+            .then_with(|| other.dup.cmp(&self.dup))
+            .then_with(|| other.hlast.total_cmp(&self.hlast))
+            .then_with(|| other.uid.cmp(&self.uid))
+    }
+}
+
+impl PartialOrd for RKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// One session registration on one worker (#49 _KvRegistration): version, desired key (the full
+/// input), anchor (deepest node of the key in the tree; NONE = no references), state 0 live,
+/// 1 released (version fence), 2 ended (lifetime fence), and the missing-page subscription.
+#[derive(Debug, Clone)]
+struct KvEntry {
+    ver: u32,
+    key: Vec<(u64, u32)>,
+    anchor: NodeId,
+    state: u8,
+    wait: Option<(NodeId, u64)>,
+}
+
+/// Tracker counters (whole run).
+#[derive(Debug, Clone, Default)]
+pub struct KvStats {
+    /// New registrations (new session or newer version), fenced arrivals, same-version retries.
+    pub admits: u64,
+    pub fenced: u64,
+    pub retries: u64,
+    /// release ops: applied to a live registration, fence installed, stale (newer version here), ended.
+    pub release_applied: u64,
+    pub release_fence: u64,
+    pub release_stale: u64,
+    pub release_ended: u64,
+    pub ends: u64,
+    /// Registrations woken by an insert that created their missing page; anchors moved up on delete.
+    pub wakes: u64,
+    pub delete_moves: u64,
+    /// Late callbacks for a non-current version (paths marked known, no references restored).
+    pub late_marks: u64,
+}
+
+/// Session-retention tracker of one tree (#49 KvSessionRetention).
+#[derive(Debug, Clone, Default)]
+pub struct KvRet {
+    ses: FxHashMap<u32, KvEntry>,
+    anch: FxHashMap<NodeId, Vec<u32>>,
+    waits: FxHashMap<(NodeId, u64), Vec<u32>>,
+    pub stats: KvStats,
+}
+
+/// Session tag of an insert: (session, version, kind); kind KV_FINISHED = the request's own prefill
+/// insert (cache_finished_req -> refresh_request), KV_PREFETCH = a pull landing (prefetch_committed).
+pub type KvTag = (u32, u32, u8);
+pub const KV_FINISHED: u8 = 0;
+pub const KV_PREFETCH: u8 = 1;
+
+/// Status of a registration (#49 control 'status').
+pub const KV_MISSING: u8 = 0;
+pub const KV_PENDING: u8 = 1;
+pub const KV_READY: u8 = 2;
+pub const KV_RELEASED: u8 = 3;
+pub const KV_ENDED: u8 = 4;
+pub const KV_STALE: u8 = 5;
+
 /// Which tiers the demote flag reorders.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DemoteScope {
@@ -146,6 +250,12 @@ pub struct CacheStats {
     /// node was pinned at that moment.
     pub moved_freed_blocks: u64,
     pub moved_flagged_blocks: u64,
+    /// Retention host eviction (blocks): [class 0 host-only leaf, class 0 GPU-backed duplicate,
+    /// class 1 host-only leaf, class 1 duplicate]; device-only nodes (host copy reclaimed earlier)
+    /// deleted by device eviction; such nodes skipped because they had children (should stay 0).
+    pub kv_evicted_blocks: [u64; 4],
+    pub kv_devonly_deleted_blocks: u64,
+    pub kv_devonly_children_skip: u64,
 }
 
 /// Window-filtered host eviction samples: (evict time, blocks, age since last use, age since write).
@@ -158,6 +268,10 @@ pub struct HostEviction {
     pub demoted: bool,
     /// Namespace of the evicted node's first block (block id >> 32 = task admission).
     pub ns: u64,
+    /// Retention class (0 known zero, 1 other; 2 = base order without retention) and whether the
+    /// host copy of a GPU-backed duplicate was reclaimed (the node stays on the device).
+    pub class: u8,
+    pub dup: bool,
 }
 
 /// Host-pool census at one instant (tokens are blocks here; the caller scales).
@@ -209,6 +323,12 @@ pub struct TwoTierRadix {
     /// un-demoted by this and later matches (:911-918); the rest keeps its own access time and
     /// demote flag (_split_node :1358-1362). false = v1-v3 behavior (whole node touched).
     pub split_on_match: bool,
+    /// Session retention mode (see the module doc); `kv` holds the tracker.
+    pub kvret: bool,
+    pub kv_dup_reclaim: bool,
+    pub kv: Option<KvRet>,
+    rh: BinaryHeap<RKey>,
+    uid_next: u64,
 }
 
 /// Longest common prefix of node runs `eruns` and prompt runs `pruns[ri..]` (offset `off` into
@@ -274,6 +394,7 @@ impl TwoTierRadix {
         root.dev = true;
         root.host = true;
         root.last = 1e18;
+        root.hlast = 1e18;
         Self {
             nodes: vec![root],
             free: Vec::new(),
@@ -291,7 +412,20 @@ impl TwoTierRadix {
             record_evictions: false,
             split_refresh: true,
             split_on_match: false,
+            kvret: false,
+            kv_dup_reclaim: true,
+            kv: None,
+            rh: BinaryHeap::new(),
+            uid_next: 0,
         }
+    }
+
+    /// Turn on session retention (host eviction by retention class, #49 host recency, GPU-backed
+    /// duplicate reclaim when `dup_reclaim`). Call on an empty tree.
+    pub fn enable_kvret(&mut self, dup_reclaim: bool) {
+        self.kvret = true;
+        self.kv_dup_reclaim = dup_reclaim;
+        self.kv = Some(KvRet::default());
     }
 
     pub fn node(&self, id: NodeId) -> &Node {
@@ -302,7 +436,9 @@ impl TwoTierRadix {
         self.live
     }
 
-    fn alloc(&mut self, node: Node) -> NodeId {
+    fn alloc(&mut self, mut node: Node) -> NodeId {
+        self.uid_next += 1;
+        node.uid = self.uid_next;
         self.live += 1;
         if let Some(id) = self.free.pop() {
             self.nodes[id as usize] = node;
@@ -342,6 +478,17 @@ impl TwoTierRadix {
             (n.dev, n.host, n.ch.is_empty(), n.last)
         };
         self.seq += 1;
+        if self.kvret {
+            if dev {
+                let class = self.class(id, false);
+                self.dh.push(HeapKey { class, last, seq: self.seq, node: id });
+            }
+            if host && (dev || leaf) {
+                let k = self.rkey(id);
+                self.rh.push(k);
+            }
+            return;
+        }
         if dev {
             let class = self.class(id, false);
             self.dh.push(HeapKey { class, last, seq: self.seq, node: id });
@@ -414,6 +561,7 @@ impl TwoTierRadix {
             if let Some(t) = touch {
                 let c = &mut self.nodes[ch as usize];
                 c.last = t;
+                c.hlast = t;
                 if clear_demote && c.demoted {
                     c.demoted = false;
                     self.stats.demote_cleared_nodes += 1;
@@ -452,6 +600,7 @@ impl TwoTierRadix {
         let mut loaded = 0u64;
         for &(n, _) in path {
             self.nodes[n as usize].last = t;
+            self.nodes[n as usize].hlast = t;
             if !self.nodes[n as usize].dev {
                 loaded += self.nodes[n as usize].nb as u64;
                 self.set_dev(n, true);
@@ -743,6 +892,18 @@ impl TwoTierRadix {
     /// `host_only` the new and existing-host-only nodes stay host-only (pull landing on host).
     /// Returns the path nodes.
     pub fn insert(&mut self, runs: &[(u64, u32)], t: f64, host_only: bool) -> Vec<NodeId> {
+        self.insert_kv(runs, t, host_only, None)
+    }
+
+    /// `insert` with a session tag (retention): after the walk, registrations waiting for a page
+    /// that this insert created are woken (#49 materialized) and the tagged registration is
+    /// refreshed (KV_FINISHED: anchor at the final node) or advanced (KV_PREFETCH: import of the
+    /// version current at issue; a late import only marks its path known), all before the eviction
+    /// that the insert triggers. Retention mode: a host-only landing does not refresh the GPU recency
+    /// of existing path nodes (#49 insert_host without _touch_node); its host recency is refreshed
+    /// (touch_host_nodes on the committed path).
+    pub fn insert_kv(&mut self, runs: &[(u64, u32)], t: f64, host_only: bool, tag: Option<KvTag>) -> Vec<NodeId> {
+        let touch_gpu = !(host_only && self.kvret);
         let mut node = ROOT;
         let mut ri = 0usize;
         let mut off: u32 = 0;
@@ -758,6 +919,7 @@ impl TwoTierRadix {
                 let nb: u32 = rest.iter().map(|&(_, c)| c).sum();
                 let mut leaf = Node::new(rest, nb, node);
                 leaf.last = t;
+                leaf.hlast = t;
                 leaf.host = true;
                 leaf.host_t = t;
                 let id = self.alloc(leaf);
@@ -790,7 +952,10 @@ impl TwoTierRadix {
             }
             {
                 let c = &mut self.nodes[ch as usize];
-                c.last = t;
+                if touch_gpu {
+                    c.last = t;
+                }
+                c.hlast = t;
                 if c.demoted {
                     c.demoted = false;
                     self.stats.demote_cleared_nodes += 1;
@@ -805,16 +970,35 @@ impl TwoTierRadix {
         for &n in &path {
             self.push(n);
         }
+        if self.kvret {
+            if let Some(&deep) = path.last() {
+                self.kv_materialized(deep);
+                if let Some((sid, ver, kind)) = tag {
+                    self.kv_tagged(sid, ver, kind, deep);
+                }
+            }
+        }
         self.evict_dev(t);
         path
     }
 
     /// Split `ch` (child of `parent` under `key`) after `m` blocks; returns the upper node.
     fn split(&mut self, parent: NodeId, key: u64, ch: NodeId, m: u32, t: f64) -> NodeId {
+        self.split_x(parent, key, ch, m, t, true)
+    }
+
+    /// Split; `touch` false = #49 _split_node(touch=False): neither fragment's recency changes.
+    /// The upper fragment always copies the host recency and the retention count of `ch`
+    /// (#49 _split_node: host_last_access_time and host_session_* copied; anchors stay on `ch`).
+    fn split_x(&mut self, parent: NodeId, key: u64, ch: NodeId, m: u32, t: f64, touch: bool) -> NodeId {
         let (a, b) = split_runs(&self.nodes[ch as usize].runs, m);
         let (cdev, chost, clast, clock, clease, chlock, cdem, chost_t) = {
             let c = &self.nodes[ch as usize];
             (c.dev, c.host, c.last, c.lock, c.lease, c.hlock, c.demoted, c.host_t)
+        };
+        let (chl, csc, ckn) = {
+            let c = &self.nodes[ch as usize];
+            (c.hlast, c.sc, c.known)
         };
         let mut mid = Node::new(a, m, parent);
         mid.dev = cdev;
@@ -827,6 +1011,9 @@ impl TwoTierRadix {
         mid.hlock = chlock;
         mid.demoted = cdem;
         mid.host_t = chost_t;
+        mid.hlast = chl;
+        mid.sc = csc;
+        mid.known = ckn;
         mid.ndev = if cdev { 1 } else { 0 };
         let bkey = b[0].0;
         let mid_id = self.alloc(mid);
@@ -840,7 +1027,7 @@ impl TwoTierRadix {
         self.nodes[parent as usize].ch.insert(key, mid_id);
         // Engine: a new node is created with a fresh access time and the split child gets a fresh
         // time too (unified_tree_core.py:123 and 1285-1335 @831bac2694): both fragments are recent.
-        if self.split_refresh {
+        if self.split_refresh && touch {
             self.nodes[mid_id as usize].last = t;
             self.nodes[ch as usize].last = t;
             if !self.nodes[ch as usize].pinned() {
@@ -864,6 +1051,29 @@ impl TwoTierRadix {
             if self.class(id, false) != k.class {
                 continue;
             }
+            if self.kvret && !n.host {
+                // Retention only: the host copy of this GPU-backed duplicate was reclaimed, so device
+                // eviction deletes the node (no host copy to keep). No child can hold a host copy
+                // (a host node's ancestors are host nodes), so a device leaf here has no children.
+                if !n.ch.is_empty() {
+                    self.stats.kv_devonly_children_skip += 1;
+                    continue;
+                }
+                let (nb, par, key) = (n.nb, n.par, n.runs[0].0);
+                self.stats.dev_evicted_blocks += nb as u64;
+                self.stats.kv_devonly_deleted_blocks += nb as u64;
+                self.set_dev(id, false);
+                if self.nodes[par as usize].ch.get(&key) == Some(&id) {
+                    self.nodes[par as usize].ch.remove(&key);
+                }
+                self.kv_on_delete(id);
+                self.release(id);
+                let p = &self.nodes[par as usize];
+                if par != ROOT && p.ndev == 0 && p.dev && !p.pinned() {
+                    self.push(par);
+                }
+                continue;
+            }
             self.stats.dev_evicted_blocks += n.nb as u64;
             let par = n.par;
             let leaf = n.ch.is_empty();
@@ -885,6 +1095,9 @@ impl TwoTierRadix {
     /// Host eviction until within capacity: host-only, unpinned leaves; demoted first, then LRU.
     /// Host eviction; returns the remaining shortfall in blocks (0 when within capacity).
     pub fn evict_host(&mut self, t: f64) -> u64 {
+        if self.kvret {
+            return self.evict_host_kv(t);
+        }
         while self.host_used > self.host_cap {
             let Some(k) = self.hh.pop() else { break };
             let id = k.node;
@@ -917,7 +1130,16 @@ impl TwoTierRadix {
                 self.stats.demote_evicted_blocks += nb as u64;
             }
             if self.record_evictions {
-                self.evictions.push(HostEviction { t, blocks: nb, age_last, age_write, demoted, ns: key >> 32 });
+                self.evictions.push(HostEviction {
+                    t,
+                    blocks: nb,
+                    age_last,
+                    age_write,
+                    demoted,
+                    ns: key >> 32,
+                    class: 2,
+                    dup: false,
+                });
             }
             if self.nodes[par as usize].ch.get(&key) == Some(&id) {
                 self.nodes[par as usize].ch.remove(&key);
@@ -940,9 +1162,508 @@ impl TwoTierRadix {
         short
     }
 
+    // ---------------------------------------------------------------------- session retention
+    /// Retention eviction key of a node (class 0 = known zero; class 1 GPU-backed duplicates after
+    /// class 1 host-only leaves).
+    fn rkey(&self, id: NodeId) -> RKey {
+        let n = &self.nodes[id as usize];
+        let rank = if n.sc == 0 && n.known { 0 } else { 1 };
+        let dup = if rank == 1 && n.dev { 1 } else { 0 };
+        RKey { rank, dup, hlast: n.hlast, uid: n.uid, node: id }
+    }
+
+    /// Push a fresh retention-heap entry for a host node (after its class may have dropped).
+    fn push_r(&mut self, id: NodeId) {
+        if id == ROOT || !self.kvret {
+            return;
+        }
+        let (host, dev, leaf) = {
+            let n = &self.nodes[id as usize];
+            (n.host, n.dev, n.ch.is_empty())
+        };
+        if host && (dev || leaf) {
+            let k = self.rkey(id);
+            self.rh.push(k);
+        }
+    }
+
+    fn has_host_child(&self, id: NodeId) -> bool {
+        self.nodes[id as usize].ch.values().any(|&c| self.nodes[c as usize].host)
+    }
+
+    /// Retention host eviction (#49 _drive_retention_host_eviction with the class-1 fix): one heap
+    /// of host-only unpinned leaves and reclaimable GPU-backed duplicates (device copy kept; no
+    /// child with a host copy; no host lock or lease; a request lock is a device lock and does not
+    /// block it, as _can_reclaim_host_duplicate); order (class, class 1 and duplicate, host recency,
+    /// creation serial). Returns the remaining shortfall in blocks.
+    fn evict_host_kv(&mut self, t: f64) -> u64 {
+        while self.host_used > self.host_cap {
+            let Some(k) = self.rh.pop() else { break };
+            let id = k.node;
+            let (leaf, dup) = {
+                let n = &self.nodes[id as usize];
+                if !n.alive || n.uid != k.uid || !n.host || n.par == NONE {
+                    continue;
+                }
+                let leaf = !n.dev && n.ch.is_empty() && !n.host_pinned();
+                let dup = n.dev && self.kv_dup_reclaim && n.hlock == 0 && n.lease == 0;
+                (leaf, dup)
+            };
+            if !leaf && !(dup && !self.has_host_child(id)) {
+                continue;
+            }
+            let cur = self.rkey(id);
+            if cur.rank != k.rank || cur.dup != k.dup || cur.hlast != k.hlast {
+                self.rh.push(cur);
+                continue;
+            }
+            let (par, nb, key, demoted, age_last, age_write) = {
+                let n = &self.nodes[id as usize];
+                (n.par, n.nb, n.runs[0].0, n.demoted, (t - n.last).max(0.0), (t - n.host_t).max(0.0))
+            };
+            self.stats.host_evicted_blocks += nb as u64;
+            self.stats.host_evicted_nodes += 1;
+            self.stats.host_age_last_sum += age_last * nb as f64;
+            self.stats.host_age_write_sum += age_write * nb as f64;
+            self.stats.kv_evicted_blocks[cur.rank as usize * 2 + if leaf { 0 } else { 1 }] += nb as u64;
+            if self.record_evictions {
+                self.evictions.push(HostEviction {
+                    t,
+                    blocks: nb,
+                    age_last,
+                    age_write,
+                    demoted,
+                    ns: key >> 32,
+                    class: cur.rank,
+                    dup: !leaf,
+                });
+            }
+            self.host_used -= nb as u64;
+            if leaf {
+                if self.nodes[par as usize].ch.get(&key) == Some(&id) {
+                    self.nodes[par as usize].ch.remove(&key);
+                }
+                self.kv_on_delete(id);
+                self.release(id);
+            } else {
+                // Reclaim the host copy of a GPU-backed duplicate: the node stays on the device.
+                self.nodes[id as usize].host = false;
+            }
+            // A removed leaf or a released host copy can expose the parent (host leaf or duplicate).
+            self.push_r(par);
+        }
+        if self.rh.len() as u64 > 8 * self.live + 10000 {
+            self.rebuild();
+        }
+        let short = self.host_used.saturating_sub(self.host_cap);
+        if short > 0 {
+            self.stats.overcommit_events += 1;
+            self.stats.overcommit_blocks += short;
+        }
+        short
+    }
+
+    /// Nodes from `n` up to the root (root excluded); NONE -> empty.
+    fn path_up(&self, mut n: NodeId) -> Vec<NodeId> {
+        let mut v = Vec::new();
+        while n != NONE && n != ROOT {
+            v.push(n);
+            n = self.nodes[n as usize].par;
+        }
+        v
+    }
+
+    /// Exact structural prefix of `key` in the tree, any tier (#49 locate_retention_prefix): walk
+    /// whole nodes; where the key ends inside a node, split it there without touching recency and
+    /// stop on the upper fragment. Returns the deepest node (ROOT if nothing matches).
+    fn kv_locate(&mut self, key: &[(u64, u32)]) -> NodeId {
+        let mut node = ROOT;
+        let mut ri = 0usize;
+        let mut off: u32 = 0;
+        while ri < key.len() {
+            let k = key[ri].0 + off as u64;
+            let Some(&ch) = self.nodes[node as usize].ch.get(&k) else { break };
+            let (m, ri2, off2) = lcp(&self.nodes[ch as usize].runs, key, ri, off);
+            if m == 0 {
+                break;
+            }
+            if m < self.nodes[ch as usize].nb {
+                node = self.split_x(node, k, ch, m, 0.0, false);
+                break;
+            }
+            node = ch;
+            ri = ri2;
+            off = off2;
+        }
+        node
+    }
+
+    /// Block id at offset `off` (blocks) of a run list.
+    fn block_at(runs: &[(u64, u32)], mut off: u64) -> Option<u64> {
+        for &(s, c) in runs {
+            if off < c as u64 {
+                return Some(s + off);
+            }
+            off -= c as u64;
+        }
+        None
+    }
+
+    /// #49 _replace_anchor: symmetric path difference (nodes only on the old path -1, nodes only on
+    /// the new path +1 and known), anchor index, then a subscription to the next missing page.
+    fn kv_replace_anchor(&mut self, kv: &mut KvRet, sid: u32, new: NodeId) {
+        let old = {
+            let e = kv.ses.get_mut(&sid).expect("kv entry");
+            let w = e.wait.take();
+            if let Some(w) = w {
+                if let Some(v) = kv.waits.get_mut(&w) {
+                    v.retain(|&x| x != sid);
+                    if v.is_empty() {
+                        kv.waits.remove(&w);
+                    }
+                }
+            }
+            kv.ses[&sid].anchor
+        };
+        let op = self.path_up(old);
+        let np = self.path_up(new);
+        if op != np {
+            let os: FxHashSet<NodeId> = op.iter().copied().collect();
+            let ns: FxHashSet<NodeId> = np.iter().copied().collect();
+            for &n in &op {
+                if !ns.contains(&n) {
+                    let nd = &mut self.nodes[n as usize];
+                    debug_assert!(nd.sc > 0, "retention count underflow");
+                    nd.sc = nd.sc.saturating_sub(1);
+                    if nd.sc == 0 {
+                        self.push_r(n);
+                    }
+                }
+            }
+            for &n in &np {
+                if !os.contains(&n) {
+                    let nd = &mut self.nodes[n as usize];
+                    nd.sc += 1;
+                    nd.known = true;
+                }
+            }
+        }
+        if old != NONE && old != ROOT {
+            if let Some(v) = kv.anch.get_mut(&old) {
+                v.retain(|&x| x != sid);
+                if v.is_empty() {
+                    kv.anch.remove(&old);
+                }
+            }
+        }
+        if new != NONE && new != ROOT {
+            kv.anch.entry(new).or_default().push(sid);
+        }
+        let e = kv.ses.get_mut(&sid).unwrap();
+        e.anchor = new;
+        // #49 _watch_missing: index the next missing page of a live, incomplete context.
+        if new == NONE || e.state != 0 {
+            return;
+        }
+        let covered: u64 = np.iter().map(|&n| self.nodes[n as usize].nb as u64).sum();
+        if covered >= run_blocks(&e.key) {
+            return;
+        }
+        if let Some(b) = Self::block_at(&e.key, covered) {
+            e.wait = Some((new, b));
+            kv.waits.entry((new, b)).or_default().push(sid);
+        }
+    }
+
+    /// #49 mark_retired: the path of a late callback becomes known (class 0 if no session covers it).
+    fn kv_mark_known(&mut self, node: NodeId) {
+        for n in self.path_up(node) {
+            let nd = &mut self.nodes[n as usize];
+            if !nd.known {
+                nd.known = true;
+                if nd.sc == 0 {
+                    self.push_r(n);
+                }
+            }
+        }
+    }
+
+    fn kv_retire(&mut self, kv: &mut KvRet, sid: u32, state: u8) {
+        self.kv_replace_anchor(kv, sid, NONE);
+        let e = kv.ses.get_mut(&sid).unwrap();
+        e.state = state;
+        e.key = Vec::new();
+    }
+
+    /// Arrival of request (session `sid`, version `ver`, full input `key`) on this worker (#49 admit
+    /// via note_kv_session_arrival). A newer version replaces the older one in one step (symmetric
+    /// path difference); an older version, an arrival after END or after a release fence of the same
+    /// version is fenced (no references; its matched path is marked known). Returns 0 registered,
+    /// 1 same-version retry, 2 fenced, 255 retention off.
+    pub fn kv_admit(&mut self, sid: u32, ver: u32, key: &[(u64, u32)]) -> u8 {
+        let Some(mut kv) = self.kv.take() else { return 255 };
+        let mut res = 0u8;
+        let fenced = match kv.ses.get(&sid) {
+            Some(e) if e.state == 2 || ver < e.ver => true,
+            Some(e) if ver == e.ver && e.state == 1 => true,
+            Some(e) if ver == e.ver => {
+                res = 1;
+                false
+            }
+            _ => false,
+        };
+        if fenced {
+            kv.stats.fenced += 1;
+            let m = self.walk(key, None, false);
+            if let Some(&(deep, _)) = m.path.last() {
+                kv.stats.late_marks += 1;
+                self.kv_mark_known(deep);
+            }
+            res = 2;
+        } else if res == 0 {
+            kv.stats.admits += 1;
+            let node = self.kv_locate(key);
+            // A live older version is replaced in place (its anchor gives the path difference).
+            let live_old = matches!(kv.ses.get(&sid), Some(e) if e.state == 0);
+            if live_old {
+                let e = kv.ses.get_mut(&sid).unwrap();
+                e.ver = ver;
+                e.key = key.to_vec();
+            } else {
+                kv.ses.insert(sid, KvEntry { ver, key: key.to_vec(), anchor: NONE, state: 0, wait: None });
+            }
+            self.kv_replace_anchor(&mut kv, sid, node);
+        } else {
+            kv.stats.retries += 1;
+        }
+        self.kv = Some(kv);
+        res
+    }
+
+    /// Tagged insert callback (see insert_kv).
+    fn kv_tagged(&mut self, sid: u32, ver: u32, kind: u8, node: NodeId) {
+        let Some(mut kv) = self.kv.take() else { return };
+        let live = matches!(kv.ses.get(&sid), Some(e) if e.state == 0 && e.ver == ver);
+        if live {
+            if kind == KV_FINISHED {
+                self.kv_replace_anchor(&mut kv, sid, node);
+            } else {
+                // #49 _advance_anchor: only to a descendant of the current anchor.
+                let old = kv.ses[&sid].anchor;
+                let mut c = node;
+                while c != NONE && c != old {
+                    c = self.nodes[c as usize].par;
+                }
+                if node != old && (old == NONE || c == old) {
+                    self.kv_replace_anchor(&mut kv, sid, node);
+                }
+            }
+        } else {
+            kv.stats.late_marks += 1;
+            self.kv_mark_known(node);
+        }
+        self.kv = Some(kv);
+    }
+
+    /// #49 materialized: registrations waiting for a page that now exists on the path of `deep`
+    /// are located again.
+    fn kv_materialized(&mut self, deep: NodeId) {
+        let Some(mut kv) = self.kv.take() else { return };
+        if !kv.waits.is_empty() {
+            let mut cands: Vec<u32> = Vec::new();
+            for n in self.path_up(deep) {
+                let (p, k) = {
+                    let nd = &self.nodes[n as usize];
+                    (nd.par, nd.runs[0].0)
+                };
+                if let Some(v) = kv.waits.get(&(p, k)) {
+                    for &s in v {
+                        if !cands.contains(&s) {
+                            cands.push(s);
+                        }
+                    }
+                }
+            }
+            for sid in cands {
+                let key = match kv.ses.get(&sid) {
+                    Some(e) if e.state == 0 => e.key.clone(),
+                    _ => continue,
+                };
+                let node = self.kv_locate(&key);
+                kv.stats.wakes += 1;
+                self.kv_replace_anchor(&mut kv, sid, node);
+            }
+        }
+        self.kv = Some(kv);
+    }
+
+    /// #49 on_delete: registrations anchored at a node that is about to be deleted move to its parent
+    /// (and wait for the missing page again).
+    fn kv_on_delete(&mut self, id: NodeId) {
+        if !self.kvret {
+            return;
+        }
+        let Some(mut kv) = self.kv.take() else { return };
+        if let Some(sids) = kv.anch.get(&id).cloned() {
+            let par = self.nodes[id as usize].par;
+            for sid in sids {
+                kv.stats.delete_moves += 1;
+                self.kv_replace_anchor(&mut kv, sid, par);
+            }
+        }
+        self.kv = Some(kv);
+    }
+
+    /// Control 'release' of (session, version) (#49 control): applied to the live registration of
+    /// that version; a newer version here makes it stale; no or an older registration installs a
+    /// version fence. Returns 0 applied (or already released), 1 fence, 2 stale, 3 ended, 255 off.
+    pub fn kv_release(&mut self, sid: u32, ver: u32) -> u8 {
+        let Some(mut kv) = self.kv.take() else { return 255 };
+        let res = match kv.ses.get(&sid).map(|e| (e.state, e.ver)) {
+            None => {
+                kv.ses.insert(sid, KvEntry { ver, key: Vec::new(), anchor: NONE, state: 1, wait: None });
+                kv.stats.release_fence += 1;
+                1
+            }
+            Some((2, _)) => {
+                kv.stats.release_ended += 1;
+                3
+            }
+            Some((_, v)) if v > ver => {
+                kv.stats.release_stale += 1;
+                2
+            }
+            Some((st, v)) => {
+                self.kv_retire(&mut kv, sid, 1);
+                kv.ses.get_mut(&sid).unwrap().ver = ver;
+                if v < ver {
+                    kv.stats.release_fence += 1;
+                    1
+                } else {
+                    if st == 0 {
+                        kv.stats.release_applied += 1;
+                    }
+                    0
+                }
+            }
+        };
+        self.kv = Some(kv);
+        res
+    }
+
+    /// Control 'end' (trajectory END): lifetime fence; all references of the session are dropped.
+    pub fn kv_end(&mut self, sid: u32, ver: u32) {
+        let Some(mut kv) = self.kv.take() else { return };
+        kv.stats.ends += 1;
+        if kv.ses.contains_key(&sid) {
+            self.kv_retire(&mut kv, sid, 2);
+        } else {
+            kv.ses.insert(sid, KvEntry { ver, key: Vec::new(), anchor: NONE, state: 2, wait: None });
+        }
+        self.kv = Some(kv);
+    }
+
+    /// Control 'status' (#49): READY when every node from the root to the anchor holds a host copy
+    /// and the run covers the whole key (page aligned; write-through is complete at insert here).
+    /// Returns (status, ready blocks, required blocks).
+    pub fn kv_status(&self, sid: u32, ver: u32) -> (u8, u64, u64) {
+        let Some(kv) = self.kv.as_ref() else { return (KV_MISSING, 0, 0) };
+        let Some(e) = kv.ses.get(&sid) else { return (KV_MISSING, 0, 0) };
+        if e.state == 2 {
+            return (KV_ENDED, 0, 0);
+        }
+        if e.ver != ver {
+            return (KV_STALE, 0, 0);
+        }
+        if e.state == 1 {
+            return (KV_RELEASED, 0, 0);
+        }
+        let req = run_blocks(&e.key);
+        let mut ready = 0u64;
+        for &n in self.path_up(e.anchor).iter().rev() {
+            let nd = &self.nodes[n as usize];
+            if !nd.host {
+                break;
+            }
+            ready += nd.nb as u64;
+        }
+        (if ready >= req { KV_READY } else { KV_PENDING }, ready.min(req), req)
+    }
+
+    /// Host blocks in retention class 0 (known zero), all host nodes.
+    pub fn kv_class0_host_blocks(&self) -> u64 {
+        if !self.kvret {
+            return 0;
+        }
+        let mut s = 0u64;
+        let mut st = vec![ROOT];
+        while let Some(n) = st.pop() {
+            let node = &self.nodes[n as usize];
+            st.extend(node.ch.values().copied());
+            if n != ROOT && node.host && node.sc == 0 && node.known {
+                s += node.nb as u64;
+            }
+        }
+        s
+    }
+
+    /// Block intervals [start, end) of every node on any tier (for cross-worker duplicate census).
+    pub fn resident_intervals(&self, out: &mut Vec<(u64, u64)>) {
+        let mut st = vec![ROOT];
+        while let Some(n) = st.pop() {
+            let node = &self.nodes[n as usize];
+            st.extend(node.ch.values().copied());
+            if n == ROOT || !(node.host || node.dev) {
+                continue;
+            }
+            for &(s, c) in &node.runs {
+                out.push((s, s + c as u64));
+            }
+        }
+    }
+
+    /// Retention audit: [count mismatches vs the live anchors, anchors on dead nodes, registrations
+    /// with references but not live / anchor-index errors, live registrations].
+    pub fn kv_audit(&self) -> [u64; 4] {
+        let Some(kv) = self.kv.as_ref() else { return [0; 4] };
+        let mut exp: FxHashMap<NodeId, u32> = FxHashMap::default();
+        let (mut dead, mut bad, mut live) = (0u64, 0u64, 0u64);
+        for (sid, e) in &kv.ses {
+            if e.state == 0 {
+                live += 1;
+            } else if e.anchor != NONE {
+                bad += 1;
+            }
+            if e.anchor == NONE {
+                continue;
+            }
+            if !self.nodes[e.anchor as usize].alive {
+                dead += 1;
+                continue;
+            }
+            if e.anchor != ROOT && !kv.anch.get(&e.anchor).is_some_and(|v| v.contains(sid)) {
+                bad += 1;
+            }
+            for n in self.path_up(e.anchor) {
+                *exp.entry(n).or_insert(0) += 1;
+            }
+        }
+        let mut mism = 0u64;
+        let mut st = vec![ROOT];
+        while let Some(n) = st.pop() {
+            let node = &self.nodes[n as usize];
+            st.extend(node.ch.values().copied());
+            if n != ROOT && node.sc != exp.get(&n).copied().unwrap_or(0) {
+                mism += 1;
+            }
+        }
+        [mism, dead, bad, live]
+    }
+
     fn rebuild(&mut self) {
         self.dh.clear();
         self.hh.clear();
+        self.rh.clear();
         let mut st = vec![ROOT];
         while let Some(n) = st.pop() {
             let kids: Vec<NodeId> = self.nodes[n as usize].ch.values().copied().collect();
@@ -1043,6 +1764,9 @@ impl TwoTierRadix {
                 }
                 if !node.dev && !node.host {
                     return Err(format!("node {n} on no tier"));
+                }
+                if self.kvret && node.host && node.par != ROOT && !self.nodes[node.par as usize].host {
+                    return Err(format!("host node {n} under a node without a host copy"));
                 }
             }
         }
@@ -1352,6 +2076,177 @@ mod tests {
         assert_eq!(c.host_used, 8);
         let m = c.match_peek(&runs(0, 8));
         assert_eq!((m.dev, m.host), (0, 8));
+    }
+
+    /// Deepest node of the structural match of `key` and its block count.
+    fn deep(c: &mut TwoTierRadix, key: &[(u64, u32)]) -> NodeId {
+        c.match_peek(key).path.last().unwrap().0
+    }
+
+    #[test]
+    fn kv_counts_follow_the_anchor_one_count_per_session() {
+        let mut c = TwoTierRadix::new(100, 100);
+        c.enable_kvret(true);
+        c.insert(&runs(0, 8), 1.0, false);
+        assert_eq!(c.kv_admit(1, 1, &runs(0, 8)), 0);
+        let a = deep(&mut c, &runs(0, 8));
+        assert_eq!((c.node(a).sc, c.node(a).known), (1, true));
+        // Same version again (retry): no second count.
+        assert_eq!(c.kv_admit(1, 1, &runs(0, 8)), 1);
+        assert_eq!(c.node(a).sc, 1);
+        // A second session shares blocks 0..4: the anchor search splits [0..8] at 4 without touching
+        // recency; the shared upper part counts both sessions, the private rest one.
+        assert_eq!(c.kv_admit(2, 1, &[(0, 4), (100, 4)]), 0);
+        let p = c.match_peek(&runs(0, 8)).path;
+        assert_eq!(p.len(), 2);
+        let (up, lo) = (p[0].0, p[1].0);
+        assert_eq!((c.node(up).sc, c.node(lo).sc), (2, 1));
+        assert_eq!((c.node(up).last, c.node(lo).last), (1.0, 1.0), "anchor search must not touch");
+        // Session 1 version 2 extends its input: anchor stays at the deepest resident node until the
+        // request's own insert; then the new suffix gets the session's count.
+        assert_eq!(c.kv_admit(1, 2, &[(0, 8), (200, 4)]), 0);
+        assert_eq!((c.node(up).sc, c.node(lo).sc), (2, 1));
+        c.insert_kv(&[(0, 8), (200, 4)], 2.0, false, Some((1, 2, KV_FINISHED)));
+        let tail = deep(&mut c, &[(0, 8), (200, 4)]);
+        assert_eq!(c.node(tail).sc, 1);
+        assert_eq!(c.kv_status(1, 2).0, KV_READY);
+        // Version 3 diverges after block 4 (a rewrite): nodes only on the old path drop to zero and
+        // stay known (class 0); the shared part keeps one count per session.
+        assert_eq!(c.kv_admit(1, 3, &[(0, 4), (300, 4)]), 0);
+        assert_eq!((c.node(up).sc, c.node(lo).sc, c.node(tail).sc), (2, 0, 0));
+        assert!(c.node(lo).known && c.node(tail).known);
+        // An older version arriving late is fenced and changes no count.
+        assert_eq!(c.kv_admit(1, 2, &[(0, 8), (200, 4)]), 2);
+        assert_eq!((c.node(up).sc, c.node(lo).sc), (2, 0));
+        assert_eq!(c.kv_audit(), [0, 0, 0, 2]);
+        c.check().unwrap();
+    }
+
+    #[test]
+    fn kv_ready_needs_the_whole_input_on_host_and_release_end_drop_references() {
+        let key = [(0u64, 8u32)];
+        // Old P: the session's version 1 is resident and referenced.
+        let mut a = TwoTierRadix::new(100, 100);
+        a.enable_kvret(true);
+        a.kv_admit(7, 1, &key);
+        a.insert_kv(&key, 1.0, false, Some((7, 1, KV_FINISHED)));
+        // New P: version 2 arrives with nothing resident -> pending; a pull lands all but the last
+        // page (host only) -> still pending; the prefill insert completes the input -> READY.
+        let mut b = TwoTierRadix::new(100, 100);
+        b.enable_kvret(true);
+        assert_eq!(b.kv_status(7, 2).0, KV_MISSING);
+        b.kv_admit(7, 2, &key);
+        assert_eq!(b.kv_status(7, 2), (KV_PENDING, 0, 8));
+        b.insert_kv(&runs(0, 7), 2.0, true, Some((7, 2, KV_PREFETCH)));
+        assert_eq!(b.kv_status(7, 2), (KV_PENDING, 7, 8));
+        let n7 = deep(&mut b, &runs(0, 7));
+        assert_eq!(b.node(n7).sc, 1, "pull landing extends the anchor");
+        b.insert_kv(&key, 3.0, false, Some((7, 2, KV_FINISHED)));
+        assert_eq!(b.kv_status(7, 2).0, KV_READY);
+        // Release of the old version on the old P: its copy becomes known zero.
+        assert_eq!(a.kv_release(7, 1), 0);
+        let n = deep(&mut a, &key);
+        assert_eq!((a.node(n).sc, a.node(n).known), (0, true));
+        assert_eq!(a.kv_status(7, 1).0, KV_RELEASED);
+        // A stale release (older version) on the new P changes nothing.
+        assert_eq!(b.kv_release(7, 1), 2);
+        let nb_ = deep(&mut b, &key);
+        assert_eq!(b.node(nb_).sc, 1);
+        // END drops every reference and fences later arrivals.
+        b.kv_end(7, 2);
+        let nb_ = deep(&mut b, &key);
+        assert_eq!(b.node(nb_).sc, 0);
+        assert_eq!(b.kv_status(7, 2).0, KV_ENDED);
+        assert_eq!(b.kv_admit(7, 3, &key), 2);
+        // A release that overtakes the arrival installs a version fence.
+        let mut d = TwoTierRadix::new(100, 100);
+        d.enable_kvret(true);
+        assert_eq!(d.kv_release(9, 4), 1);
+        assert_eq!(d.kv_admit(9, 4, &key), 2);
+        assert_eq!(d.kv_admit(9, 5, &key), 0);
+        for t in [&a, &b, &d] {
+            assert_eq!(t.kv_audit()[..3], [0, 0, 0]);
+            t.check().unwrap();
+        }
+    }
+
+    #[test]
+    fn kv_known_zero_goes_first_even_when_newer() {
+        let mut c = TwoTierRadix::new(0, 8);
+        c.enable_kvret(true);
+        c.insert(&runs(0, 4), 1.0, false); // X: class 1 (never tagged), older
+        c.insert(&runs(10, 4), 2.0, false); // Y: tagged, then released -> class 0, newer
+        c.kv_admit(1, 1, &runs(10, 4));
+        c.kv_release(1, 1);
+        c.insert(&runs(20, 4), 3.0, false);
+        c.check().unwrap();
+        assert_eq!(c.match_peek(&runs(10, 4)).total(), 0, "known zero evicted first");
+        assert_eq!(c.match_peek(&runs(0, 4)).total(), 4, "older class-1 node kept");
+        assert_eq!(c.stats.kv_evicted_blocks, [4, 0, 0, 0]);
+        // A positive count is not a pin: with no class-0 candidate the referenced LRU node goes.
+        c.kv_admit(2, 1, &runs(0, 4));
+        c.insert(&runs(30, 4), 4.0, false);
+        c.check().unwrap();
+        assert_eq!(c.match_peek(&runs(0, 4)).total(), 0);
+        assert_eq!(c.stats.kv_evicted_blocks, [4, 0, 4, 0]);
+        // Its anchor moved to the root (on delete); counts stay consistent.
+        assert_eq!(c.kv_audit(), [0, 0, 0, 1]);
+    }
+
+    #[test]
+    fn kv_class1_keeps_leaves_before_duplicates_and_class0_mixes_them() {
+        let mut c = TwoTierRadix::new(8, 8);
+        c.enable_kvret(true);
+        c.insert(&runs(0, 4), 1.0, false); // D: GPU-backed duplicate, oldest
+        c.insert(&runs(10, 4), 2.0, true); // L: host-only leaf
+        c.insert(&runs(20, 4), 3.0, true); // N: host-only leaf, over capacity by 4
+        c.check().unwrap();
+        // Class 1 (all untagged): the host-only leaf L goes before the older duplicate D.
+        assert_eq!(c.match_peek(&runs(10, 4)).total(), 0);
+        assert_eq!(c.match_peek(&runs(0, 4)).dev, 4);
+        let d0 = deep(&mut c, &runs(0, 4));
+        assert!(c.node(d0).host);
+        assert_eq!(c.stats.kv_evicted_blocks, [0, 0, 4, 0]);
+        // D becomes known zero: class 0 mixes duplicates with leaves, so its host copy is reclaimed
+        // before the newer class-1 leaf N; the device copy stays.
+        c.kv_admit(1, 1, &runs(0, 4));
+        c.kv_release(1, 1);
+        c.insert(&runs(30, 4), 4.0, true);
+        c.check().unwrap();
+        let d = deep(&mut c, &runs(0, 4));
+        assert!(c.node(d).dev && !c.node(d).host, "duplicate host copy reclaimed, device copy kept");
+        assert_eq!(c.match_peek(&runs(20, 4)).total(), 4);
+        assert_eq!(c.stats.kv_evicted_blocks, [0, 4, 4, 0]);
+        // Device eviction of a node without a host copy deletes it.
+        c.insert(&runs(40, 8), 5.0, false);
+        c.check().unwrap();
+        assert_eq!(c.match_peek(&runs(0, 4)).total(), 0);
+        assert_eq!(c.stats.kv_devonly_deleted_blocks, 4);
+        // Flag off: base order (no class, no duplicate reclaim).
+        let mut b = TwoTierRadix::new(8, 8);
+        b.insert(&runs(0, 4), 1.0, false);
+        b.insert(&runs(10, 4), 2.0, true);
+        b.insert(&runs(20, 4), 3.0, true);
+        assert_eq!(b.match_peek(&runs(10, 4)).total(), 0);
+        assert!(b.kv.is_none() && b.stats.kv_evicted_blocks == [0; 4]);
+    }
+
+    #[test]
+    fn kv_waiting_registration_is_woken_by_another_insert_and_moves_up_on_delete() {
+        let mut c = TwoTierRadix::new(100, 100);
+        c.enable_kvret(true);
+        c.insert(&runs(0, 4), 1.0, false);
+        // Session 1 wants [0..8]; only [0..4] is resident: anchor at [0..4], waiting for block 4.
+        c.kv_admit(1, 1, &runs(0, 8));
+        let up = deep(&mut c, &runs(0, 4));
+        assert_eq!(c.node(up).sc, 1);
+        // Another request creates block 4.. (an untagged insert): the waiter advances.
+        c.insert(&runs(0, 8), 2.0, false);
+        let lo = deep(&mut c, &runs(0, 8));
+        assert_ne!(lo, up);
+        assert_eq!(c.node(lo).sc, 1);
+        assert_eq!(c.kv.as_ref().unwrap().stats.wakes, 1);
+        assert_eq!(c.kv_audit()[..3], [0, 0, 0]);
     }
 
     #[test]

@@ -15,7 +15,9 @@ use std::collections::{BinaryHeap, VecDeque};
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
-use super::cache::{DemoteScope, MatchResult, NodeId, TwoTierRadix, run_blocks, runs_prefix};
+use super::cache::{
+    DemoteScope, KV_FINISHED, KV_PREFETCH, KV_READY, MatchResult, NodeId, TwoTierRadix, run_blocks, runs_prefix,
+};
 use super::trie::{Event, PyRandom, Workload};
 use crate::replay::report::percentile_in_place;
 
@@ -289,6 +291,27 @@ pub struct SimConfig {
     /// happens when avail - local >= s2_min_tokens; it takes pull_fit time and lands like a pull.
     pub s2_read: String,
     pub s2_min_tokens: u64,
+    /// Session retention (option; sglang-private PR #49 engine + Morphosis PR #25 router, adoption
+    /// plan wf_b21a8cdb-0dc; default off = every older arm bit-identical). Session = the replay's
+    /// agent trajectory (agent state), version = its request counter (+1 per request). The router
+    /// registers (session, version) on the chosen P; the P counts one reference per session on the
+    /// anchor path of the full input (cache.rs). On a P move the old P keeps its references until the
+    /// new P reports the current version READY (the full input on the host tier, after write-through
+    /// or pull landing): the router polls the current P every kvret_poll_s and then sends 'release'
+    /// to each retired P (delivered after kvret_ctl_s). The agent's last request completing sends
+    /// 'end' to every P the session used (kvret_end). Host eviction on P: class 0 (known zero) first,
+    /// class 1 keeps the base order; #49 host recency; GPU-backed duplicates reclaimable
+    /// (kvret_dup_reclaim). D side unchanged (no tags reach D). Requires demote-source off.
+    pub kv_retention: bool,
+    /// With kv_retention: "ready_end" (default: #25 release after READY on a move + END),
+    /// "end_only" (no release on a move; END only), "recency_only" (the #49 engine without session
+    /// tags, as with SMG cache-aware: every range untracked = class 1; only the host-recency changes
+    /// and the class-1 order apply; no router control traffic).
+    pub kvret_mode: String,
+    pub kvret_poll_s: f64,
+    pub kvret_ctl_s: f64,
+    pub kvret_dup_reclaim: bool,
+    pub kvret_end: bool,
 }
 
 impl Default for SimConfig {
@@ -415,6 +438,12 @@ impl Default for SimConfig {
             d_host_ratio: 6.0,
             s2_read: "off".into(),
             s2_min_tokens: 8192,
+            kv_retention: false,
+            kvret_mode: "ready_end".into(),
+            kvret_poll_s: 0.1,
+            kvret_ctl_s: 0.01,
+            kvret_dup_reclaim: true,
+            kvret_end: true,
         }
     }
 }
@@ -451,6 +480,10 @@ enum Ev {
     LdBound(u32),
     /// Late D: re-run P's binder (an ADMIT stops counting in the window after hold_s).
     LdTick(u16),
+    /// Session retention: router READY poll; control op delivered to a P (session, P, version,
+    /// 0 release / 1 end).
+    KvTick,
+    KvCtl(u32, u16, u32, u8),
 }
 
 struct Item {
@@ -581,6 +614,8 @@ struct Req {
     dread_src: Option<u16>,
     dread_lease: Option<NodeId>,
     dread_upto: u32,
+    /// Session retention: the version the router registered for this request.
+    kv_ver: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -602,6 +637,17 @@ struct AgentState {
     cutting: bool,
     pend: f64,
     warm: Option<u32>,
+}
+
+/// Router-side session state (Morphosis #25 KvSessions): last version, current P, version held per
+/// P, pending retirements (P, version, time of the move), ended.
+#[derive(Debug, Clone, Default)]
+struct KvSess {
+    ver: u32,
+    cur: Option<u16>,
+    workers: Vec<(u16, u32)>,
+    retire: Vec<(u16, u32, f64)>,
+    ended: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -895,6 +941,39 @@ pub struct SimReport {
     pub d_local_reuse: f64,
     pub dreads_all: u64,
     pub dread_tokens_all: u64,
+    /// Session retention (0 without kv_retention). Router: releases sent [whole run, score window];
+    /// READY waits of the releases sent in the window [count, mean, p50, p90] (s, move -> release
+    /// sent); END ops [whole run, window]; retirements cancelled by a return to the P; retirements
+    /// dropped by END; status polls. Engine (all P, whole run): release outcomes [applied, fence,
+    /// stale, ended]; tracker [admits, fenced, retries, end ops, wakes, anchors moved on delete, late
+    /// marks]; host eviction by class [class 0 host-only leaf, class 0 duplicate, class 1 host-only
+    /// leaf, class 1 duplicate] in tokens (window, whole run); device-only nodes deleted (tokens);
+    /// class-0 host tokens / host pool (census mean); audit per P [count mismatches, dead anchors,
+    /// bad registrations, live registrations].
+    pub kv_releases_sent: [u64; 2],
+    pub kv_ready_wait: [f64; 4],
+    pub kv_end_ops: [u64; 2],
+    pub kv_retire_cancelled: u64,
+    pub kv_retire_dropped_end: u64,
+    pub kv_polls: u64,
+    pub kv_release_outcome: [u64; 4],
+    pub kv_tracker: [u64; 7],
+    pub kv_evicted_tokens_win: [u64; 4],
+    pub kv_evicted_tokens_all: [u64; 4],
+    pub kv_devonly_deleted_tokens: u64,
+    pub kv_class0_host_frac: f64,
+    pub kv_audit: Vec<[u64; 4]>,
+    /// Cross-P duplicates (all arms; census every 30 s in the score window): tokens resident (any
+    /// tier) on >= 2 P (mean), extra copies sum(copies - 1) (mean), token-seconds of the first over
+    /// the window, union of resident tokens over all P (mean).
+    pub dup_tokens_mean: f64,
+    pub dup_extra_tokens_mean: f64,
+    pub dup_token_s: f64,
+    pub resident_union_tokens_mean: f64,
+    /// P moves per session (agent trajectory; consecutive requests on different P, the later one
+    /// admitted in the score window): [sessions with a window request, mean moves, share with >= 1
+    /// move, p90 moves, moves per 100 window requests].
+    pub sess_moves: [f64; 5],
     pub wall_s: f64,
 }
 
@@ -995,6 +1074,20 @@ pub struct Sim<'a> {
     last_d: FxHashMap<(u64, u32), u16>,
     dreads_all: u64,
     dread_tok_all: u64,
+    /// Session retention: router sessions, sessions with pending retirements, releases sent (time,
+    /// READY wait), END op times, retirements cancelled / dropped by END, polls, control-op log
+    /// (delivery time, session, P, version, op), last generate index per (task row, agent).
+    kv_sess: FxHashMap<u32, KvSess>,
+    kv_pend: Vec<u32>,
+    kv_rel: Vec<(f64, f64)>,
+    kv_end_t: Vec<f64>,
+    kv_cancel: u64,
+    kv_drop_end: u64,
+    kv_polls: u64,
+    kv_log: Vec<(f64, u32, u16, u32, u8)>,
+    kv_lastgen: FxHashMap<(u32, u32), u32>,
+    /// Duplicate census (t, dup blocks, extra-copy blocks, union blocks, class-0 host blocks).
+    dupc: Vec<(f64, u64, u64, u64, u64)>,
     lo: f64,
     hi: f64,
 }
@@ -1076,6 +1169,9 @@ impl<'a> Sim<'a> {
             radix.record_evictions = true;
             radix.split_refresh = c.split_refresh;
             radix.split_on_match = c.split_on_match;
+            if c.kv_retention {
+                radix.enable_kvret(c.kvret_dup_reclaim);
+            }
             p.push(PW {
                 beta,
                 radix,
@@ -1119,6 +1215,22 @@ impl<'a> Sim<'a> {
                 ld_out: vec![0; c.n_d],
                 ld_last_end: -1.0,
             });
+        }
+        if c.kv_retention {
+            assert!(
+                !c.demote_source
+                    && !c.oracle_move
+                    && c.demote_defer_n == 0
+                    && c.demote_defer_t == 0.0
+                    && !c.shared_pool
+                    && c.s2_read == "off",
+                "kv_retention needs demote-source off (the engine refuses --peer-kv-demote-source with retention), \
+                 no oracle move, no deferred demote, no shared pool, no S2 read"
+            );
+            assert!(
+                matches!(c.kvret_mode.as_str(), "ready_end" | "end_only" | "recency_only"),
+                "kvret_mode: ready_end | end_only | recency_only"
+            );
         }
         if c.shared_pool {
             // IDEAL bound: P 0's tree is the one pool of all P (sizes x n_p); the others stay empty.
@@ -1216,6 +1328,16 @@ impl<'a> Sim<'a> {
             last_d: FxHashMap::default(),
             dreads_all: 0,
             dread_tok_all: 0,
+            kv_sess: FxHashMap::default(),
+            kv_pend: Vec::new(),
+            kv_rel: Vec::new(),
+            kv_end_t: Vec::new(),
+            kv_cancel: 0,
+            kv_drop_end: 0,
+            kv_polls: 0,
+            kv_log: Vec::new(),
+            kv_lastgen: FxHashMap::default(),
+            dupc: Vec::new(),
             lo,
             hi,
         }
@@ -1299,6 +1421,9 @@ impl<'a> Sim<'a> {
         if self.c.p_policy == "smgca" && self.c.smg_evict_interval_s > 0.0 {
             self.at(self.c.smg_evict_interval_s, Ev::SmgEvict);
         }
+        if self.kv_tagged() && self.c.kvret_mode == "ready_end" {
+            self.at(self.c.kvret_poll_s, Ev::KvTick);
+        }
         while let Some(it) = self.heap.pop() {
             if it.t > self.c.duration_s + 1.0 {
                 break;
@@ -1336,6 +1461,14 @@ impl<'a> Sim<'a> {
                     self.p_idle_update(t, p as usize);
                 }
                 Ev::PReady(r) => self.p_ready(t, r),
+                Ev::KvTick => {
+                    self.kv_tick(t);
+                    if t < self.c.duration_s {
+                        let dt = self.c.kvret_poll_s;
+                        self.at(t + dt, Ev::KvTick);
+                    }
+                }
+                Ev::KvCtl(sid, p, ver, op) => self.kv_ctl(t, sid, p as usize, ver, op),
                 Ev::PullDone(r) => self.pull_done(t, r),
                 Ev::DReadDone(r) => self.dread_done(t, r),
                 Ev::DemoteDue(id) => self.demote_due(id),
@@ -1392,6 +1525,9 @@ impl<'a> Sim<'a> {
                     for (i, d) in self.d.iter().enumerate() {
                         self.dstate.push((t, i as u16, d.used, d.fifo.len() as u32));
                     }
+                    let (dup, extra, uni) = self.dup_census();
+                    let c0: u64 = self.p.iter().map(|p| p.radix.kv_class0_host_blocks()).sum();
+                    self.dupc.push((t, dup, extra, uni, c0));
                     if t + 30.0 < self.hi {
                         self.at(t + 30.0, Ev::Census);
                     }
@@ -1676,6 +1812,9 @@ impl<'a> Sim<'a> {
         self.pick_p(t, r);
         if self.c.d_mode != "choose" {
             self.pick_d(r);
+        }
+        if self.kv_tagged() {
+            self.kv_route(t, r);
         }
         if self.c.pull_at_route && self.c.pull_enabled && self.reqs[r as usize].pull_src.is_some() {
             // O3: the pull starts at the routing decision (oracle, no JIT deferral).
@@ -2482,6 +2621,12 @@ impl<'a> Sim<'a> {
         self.p[p].bq.push(r);
         self.p[p].qp_next += 1;
         self.reqs[r as usize].qp_seq = self.p[p].qp_next;
+        if self.kv_tagged() {
+            // #49 note_kv_session_arrival: register (session, version) with the FULL input.
+            let (sid, ver) = (self.reqs[r as usize].agent_state, self.reqs[r as usize].kv_ver);
+            let key = self.reqs[r as usize].runs.clone();
+            self.p[p].radix.kv_admit(sid, ver, &key);
+        }
         // Arrival match / bootstrap-prefetch re-match refresh the local LRU (H5) [approx: at intake].
         let runs = self.lkey(r);
         if self.c.touch_at_intake {
@@ -2814,7 +2959,12 @@ impl<'a> Sim<'a> {
         let runs = runs_prefix(&self.reqs[r as usize].runs, upto);
         let host_only = self.c.pull_landing == "host";
         let before = self.p[dst].radix.stats.host_inserted_blocks;
-        self.p[dst].radix.insert(&runs, t, host_only);
+        let tag = if self.kv_tagged() {
+            Some((self.reqs[r as usize].agent_state, self.reqs[r as usize].kv_ver, KV_PREFETCH))
+        } else {
+            None
+        };
+        self.p[dst].radix.insert_kv(&runs, t, host_only, tag);
         self.guard_pressure(t, dst, Some(r));
         let ins = (self.p[dst].radix.stats.host_inserted_blocks - before) * bt;
         if t >= self.lo && t < self.hi {
@@ -3298,7 +3448,12 @@ impl<'a> Sim<'a> {
         }
         let x = self.rx(p);
         let before = self.p[x].radix.stats.host_inserted_blocks;
-        let path = self.p[x].radix.insert(&runs, t, false);
+        let tag = if self.kv_tagged() {
+            Some((self.reqs[r as usize].agent_state, self.reqs[r as usize].kv_ver, KV_FINISHED))
+        } else {
+            None
+        };
+        let path = self.p[x].radix.insert_kv(&runs, t, false, tag);
         self.guard_pressure(t, p, Some(r));
         let ins = (self.p[x].radix.stats.host_inserted_blocks - before) * self.c.block_tokens;
         if t >= self.lo && t < self.hi {
@@ -3460,6 +3615,9 @@ impl<'a> Sim<'a> {
             }
             return;
         }
+        if self.kv_tagged() && self.c.kvret_end && self.kv_is_last(r) {
+            self.kv_end_session(t, a);
+        }
         let (task, agent) = {
             let s = &self.agents[a as usize];
             (s.task, s.agent)
@@ -3468,6 +3626,173 @@ impl<'a> Sim<'a> {
         self.complete(task, agent, idx, t);
         self.agents[a as usize].idx += 1;
         self.agent_step(t, a);
+    }
+
+    // ------------------------------------------------------------------------------ session retention
+    /// Router registration at placement (Morphosis #25 register): version + 1 per request; on a P
+    /// change the old P's version is retired (pending until READY on the new P); a P that serves the
+    /// session again cancels its pending retirement.
+    /// Session tags are sent (retention on and not recency_only).
+    fn kv_tagged(&self) -> bool {
+        self.c.kv_retention && self.c.kvret_mode != "recency_only"
+    }
+
+    fn kv_route(&mut self, t: f64, r: u32) {
+        let sid = self.reqs[r as usize].agent_state;
+        let p = self.reqs[r as usize].p;
+        let end_only = self.c.kvret_mode == "end_only";
+        let s = self.kv_sess.entry(sid).or_default();
+        s.ver += 1;
+        let ver = s.ver;
+        if let Some(cur) = s.cur {
+            if cur != p && !end_only {
+                if let Some(&(_, wv)) = s.workers.iter().find(|w| w.0 == cur) {
+                    if !s.retire.iter().any(|x| x.0 == cur) {
+                        s.retire.push((cur, wv, t));
+                    }
+                }
+            }
+        }
+        let n0 = s.retire.len();
+        s.retire.retain(|x| x.0 != p);
+        let cancelled = (n0 - s.retire.len()) as u64;
+        s.cur = Some(p);
+        match s.workers.iter_mut().find(|w| w.0 == p) {
+            Some(w) => w.1 = ver,
+            None => s.workers.push((p, ver)),
+        }
+        let pend = !s.retire.is_empty();
+        self.kv_cancel += cancelled;
+        self.reqs[r as usize].kv_ver = ver;
+        if pend && !self.kv_pend.contains(&sid) {
+            self.kv_pend.push(sid);
+        }
+    }
+
+    /// Router background worker (#25): for sessions with pending retirements, 'status' of the
+    /// current version on the current P; READY -> 'release' of each retired (P, version).
+    fn kv_tick(&mut self, t: f64) {
+        if self.kv_pend.is_empty() {
+            return;
+        }
+        let mut pend = std::mem::take(&mut self.kv_pend);
+        pend.sort_unstable();
+        pend.dedup();
+        let dt = self.c.kvret_ctl_s;
+        let mut keep = Vec::new();
+        for sid in pend {
+            let (cur, ver, idle) = {
+                let s = &self.kv_sess[&sid];
+                (s.cur, s.ver, s.retire.is_empty() || s.ended)
+            };
+            let Some(cur) = cur else { continue };
+            if idle {
+                continue;
+            }
+            self.kv_polls += 1;
+            let (st, _, _) = self.p[cur as usize].radix.kv_status(sid, ver);
+            if st == KV_READY {
+                let items = std::mem::take(&mut self.kv_sess.get_mut(&sid).unwrap().retire);
+                for (wp, wv, t0) in items {
+                    self.at(t + dt, Ev::KvCtl(sid, wp, wv, 0));
+                    self.kv_rel.push((t, t - t0));
+                }
+            } else {
+                keep.push(sid);
+            }
+        }
+        self.kv_pend.extend(keep);
+    }
+
+    /// A control op reaches P `p`.
+    fn kv_ctl(&mut self, t: f64, sid: u32, p: usize, ver: u32, op: u8) {
+        if op == 0 {
+            self.p[p].radix.kv_release(sid, ver);
+        } else {
+            self.p[p].radix.kv_end(sid, ver);
+        }
+        self.kv_log.push((t, sid, p as u16, ver, op));
+    }
+
+    /// Whether `r` is its agent's last generate (trajectory END follows its completion).
+    fn kv_is_last(&mut self, r: u32) -> bool {
+        let (task, a, idx) = {
+            let rq = &self.reqs[r as usize];
+            (rq.task, rq.agent_state, rq.idx)
+        };
+        let row = self.tasks[task as usize].row;
+        let agent = self.agents[a as usize].agent;
+        let wl = self.wl;
+        let last = *self.kv_lastgen.entry((row, agent)).or_insert_with(|| {
+            wl.tasks[row as usize].agents[agent as usize]
+                .events
+                .iter()
+                .rposition(|e| matches!(e, Event::Generate { .. }))
+                .map(|x| x as u32)
+                .unwrap_or(u32::MAX)
+        });
+        idx == last
+    }
+
+    /// Trajectory END (#25 KvSessions::end): clear pending retirements, send 'end' to every P the
+    /// session used.
+    fn kv_end_session(&mut self, t: f64, sid: u32) {
+        let Some(s) = self.kv_sess.get_mut(&sid) else { return };
+        if s.ended {
+            return;
+        }
+        s.ended = true;
+        let dropped = s.retire.len() as u64;
+        s.retire.clear();
+        let ws = s.workers.clone();
+        self.kv_drop_end += dropped;
+        let dt = self.c.kvret_ctl_s;
+        for (wp, wv) in ws {
+            self.at(t + dt, Ev::KvCtl(sid, wp, wv, 1));
+            self.kv_end_t.push(t);
+        }
+    }
+
+    /// Cross-P duplicate census: (blocks resident on >= 2 P, sum over blocks of copies - 1, union).
+    fn dup_census(&self) -> (u64, u64, u64) {
+        let mut ev: Vec<(u64, i32)> = Vec::new();
+        let mut v: Vec<(u64, u64)> = Vec::new();
+        for w in &self.p {
+            v.clear();
+            w.radix.resident_intervals(&mut v);
+            v.sort_unstable();
+            let mut cur: Option<(u64, u64)> = None;
+            for &(a, b) in &v {
+                cur = match cur {
+                    Some((cs, ce)) if a <= ce => Some((cs, ce.max(b))),
+                    Some((cs, ce)) => {
+                        ev.push((cs, 1));
+                        ev.push((ce, -1));
+                        Some((a, b))
+                    }
+                    None => Some((a, b)),
+                };
+            }
+            if let Some((cs, ce)) = cur {
+                ev.push((cs, 1));
+                ev.push((ce, -1));
+            }
+        }
+        ev.sort_unstable();
+        let (mut cov, mut last, mut dup, mut extra, mut uni) = (0i32, 0u64, 0u64, 0u64, 0u64);
+        for (x, d) in ev {
+            let len = x - last;
+            if cov >= 2 {
+                dup += len;
+                extra += (cov - 1) as u64 * len;
+            }
+            if cov >= 1 {
+                uni += len;
+            }
+            cov += d;
+            last = x;
+        }
+        (dup, extra, uni)
     }
 
     // ------------------------------------------------------------------------------ report
@@ -4066,6 +4391,84 @@ impl<'a> Sim<'a> {
             ];
         }
         rep.wall_s = wall_s;
+        {
+            // ---- session retention, duplicate census, moves per session (output only)
+            let inw = |x: f64| x >= lo && x < hi;
+            rep.kv_releases_sent = [self.kv_rel.len() as u64, self.kv_rel.iter().filter(|x| inw(x.0)).count() as u64];
+            let mut ages: Vec<f64> = self.kv_rel.iter().filter(|x| inw(x.0)).map(|x| x.1).collect();
+            if !ages.is_empty() {
+                let m = ages.iter().sum::<f64>() / ages.len() as f64;
+                let k = ages.len() as f64;
+                rep.kv_ready_wait = [k, m, percentile_in_place(&mut ages, 50.0), percentile_in_place(&mut ages, 90.0)];
+            }
+            rep.kv_end_ops = [self.kv_end_t.len() as u64, self.kv_end_t.iter().filter(|&&x| inw(x)).count() as u64];
+            rep.kv_retire_cancelled = self.kv_cancel;
+            rep.kv_retire_dropped_end = self.kv_drop_end;
+            rep.kv_polls = self.kv_polls;
+            for w in &self.p {
+                if let Some(kv) = &w.radix.kv {
+                    let s = &kv.stats;
+                    let o = [s.release_applied, s.release_fence, s.release_stale, s.release_ended];
+                    for k in 0..4 {
+                        rep.kv_release_outcome[k] += o[k];
+                    }
+                    let tr = [s.admits, s.fenced, s.retries, s.ends, s.wakes, s.delete_moves, s.late_marks];
+                    for k in 0..7 {
+                        rep.kv_tracker[k] += tr[k];
+                    }
+                }
+                for k in 0..4 {
+                    rep.kv_evicted_tokens_all[k] += w.radix.stats.kv_evicted_blocks[k] * bt;
+                }
+                rep.kv_devonly_deleted_tokens += w.radix.stats.kv_devonly_deleted_blocks * bt;
+                for e in w.radix.evictions.iter().filter(|e| inw(e.t) && e.class < 2) {
+                    rep.kv_evicted_tokens_win[e.class as usize * 2 + e.dup as usize] += e.blocks as u64 * bt;
+                }
+                rep.kv_audit.push(w.radix.kv_audit());
+            }
+            let dc: Vec<_> = self.dupc.iter().filter(|x| inw(x.0)).collect();
+            if !dc.is_empty() {
+                let k = dc.len() as f64;
+                let b = bt as f64;
+                rep.dup_tokens_mean = dc.iter().map(|x| x.1 as f64 * b).sum::<f64>() / k;
+                rep.dup_extra_tokens_mean = dc.iter().map(|x| x.2 as f64 * b).sum::<f64>() / k;
+                rep.dup_token_s = rep.dup_tokens_mean * self.c.score_s;
+                rep.resident_union_tokens_mean = dc.iter().map(|x| x.3 as f64 * b).sum::<f64>() / k;
+                let pool = (self.c.n_p as f64 * self.c.p_host_tokens as f64).max(1.0);
+                rep.kv_class0_host_frac = dc.iter().map(|x| x.4 as f64 * b / pool).sum::<f64>() / k;
+            }
+            let mut by: FxHashMap<u32, Vec<(f64, u16)>> = FxHashMap::default();
+            for r in &self.reqs {
+                by.entry(r.agent_state).or_default().push((r.admit, r.p));
+            }
+            let mut mv: Vec<f64> = Vec::new();
+            let (mut moves, mut nreq) = (0u64, 0u64);
+            for v in by.values_mut() {
+                v.sort_by(|a, b| a.0.total_cmp(&b.0));
+                let mut m = 0u64;
+                let mut n = 0u64;
+                for i in 0..v.len() {
+                    if !inw(v[i].0) {
+                        continue;
+                    }
+                    n += 1;
+                    if i > 0 && v[i].1 != v[i - 1].1 {
+                        m += 1;
+                    }
+                }
+                if n > 0 {
+                    mv.push(m as f64);
+                    moves += m;
+                    nreq += n;
+                }
+            }
+            if !mv.is_empty() {
+                let k = mv.len() as f64;
+                let mean = mv.iter().sum::<f64>() / k;
+                let share = mv.iter().filter(|&&x| x >= 1.0).count() as f64 / k;
+                rep.sess_moves = [k, mean, share, percentile_in_place(&mut mv, 90.0), 100.0 * moves as f64 / nreq.max(1) as f64];
+            }
+        }
         let mut rows = Vec::new();
         if self.c.record_rows {
             for r in &w {
@@ -4506,5 +4909,153 @@ mod tests {
         assert!(sim.reqs.iter().all(|r| r.dread_pending == false || r.done.is_none()));
         let (rc, _) = sim.report(0.0);
         assert!(rc.dread_hit_tokens_scored > 0);
+    }
+
+    fn kv_cfg(policy: &str) -> SimConfig {
+        SimConfig { p_policy: policy.into(), kv_retention: true, split_on_match: true, ..small_cfg() }
+    }
+
+    #[test]
+    fn kv_retention_off_is_inert() {
+        let wl = synth_workload(12, 40);
+        let ct = FxHashMap::default();
+        let base = SimConfig {
+            p_policy: "eft".into(),
+            cs_workload: "true".into(),
+            pull_start: "queue".into(),
+            repull_on_admission: true,
+            queued_prefix_protect: true,
+            demote_source: true,
+            split_on_match: true,
+            ..small_cfg()
+        };
+        let go = |c: SimConfig| {
+            let mut s = Sim::new(c, &wl, &ct);
+            s.run();
+            let (r, rows) = s.report(0.0);
+            (serde_json::to_string(&r).unwrap(), rows.len())
+        };
+        let a = go(base.clone());
+        let b = go(SimConfig {
+            kvret_mode: "end_only".into(),
+            kvret_poll_s: 0.37,
+            kvret_ctl_s: 0.5,
+            kvret_dup_reclaim: false,
+            kvret_end: false,
+            ..base.clone()
+        });
+        assert_eq!(a, b, "retention knobs must be inert while kv_retention is off");
+        let mut s = Sim::new(base, &wl, &ct);
+        s.run();
+        assert!(s.p.iter().all(|w| w.radix.kv.is_none() && !w.radix.kvret));
+        assert!(s.kv_log.is_empty() && s.kv_sess.is_empty() && s.kv_rel.is_empty());
+    }
+
+    #[test]
+    fn kv_retention_releases_only_after_ready_and_ends_every_finished_session() {
+        let wl = synth_workload(12, 40);
+        let ct = FxHashMap::default();
+        // Round robin moves almost every request to another P.
+        let mut sim = Sim::new(kv_cfg("rr"), &wl, &ct);
+        sim.run();
+        let rel: Vec<_> = sim.kv_log.iter().filter(|x| x.4 == 0).copied().collect();
+        let ends: Vec<_> = sim.kv_log.iter().filter(|x| x.4 == 1).copied().collect();
+        assert!(!ends.is_empty());
+        // Every completed move (the moving request finished its prefill well before the end) is
+        // followed by a release of the old P's version.
+        let mut last: FxHashMap<u32, u16> = FxHashMap::default();
+        let mut moves_done = 0usize;
+        let mut order: Vec<&Req> = sim.reqs.iter().collect();
+        order.sort_by(|a, b| a.start.total_cmp(&b.start));
+        for q in order {
+            if let Some(&pp) = last.get(&q.agent_state) {
+                if pp != q.p && q.t_pd.is_some_and(|x| x >= 0.0 && x + 1.0 < sim.c.duration_s) {
+                    moves_done += 1;
+                }
+            }
+            last.insert(q.agent_state, q.p);
+        }
+        assert!(moves_done >= 10, "moves {moves_done}");
+        assert!(rel.len() >= moves_done, "releases {} < completed moves {moves_done}", rel.len());
+        let ctl = sim.c.kvret_ctl_s;
+        for &(t, sid, p, ver, _) in &rel {
+            // READY before the release: a newer version of the session finished its prefill (the
+            // write-through of the whole input) on another P before the release was sent.
+            let ok = sim.reqs.iter().any(|q| {
+                q.agent_state == sid
+                    && q.kv_ver > ver
+                    && q.p != p
+                    && q.t_pd.is_some_and(|x| x >= 0.0 && x <= t - ctl + 1e-9)
+            });
+            assert!(ok, "release of session {sid} v{ver} on P{p} at {t} before READY");
+        }
+        // END reaches every P the session used, and that P then reports the session ended.
+        for &(_, sid, p, ver, _) in &ends {
+            assert_eq!(sim.p[p as usize].radix.kv_status(sid, ver).0, super::super::cache::KV_ENDED);
+        }
+        let ended: FxHashSet<u32> = ends.iter().map(|x| x.1).collect();
+        for &sid in &ended {
+            let used: FxHashSet<u16> = sim.reqs.iter().filter(|q| q.agent_state == sid).map(|q| q.p).collect();
+            let got: FxHashSet<u16> = ends.iter().filter(|x| x.1 == sid).map(|x| x.2).collect();
+            assert_eq!(used, got, "session {sid}");
+        }
+        let (rep, _) = sim.report(0.0);
+        assert!(rep.kv_releases_sent[0] as usize >= rel.len());
+        assert!(rep.kv_ready_wait[0] > 0.0 && rep.kv_ready_wait[1] > 0.0, "{:?}", rep.kv_ready_wait);
+        for a in &rep.kv_audit {
+            assert_eq!(a[..3], [0, 0, 0], "{:?}", rep.kv_audit);
+        }
+        for a in &rep.per_p_audit {
+            assert_eq!(a[..3], [0, 0, 0], "{:?}", rep.per_p_audit);
+        }
+        // (Identical synthetic tasks run in lockstep, so the global round robin returns most sessions to
+        // the same P: only some sessions move.)
+        assert!(rep.sess_moves[0] > 0.0 && rep.sess_moves[2] > 0.0, "{:?}", rep.sess_moves);
+        // Sticky never moves: no release, END only.
+        let mut st = Sim::new(kv_cfg("sticky"), &wl, &ct);
+        st.run();
+        assert!(!st.kv_log.is_empty() && st.kv_log.iter().all(|x| x.4 == 1));
+        // end_only: moves send no release; END still goes out.
+        let mut eo = Sim::new(SimConfig { kvret_mode: "end_only".into(), ..kv_cfg("rr") }, &wl, &ct);
+        eo.run();
+        assert!(!eo.kv_log.is_empty() && eo.kv_log.iter().all(|x| x.4 == 1));
+        // recency_only: no tags, no control traffic, every range stays class 1.
+        let mut ro = Sim::new(SimConfig { kvret_mode: "recency_only".into(), ..kv_cfg("rr") }, &wl, &ct);
+        ro.run();
+        assert!(ro.kv_log.is_empty() && ro.kv_sess.is_empty());
+        assert!(ro.p.iter().all(|w| w.radix.kvret && w.radix.kv_class0_host_blocks() == 0));
+        let (rr, _) = ro.report(0.0);
+        assert_eq!(rr.kv_evicted_tokens_all[0] + rr.kv_evicted_tokens_all[1], 0);
+    }
+
+    #[test]
+    fn kv_retention_with_pulls_and_eviction_pressure_keeps_counts_consistent() {
+        let wl = synth_workload(12, 30);
+        let ct = FxHashMap::default();
+        let c = SimConfig {
+            cs_workload: "true".into(),
+            pull_start: "queue".into(),
+            repull_on_admission: true,
+            queued_prefix_protect: true,
+            p_dev_tokens: 131_072,
+            p_host_tokens: 262_144,
+            ..kv_cfg("eft")
+        };
+        let mut sim = Sim::new(c, &wl, &ct);
+        sim.run();
+        for w in &sim.p {
+            w.radix.check().unwrap();
+        }
+        let (rep, _) = sim.report(0.0);
+        assert!(rep.n_scored > 100, "scored {}", rep.n_scored);
+        for a in &rep.kv_audit {
+            assert_eq!(a[..3], [0, 0, 0], "{:?}", rep.kv_audit);
+        }
+        for a in &rep.per_p_audit {
+            assert_eq!(a[..3], [0, 0, 0], "{:?}", rep.per_p_audit);
+        }
+        assert!(rep.pulls_all > 0, "no pull");
+        assert!(rep.kv_evicted_tokens_all[0] + rep.kv_evicted_tokens_all[1] > 0, "{:?}", rep.kv_evicted_tokens_all);
+        assert!(rep.kv_end_ops[0] > 0);
     }
 }
