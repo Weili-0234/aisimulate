@@ -383,6 +383,35 @@ pub struct SimConfig {
     /// already sent to it that are still in transit or in its bootstrap queue (an in-flight ledger;
     /// without it, near-simultaneous decisions do not see each other).
     pub cs_eft_wait_transit: bool,
+    /// S7 PM-EFT options on the EFT path (all default off = older arms bit-identical).
+    /// H: hand-off seconds added to the predicted finish of a P when the request pulls there.
+    pub cs_eft_handoff_s: f64,
+    /// Noise-aware move margin: move only if C_o - C_w > margin_s + k * sqrt(B_o^2 + B_w^2).
+    pub cs_eft_margin_k: f64,
+    /// Owner ties (equal cached prefix) go to the P with the smaller predicted finish.
+    pub cs_eft_owner_tie_c: bool,
+    /// Owner = the P with the least backlog among P within this many tokens of the best cached
+    /// prefix (C4 no-pull tie-break; 0 = off).
+    pub cs_eft_owner_near_tokens: u64,
+    /// Predictor error on the EFT path: B and S each x exp(sigma Z) per P per decision; B also
+    /// x (1 + U(-e, e)) (backlog error).
+    pub cs_eft_noise_sigma: f64,
+    pub cs_eft_noise_queue: f64,
+    /// State age on the EFT path (s, 0 = off): B = max(0, B sampled every 0.1 s, age old, minus the
+    /// time since the sample) + seconds the router itself routed to that P since the sample.
+    pub cs_eft_state_age_s: f64,
+    /// R2 lambda-pressure (0 = off): lambda_w = lambda x (1 + gain x max(0, rate / ref - 1)), rate =
+    /// EWMA (tau) of class-1 host-evicted tok/s on the destination P ("worker") or on all P ("global").
+    pub cs_eft_lp_ref: f64,
+    pub cs_eft_lp_scope: String,
+    pub cs_eft_lp_tau_s: f64,
+    pub cs_eft_lp_gain: f64,
+    /// B2 C4-gated (0 = off): a request leaves its owner only when an item with >= big uncached
+    /// tokens and >= theta predicted seconds is queued or running on the owner.
+    pub cs_eft_gate_big_tokens: u64,
+    pub cs_eft_gate_theta_s: f64,
+    /// Multiplier on the trace's think waits (after the cap; 1.0 = as recorded). Used to match req/s.
+    pub wait_scale: f64,
 }
 
 impl Default for SimConfig {
@@ -535,6 +564,20 @@ impl Default for SimConfig {
             smg_load: "requests".into(),
             smg_abs_tokens: 0,
             cs_eft_wait_transit: false,
+            cs_eft_handoff_s: 0.0,
+            cs_eft_margin_k: 0.0,
+            cs_eft_owner_tie_c: false,
+            cs_eft_owner_near_tokens: 0,
+            cs_eft_noise_sigma: 0.0,
+            cs_eft_noise_queue: 0.0,
+            cs_eft_state_age_s: 0.0,
+            cs_eft_lp_ref: 0.0,
+            cs_eft_lp_scope: "worker".into(),
+            cs_eft_lp_tau_s: 60.0,
+            cs_eft_lp_gain: 1.0,
+            cs_eft_gate_big_tokens: 0,
+            cs_eft_gate_theta_s: 3.0,
+            wait_scale: 1.0,
         }
     }
 }
@@ -822,6 +865,10 @@ struct PW {
     ld_last_end: f64,
     /// S6: in-transit router seconds (requests sent here, not yet received).
     transit_s: f64,
+    /// S7 lambda-pressure: EWMA class-1 host-evicted tok/s, its time and the eviction-log cursor.
+    lp_rate: f64,
+    lp_t: f64,
+    lp_cur: usize,
 }
 
 struct DW {
@@ -1138,6 +1185,13 @@ pub struct SimReport {
     /// Device-evicted and device-only-deleted tokens/s over the whole run by trigger (same rows).
     pub dev_ev_cause_tok_s: [f64; 3],
     pub devonly_ev_cause_tok_s: [f64; 3],
+    /// S7 E2E split by the chain's move at the request: rows [first request of the chain, not moved,
+    /// moved without a pull, moved with a pull]: [share, mean E2E, mean TTFT, mean pulled tokens].
+    pub e2e_by_move: Vec<[f64; 4]>,
+    /// S7: mean lambda-pressure multiplier over priced pull candidates; share of decisions where the
+    /// B2 gate fired.
+    pub lp_mult_mean: f64,
+    pub gate_fire_share: f64,
     pub wall_s: f64,
 }
 
@@ -1270,6 +1324,12 @@ pub struct Sim<'a> {
     nrng: PyRandom,
     st_hist: VecDeque<(f64, Vec<u64>)>,
     st_routed: Vec<VecDeque<(f64, u64)>>,
+    /// S7 EFT state age: sampled backlog seconds and router seconds routed per P since.
+    eft_hist: VecDeque<(f64, Vec<f64>)>,
+    eft_routed: Vec<VecDeque<(f64, f64)>>,
+    /// S7: lambda-pressure multipliers used (sum, count) and gate firings (decisions, fired).
+    lp_stats: (f64, u64),
+    gate_stats: (u64, u64),
     fpi_n: Vec<u64>,
     fpi_lr: Option<Vec<(f64, f64)>>,
     wf: FxHashMap<(u64, u32), WfState>,
@@ -1303,6 +1363,7 @@ pub(crate) fn eft_secs(beta: &[f64; 5], chunk: u64, unc: u64, pre: u64, host: u6
 /// (one-way), 3 = stay because a better P needs a pull above `max_pull` (cap; 0 = no cap), 4 = stay
 /// because the owner's wait is below `burst_s` (0 = off). A move needs total + margin < owner total.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn eft_choose(
     wait: &[f64],
     own_s: &[f64],
@@ -1315,9 +1376,34 @@ pub(crate) fn eft_choose(
     max_pull: u64,
     margin_s: f64,
 ) -> (usize, u8) {
+    eft_choose_k(wait, own_s, pull_s, dup, pulled, own, excluded, burst_s, max_pull, margin_s, 0.0)
+}
+
+/// eft_choose with the S7 noise-aware margin: a move needs C_o - C_w > margin_s + k sqrt(B_o^2 + B_w^2).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn eft_choose_k(
+    wait: &[f64],
+    own_s: &[f64],
+    pull_s: &[f64],
+    dup: &[f64],
+    pulled: &[u64],
+    own: usize,
+    excluded: Option<usize>,
+    burst_s: f64,
+    max_pull: u64,
+    margin_s: f64,
+    margin_k: f64,
+) -> (usize, u8) {
     let tot = |w: usize| wait[w].max(pull_s[w]) + own_s[w] + dup[w];
     let base = tot(own);
-    let better = |w: usize| w != own && tot(w) + margin_s < base;
+    let mg = |w: usize| {
+        if margin_k > 0.0 {
+            margin_s + margin_k * (wait[own] * wait[own] + wait[w] * wait[w]).sqrt()
+        } else {
+            margin_s
+        }
+    };
+    let better = |w: usize| w != own && tot(w) + mg(w) < base;
     let pick = |ok: &dyn Fn(usize) -> bool| -> Option<usize> {
         (0..wait.len()).filter(|&w| better(w) && ok(w)).min_by(|&a, &b| tot(a).total_cmp(&tot(b)).then(a.cmp(&b)))
     };
@@ -1407,6 +1493,9 @@ impl<'a> Sim<'a> {
                 ld_out: vec![0; c.n_d],
                 ld_last_end: -1.0,
                 transit_s: 0.0,
+                lp_rate: 0.0,
+                lp_t: 0.0,
+                lp_cur: 0,
             });
         }
         if c.kv_retention {
@@ -1557,6 +1646,10 @@ impl<'a> Sim<'a> {
             nrng: PyRandom::new(0x6e01_0000 + s5_seed),
             st_hist: VecDeque::new(),
             st_routed: vec![VecDeque::new(); s5_np],
+            eft_hist: VecDeque::new(),
+            eft_routed: vec![VecDeque::new(); s5_np],
+            lp_stats: (0.0, 0),
+            gate_stats: (0, 0),
             fpi_n: vec![0; s5_np],
             fpi_lr: None,
             wf: FxHashMap::default(),
@@ -1647,7 +1740,7 @@ impl<'a> Sim<'a> {
         if self.kv_tagged() && (self.c.kvret_mode == "ready_end" || self.c.kvret_mode == "transfer_end") {
             self.at(self.c.kvret_poll_s, Ev::KvTick);
         }
-        if self.c.cs_state_age_s > 0.0 {
+        if self.c.cs_state_age_s > 0.0 || self.c.cs_eft_state_age_s > 0.0 {
             self.at(0.0, Ev::StateTick);
         }
         if self.c.cs_fpi != "off" {
@@ -1700,11 +1793,26 @@ impl<'a> Sim<'a> {
                 Ev::KvCtl(sid, p, ver, op) => self.kv_ctl(t, sid, p as usize, ver, op),
                 Ev::KvIdle(sid, ver) => self.kv_idle(t, sid, ver),
                 Ev::StateTick => {
-                    let v = self.cs_pend_now();
-                    self.st_hist.push_back((t, v));
-                    let keep = self.c.cs_state_age_s + 1.0;
-                    while self.st_hist.len() > 2 && self.st_hist[1].0 < t - keep {
-                        self.st_hist.pop_front();
+                    if self.c.cs_state_age_s > 0.0 {
+                        let v = self.cs_pend_now();
+                        self.st_hist.push_back((t, v));
+                        let keep = self.c.cs_state_age_s + 1.0;
+                        while self.st_hist.len() > 2 && self.st_hist[1].0 < t - keep {
+                            self.st_hist.pop_front();
+                        }
+                    }
+                    if self.c.cs_eft_state_age_s > 0.0 {
+                        let v: Vec<f64> = (0..self.p.len()).map(|w| self.backlog_secs(w, true)).collect();
+                        self.eft_hist.push_back((t, v));
+                        let keep = self.c.cs_eft_state_age_s + 1.0;
+                        while self.eft_hist.len() > 2 && self.eft_hist[1].0 < t - keep {
+                            self.eft_hist.pop_front();
+                        }
+                        for q in self.eft_routed.iter_mut() {
+                            while q.front().is_some_and(|x| x.0 < t - keep) {
+                                q.pop_front();
+                            }
+                        }
                     }
                     if t < self.c.duration_s {
                         self.at(t + 0.1, Ev::StateTick);
@@ -1889,7 +1997,7 @@ impl<'a> Sim<'a> {
             let e = evs[i as usize].clone();
             match e {
                 Event::Wait { seconds } => {
-                    let d = seconds.min(self.c.wait_cap_s);
+                    let d = seconds.min(self.c.wait_cap_s) * self.c.wait_scale;
                     if self.agents[a as usize].cutting {
                         self.agents[a as usize].pend = d;
                         self.complete(task, agent, i, t);
@@ -2381,21 +2489,70 @@ impl<'a> Sim<'a> {
                     let b = self.p[w].beta;
                     let pl = exp[w].saturating_sub(local[w]);
                     let host_local = local[w].saturating_sub(gpu[w].min(local[w]));
-                    wait[w] = if self.c.cs_eft_wait_transit {
+                    wait[w] = if self.c.cs_eft_state_age_s > 0.0 {
+                        self.eft_wait_stale(t, w)
+                    } else if self.c.cs_eft_wait_transit {
                         self.backlog_secs(w, true) + self.p[w].transit_s.max(0.0)
                     } else {
                         self.backlog_secs(w, false)
                     };
                     own_s[w] = eft_secs(&b, ch, l - exp[w], exp[w], host_local, pl);
+                    if self.c.cs_eft_noise_queue > 0.0 {
+                        let e = self.c.cs_eft_noise_queue;
+                        let u = self.nrng.random();
+                        wait[w] *= 1.0 + e * (2.0 * u - 1.0);
+                    }
+                    if self.c.cs_eft_noise_sigma > 0.0 {
+                        let s = self.c.cs_eft_noise_sigma;
+                        let z1 = self.ngauss();
+                        let z2 = self.ngauss();
+                        wait[w] *= (s * z1).exp();
+                        own_s[w] *= (s * z2).exp();
+                    }
                     pull_s[w] = if pl > 0 {
                         self.c.cs_eft_pull_fixed_s + self.c.cs_eft_pull_s_per_100k * pl as f64 / 1e5
                     } else {
                         0.0
                     };
-                    dup[w] = self.c.cs_eft_dup_rho * eft_secs(&b, ch, pl, 0, 0, 0)
-                        + self.c.cs_eft_dup_per_token_s * pl as f64;
+                    let lam = if self.c.cs_eft_lp_ref > 0.0 && pl > 0 {
+                        let m = self.lp_mult(t, w);
+                        self.lp_stats.0 += m;
+                        self.lp_stats.1 += 1;
+                        self.c.cs_eft_dup_per_token_s * m
+                    } else {
+                        self.c.cs_eft_dup_per_token_s
+                    };
+                    dup[w] = self.c.cs_eft_dup_rho * eft_secs(&b, ch, pl, 0, 0, 0) + lam * pl as f64;
+                    if pl > 0 {
+                        dup[w] += self.c.cs_eft_handoff_s;
+                    }
                     pulled[w] = pl;
                 }
+                let tot_w = |w: usize| wait[w].max(pull_s[w]) + own_s[w] + dup[w];
+                if self.c.cs_eft_owner_near_tokens > 0 && !self.c.cs_eft_one_way {
+                    let best = local[own_hit];
+                    let near = self.c.cs_eft_owner_near_tokens;
+                    own = (0..np)
+                        .filter(|&w| local[w] + near >= best)
+                        .min_by(|&a, &b| wait[a].total_cmp(&wait[b]).then((a != own_hit).cmp(&(b != own_hit))).then(a.cmp(&b)))
+                        .unwrap_or(own_hit);
+                } else if self.c.cs_eft_owner_tie_c && !self.c.cs_eft_one_way {
+                    let best = local[own_hit];
+                    own = (0..np)
+                        .filter(|&w| local[w] == best)
+                        .min_by(|&a, &b| tot_w(a).total_cmp(&tot_w(b)).then((a != own_hit).cmp(&(b != own_hit))).then(a.cmp(&b)))
+                        .unwrap_or(own_hit);
+                }
+                let gate_hold = if self.c.cs_eft_gate_big_tokens > 0 {
+                    let fired = self.gate_fires(own);
+                    self.gate_stats.0 += 1;
+                    if fired {
+                        self.gate_stats.1 += 1;
+                    }
+                    !fired
+                } else {
+                    false
+                };
                 let excluded = match prev {
                     Some(pv) if self.c.cs_eft_one_way
                         && self.c.cs_eft_exclude_prev
@@ -2409,7 +2566,9 @@ impl<'a> Sim<'a> {
                 };
                 // S5 FPI family: (target, pull allowed) replaces the greedy EFT choice.
                 let mut fpi_pull = true;
-                let (t_, why) = if self.c.cs_fpi != "off" {
+                let (t_, why) = if gate_hold {
+                    (own, 0)
+                } else if self.c.cs_fpi != "off" {
                     let rec_s: Vec<f64> = (0..np)
                         .map(|w| {
                             let host_local = local[w].saturating_sub(gpu[w].min(local[w]));
@@ -2420,7 +2579,7 @@ impl<'a> Sim<'a> {
                     fpi_pull = use_pull;
                     (k, if k != own { 1 } else { 0 })
                 } else {
-                    eft_choose(
+                    eft_choose_k(
                         &wait,
                         &own_s,
                         &pull_s,
@@ -2431,6 +2590,7 @@ impl<'a> Sim<'a> {
                         self.c.cs_eft_burst_wait_s,
                         self.c.cs_eft_max_pull_tokens,
                         self.c.cs_eft_margin_s,
+                        self.c.cs_eft_margin_k,
                     )
                 };
                 tgt = t_;
@@ -2494,11 +2654,16 @@ impl<'a> Sim<'a> {
         let c90 = hits.iter().filter(|&&h| 10 * h >= 9 * pt && h > 0).count() as u8;
         let rcl = self.route_class(&hits, pt);
         let lost = best.min(pt).saturating_sub(hits[tgt].min(pt));
-        if self.c.cs_eft_wait_transit {
+        if self.c.cs_eft_wait_transit || self.c.cs_eft_state_age_s > 0.0 {
             let u = self.reqs[r as usize].cs_cost.unwrap_or(pt.saturating_sub(hits[tgt].min(pt)));
             let s = eft_secs(&self.p[tgt].beta, self.c.chunk_tokens, u, pt.saturating_sub(u), 0, 0);
-            self.reqs[r as usize].transit_s = s;
-            self.p[tgt].transit_s += s;
+            if self.c.cs_eft_wait_transit {
+                self.reqs[r as usize].transit_s = s;
+                self.p[tgt].transit_s += s;
+            }
+            if self.c.cs_eft_state_age_s > 0.0 {
+                self.eft_routed[tgt].push_back((t, s));
+            }
         }
         let rq = &mut self.reqs[r as usize];
         rq.rclass = rcl;
@@ -4212,6 +4377,62 @@ impl<'a> Sim<'a> {
         }
     }
 
+    /// S7: EFT backlog seconds as sampled cs_eft_state_age_s ago, minus the time since the sample,
+    /// plus the router's own seconds routed to that P since the sample.
+    fn eft_wait_stale(&self, t: f64, w: usize) -> f64 {
+        let due = t - self.c.cs_eft_state_age_s;
+        let Some(&(ts, ref v)) = self.eft_hist.iter().rev().find(|x| x.0 <= due).or(self.eft_hist.front()) else {
+            return self.backlog_secs(w, true);
+        };
+        let own: f64 = self.eft_routed[w].iter().filter(|x| x.0 > ts).map(|x| x.1).sum();
+        (v[w] - (t - ts)).max(0.0) + own
+    }
+
+    /// S7 R2: lambda multiplier from the EWMA class-1 host-eviction rate (worker or global scope).
+    fn lp_mult(&mut self, t: f64, w: usize) -> f64 {
+        let tau = self.c.cs_eft_lp_tau_s.max(1e-3);
+        let bt = self.c.block_tokens as f64;
+        for k in 0..self.p.len() {
+            let pw = &mut self.p[k];
+            if pw.lp_t == t && pw.lp_cur == pw.radix.evictions.len() {
+                continue;
+            }
+            let dt = (t - pw.lp_t).max(0.0);
+            let mut add = 0.0;
+            for e in &pw.radix.evictions[pw.lp_cur..] {
+                if e.class == 1 {
+                    add += e.blocks as f64 * bt;
+                }
+            }
+            pw.lp_cur = pw.radix.evictions.len();
+            pw.lp_rate = pw.lp_rate * (-dt / tau).exp() + add / tau;
+            pw.lp_t = t;
+        }
+        let rate = if self.c.cs_eft_lp_scope == "global" {
+            self.p.iter().map(|p| p.lp_rate).sum::<f64>()
+        } else {
+            self.p[w].lp_rate
+        };
+        1.0 + self.c.cs_eft_lp_gain * (rate / self.c.cs_eft_lp_ref - 1.0).max(0.0)
+    }
+
+    /// S7 B2: the owner holds (queued, bootstrap or running) an item with >= big uncached tokens
+    /// whose predicted prefill is >= theta seconds.
+    fn gate_fires(&self, own: usize) -> bool {
+        let p = &self.p[own];
+        let ch = self.c.chunk_tokens;
+        let big = self.c.cs_eft_gate_big_tokens;
+        let th = self.c.cs_eft_gate_theta_s;
+        let hit = |u: u64, pt: u64| u >= big && eft_secs(&p.beta, ch, u, pt.saturating_sub(u), 0, 0) >= th;
+        p.wq.iter().chain(p.bq.iter()).any(|&r| {
+            let rq = &self.reqs[r as usize];
+            hit(rq.cs_cost.unwrap_or(rq.unc_est), rq.pt)
+        }) || p.pf_set.iter().any(|&r| {
+            let rq = &self.reqs[r as usize];
+            hit(rq.unc.saturating_sub(rq.computed), rq.pt)
+        })
+    }
+
     /// S5: backlog as sampled cs_state_age_s ago (0.1 s samples) + own charges routed since.
     fn cs_pend_stale(&self, t: f64) -> Vec<u64> {
         let due = t - self.c.cs_state_age_s;
@@ -5238,6 +5459,31 @@ impl<'a> Sim<'a> {
                     row[0] /= ns;
                 }
                 rep.deficit_by_move = dm;
+                let mut em = vec![[0.0f64; 4]; 4];
+                for q in &cmp {
+                    let g = *grp.get(&(q.agent_state, q.idx)).unwrap_or(&0) as usize;
+                    let k = match g {
+                        0 => 0,
+                        1 => 1,
+                        _ if q.pull_src.is_some() => 3,
+                        _ => 2,
+                    };
+                    em[k][0] += 1.0;
+                    em[k][1] += q.done.unwrap() - q.start;
+                    em[k][2] += q.first.unwrap() - q.start;
+                    em[k][3] += q.pulled as f64;
+                }
+                for row in em.iter_mut() {
+                    let k = row[0].max(1.0);
+                    for j in 1..4 {
+                        row[j] /= k;
+                    }
+                    row[0] /= ns;
+                }
+                rep.e2e_by_move = em;
+                rep.lp_mult_mean = if self.lp_stats.1 > 0 { self.lp_stats.0 / self.lp_stats.1 as f64 } else { 0.0 };
+                rep.gate_fire_share =
+                    if self.gate_stats.0 > 0 { self.gate_stats.1 as f64 / self.gate_stats.0 as f64 } else { 0.0 };
                 let mut hc = vec![[0.0f64; 3]; 3];
                 for w in &self.p {
                     for e in w.radix.evictions.iter().filter(|e| inw(e.t)) {
@@ -5547,6 +5793,63 @@ mod tests {
         assert!(t0.pulls_all > 0, "TRADE(0) never pulled");
         let t9 = go(trade(1.0));
         assert_eq!(t9.pulls_all, 0);
+    }
+
+    #[test]
+    fn s7_pm_eft_options_run_and_keep_counts_consistent() {
+        let wl = synth_workload(12, 30);
+        let ct = FxHashMap::default();
+        let base = SimConfig {
+            cs_workload: "true".into(),
+            p_dev_tokens: 131_072,
+            p_host_tokens: 262_144,
+            kv_retention: true,
+            kvret_mode: "transfer_end".into(),
+            pull_min_incremental_tokens: 512,
+            p_policy: "eft".into(),
+            cs_eft_one_way: false,
+            cs_eft_dup_rho: 0.0,
+            cs_eft_wait_transit: true,
+            ..kv_cfg("smgca")
+        };
+        let go = |c: SimConfig| {
+            let mut s = Sim::new(c, &wl, &ct);
+            s.run();
+            for w in &s.p {
+                w.radix.check().unwrap();
+            }
+            let (rep, _) = s.report(0.0);
+            assert!(rep.n_scored > 50, "scored {}", rep.n_scored);
+            let shares: f64 = rep.e2e_by_move.iter().map(|x| x[0]).sum();
+            assert!((shares - 1.0).abs() < 1e-9, "{shares}");
+            assert!(rep.e2e_by_move[3][0] == 0.0 || rep.pulls_all > 0);
+            rep
+        };
+        let a = go(SimConfig {
+            cs_eft_handoff_s: 0.32,
+            cs_eft_margin_k: 0.2,
+            cs_eft_owner_tie_c: true,
+            cs_eft_noise_sigma: 0.25,
+            cs_eft_noise_queue: 0.25,
+            cs_eft_lp_ref: 1.0,
+            cs_eft_lp_tau_s: 10.0,
+            ..base.clone()
+        });
+        assert!(a.lp_mult_mean == 0.0 || a.lp_mult_mean >= 1.0, "{}", a.lp_mult_mean);
+        go(SimConfig { cs_eft_state_age_s: 1.0, cs_eft_lp_ref: 1.0, cs_eft_lp_scope: "global".into(), ..base.clone() });
+        let g = go(SimConfig { cs_eft_gate_big_tokens: 1, cs_eft_gate_theta_s: 0.0, cs_eft_owner_near_tokens: 512, ..base.clone() });
+        assert!(g.gate_fire_share > 0.0 && g.gate_fire_share <= 1.0, "{}", g.gate_fire_share);
+        // A gate that never fires keeps every request on its owner: no pulls.
+        let n = go(SimConfig { cs_eft_gate_big_tokens: u64::MAX, ..base.clone() });
+        assert_eq!(n.gate_fire_share, 0.0);
+        assert_eq!(n.pulls_all, 0);
+        // A huge noise-aware margin also stops every move with a pull.
+        let m = go(SimConfig { cs_eft_margin_k: 1e9, cs_eft_margin_s: 1e9, ..base.clone() });
+        assert_eq!(m.pulls_all, 0);
+        // Slower think time lowers throughput.
+        let s1 = go(base.clone());
+        let s2 = go(SimConfig { wait_scale: 4.0, ..base.clone() });
+        assert!(s2.rps <= s1.rps + 1e-9, "{} vs {}", s2.rps, s1.rps);
     }
 
     #[test]
