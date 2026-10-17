@@ -379,6 +379,10 @@ pub struct SimConfig {
     /// (CA-U: live queued uncached tokens of each P, threshold smg_abs_tokens; smg_rel unchanged).
     pub smg_load: String,
     pub smg_abs_tokens: u64,
+    /// S6 diagnostic (EFT path): the backlog seconds of each P also count the requests the router
+    /// already sent to it that are still in transit or in its bootstrap queue (an in-flight ledger;
+    /// without it, near-simultaneous decisions do not see each other).
+    pub cs_eft_wait_transit: bool,
 }
 
 impl Default for SimConfig {
@@ -530,6 +534,7 @@ impl Default for SimConfig {
             smg_p1_classes: String::new(),
             smg_load: "requests".into(),
             smg_abs_tokens: 0,
+            cs_eft_wait_transit: false,
         }
     }
 }
@@ -685,6 +690,8 @@ struct Req {
     /// holder) and cache given up by the choice (best hit - hit on the chosen P, tokens).
     rclass: u8,
     lost: u64,
+    /// S6: router seconds charged to the target's in-transit ledger (removed at P receive).
+    transit_s: f64,
     unc_est: u64,
     ideal: u64,
     // routing / gap cause
@@ -813,6 +820,8 @@ struct PW {
     ld_sent: Vec<u32>,
     ld_out: Vec<u32>,
     ld_last_end: f64,
+    /// S6: in-transit router seconds (requests sent here, not yet received).
+    transit_s: f64,
 }
 
 struct DW {
@@ -1397,6 +1406,7 @@ impl<'a> Sim<'a> {
                 ld_sent: Vec::new(),
                 ld_out: vec![0; c.n_d],
                 ld_last_end: -1.0,
+                transit_s: 0.0,
             });
         }
         if c.kv_retention {
@@ -2371,7 +2381,11 @@ impl<'a> Sim<'a> {
                     let b = self.p[w].beta;
                     let pl = exp[w].saturating_sub(local[w]);
                     let host_local = local[w].saturating_sub(gpu[w].min(local[w]));
-                    wait[w] = self.backlog_secs(w, false);
+                    wait[w] = if self.c.cs_eft_wait_transit {
+                        self.backlog_secs(w, true) + self.p[w].transit_s.max(0.0)
+                    } else {
+                        self.backlog_secs(w, false)
+                    };
                     own_s[w] = eft_secs(&b, ch, l - exp[w], exp[w], host_local, pl);
                     pull_s[w] = if pl > 0 {
                         self.c.cs_eft_pull_fixed_s + self.c.cs_eft_pull_s_per_100k * pl as f64 / 1e5
@@ -2480,6 +2494,12 @@ impl<'a> Sim<'a> {
         let c90 = hits.iter().filter(|&&h| 10 * h >= 9 * pt && h > 0).count() as u8;
         let rcl = self.route_class(&hits, pt);
         let lost = best.min(pt).saturating_sub(hits[tgt].min(pt));
+        if self.c.cs_eft_wait_transit {
+            let u = self.reqs[r as usize].cs_cost.unwrap_or(pt.saturating_sub(hits[tgt].min(pt)));
+            let s = eft_secs(&self.p[tgt].beta, self.c.chunk_tokens, u, pt.saturating_sub(u), 0, 0);
+            self.reqs[r as usize].transit_s = s;
+            self.p[tgt].transit_s += s;
+        }
         let rq = &mut self.reqs[r as usize];
         rq.rclass = rcl;
         rq.lost = lost;
@@ -2945,6 +2965,10 @@ impl<'a> Sim<'a> {
     fn on_p_recv(&mut self, t: f64, r: u32) {
         self.reqs[r as usize].p_in = true;
         let p = self.reqs[r as usize].p as usize;
+        if self.c.cs_eft_wait_transit {
+            let s = std::mem::take(&mut self.reqs[r as usize].transit_s);
+            self.p[p].transit_s -= s;
+        }
         self.p[p].bq_n += 1;
         self.p[p].bq_tok += self.reqs[r as usize].pt;
         self.p[p].bq.push(r);
