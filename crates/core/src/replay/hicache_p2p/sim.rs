@@ -478,6 +478,9 @@ pub struct SimConfig {
     pub lpb_hold_free: bool,
     /// PRED-GWQ: extra lead (s) added to every P's lead (a deeper engine queue: + R x extra tokens).
     pub lpb_lead_extra_s: f64,
+    /// PRED-GWQ: cs_pred_noise only on the LATE-P drains, not on the TRADE (eft) arrival terms (the router build
+    /// with the E3 state for the drain only and the ledger TRADE decision).
+    pub lpb_noise_drain_only: bool,
     /// r5 bound curves (deploy mode, level 0.8): knots (s) and bounds (s) per bucket (idle, busy). Used by LATE-P
     /// and, with cs_pred_curve, by the PRED-GATE instead of k x forecast. Empty = 0.
     pub bnd_idle_k: Vec<f64>,
@@ -747,6 +750,7 @@ impl Default for SimConfig {
             lpb_bnd_scale: 1.0,
             lpb_hold_free: false,
             lpb_lead_extra_s: 0.0,
+            lpb_noise_drain_only: false,
             bnd_idle_k: Vec::new(),
             bnd_idle_b: Vec::new(),
             bnd_busy_k: Vec::new(),
@@ -3052,7 +3056,7 @@ impl<'a> Sim<'a> {
                     pidle[w] = wait[w] <= 1e-9;
                     wait0[w] = wait[w];
                     own0[w] = own_s[w];
-                    if !self.c.cs_pred_noise.is_empty() {
+                    if !self.c.cs_pred_noise.is_empty() && !self.c.lpb_noise_drain_only {
                         let u = self.nrng.random();
                         let tab = if pidle[w] && !self.c.cs_pred_noise_idle.is_empty() {
                             &self.c.cs_pred_noise_idle
