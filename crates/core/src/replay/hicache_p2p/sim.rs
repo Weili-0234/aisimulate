@@ -543,6 +543,8 @@ pub struct SimConfig {
     /// a forced move (destination +K before the landing, source -K after its release): a memory-neutral move.
     pub fm_dst: String,
     pub fm_cap_follow: bool,
+    /// P2PMEM audit ORACLE bound: fm_cap_follow for every move with a pull (not only forced ones).
+    pub cap_follow_all: bool,
 }
 
 impl Default for SimConfig {
@@ -763,6 +765,7 @@ impl Default for SimConfig {
             kvret_src_first: false,
             fm_dst: "best".into(),
             fm_cap_follow: false,
+            cap_follow_all: false,
         }
     }
 }
@@ -4180,7 +4183,7 @@ impl<'a> Sim<'a> {
             None
         };
         // P2PMEM audit: a memory-neutral forced move carries the host capacity of its pulled blocks.
-        let follow = self.c.fm_cap_follow && self.reqs[r as usize].forced;
+        let follow = (self.c.fm_cap_follow && self.reqs[r as usize].forced) || self.c.cap_follow_all;
         let pib = self.reqs[r as usize].pull_issue_blocks;
         if follow {
             self.p[dst].radix.host_cap += pib;
