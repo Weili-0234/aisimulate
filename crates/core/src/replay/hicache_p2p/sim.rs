@@ -481,6 +481,9 @@ pub struct SimConfig {
     /// PRED-GWQ: cs_pred_noise only on the LATE-P drains, not on the TRADE (eft) arrival terms (the router build
     /// with the E3 state for the drain only and the ledger TRADE decision).
     pub lpb_noise_drain_only: bool,
+    /// PRED-GWQ: the forecast may make a P look emptier than the router ledger, never fuller: drain =
+    /// min(forecast drain, noise-free ledger drain) for the open test and the finish estimate (work-conserving floor).
+    pub lpb_floor: bool,
     /// r5 bound curves (deploy mode, level 0.8): knots (s) and bounds (s) per bucket (idle, busy). Used by LATE-P
     /// and, with cs_pred_curve, by the PRED-GATE instead of k x forecast. Empty = 0.
     pub bnd_idle_k: Vec<f64>,
@@ -751,6 +754,7 @@ impl Default for SimConfig {
             lpb_hold_free: false,
             lpb_lead_extra_s: 0.0,
             lpb_noise_drain_only: false,
+            lpb_floor: false,
             bnd_idle_k: Vec::new(),
             bnd_idle_b: Vec::new(),
             bnd_busy_k: Vec::new(),
@@ -5446,8 +5450,18 @@ impl<'a> Sim<'a> {
                 break;
             }
             let d: Vec<f64> = (0..np).map(|w| self.lpb_drain(t, w)).collect();
-            let dlo: Vec<f64> =
+            let mut dlo: Vec<f64> =
                 (0..np).map(|w| (d[w] - self.c.lpb_bnd_scale * self.lpb_bound(false, d[w])).max(0.0)).collect();
+            let d = if self.c.lpb_floor {
+                // Noise-free ledger drain (lpb_drain without the forecast-error factor).
+                let d0: Vec<f64> = (0..np).map(|w| d[w] / self.p[w].lpb_nf.max(1e-9)).collect();
+                for w in 0..np {
+                    dlo[w] = dlo[w].min(d0[w]);
+                }
+                (0..np).map(|w| d[w].min(d0[w])).collect::<Vec<f64>>()
+            } else {
+                d
+            };
             let ti: Vec<f64> = (0..np).map(|w| self.lpb_titer(w)).collect();
             // Cheap pre-check: can any P open for the largest lead in the queue (largest prompt, full pull)?
             let ptmax = self.lpb_q.iter().map(|&r| self.reqs[r as usize].pt).max().unwrap_or(0);
