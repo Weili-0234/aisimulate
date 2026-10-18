@@ -471,6 +471,13 @@ pub struct SimConfig {
     /// Sensitivity: receipt-delay forecast x scale; dispatch bound x scale (0 = trust the forecast).
     pub lpb_rx_scale: f64,
     pub lpb_bnd_scale: f64,
+    /// PRED-GWQ (2026-10-18, default off): predicted-drain fill. Only a request that is free to go to any P enters
+    /// the LATE-P router queue; a request whose largest local hit exceeds the second largest by at least
+    /// chunk_tokens (bound to its owner) takes the normal P choice (p_policy eft = TRADE) at arrival and waits in the
+    /// engine queue (queued prefix protected, as without the router queue).
+    pub lpb_hold_free: bool,
+    /// PRED-GWQ: extra lead (s) added to every P's lead (a deeper engine queue: + R x extra tokens).
+    pub lpb_lead_extra_s: f64,
     /// r5 bound curves (deploy mode, level 0.8): knots (s) and bounds (s) per bucket (idle, busy). Used by LATE-P
     /// and, with cs_pred_curve, by the PRED-GATE instead of k x forecast. Empty = 0.
     pub bnd_idle_k: Vec<f64>,
@@ -738,6 +745,8 @@ impl Default for SimConfig {
             lpb_tick_s: 0.02,
             lpb_rx_scale: 1.0,
             lpb_bnd_scale: 1.0,
+            lpb_hold_free: false,
+            lpb_lead_extra_s: 0.0,
             bnd_idle_k: Vec::new(),
             bnd_idle_b: Vec::new(),
             bnd_busy_k: Vec::new(),
@@ -1470,6 +1479,8 @@ pub struct SimReport {
     /// move with pull, move without pull, full scans].
     pub lpb_stats: [f64; 8],
     pub lpb_counts: [u64; 6],
+    /// PRED-GWQ (lpb_hold_free): arrivals bound to their owner that skipped the router queue (whole run).
+    pub lpb_bypassed: u64,
     /// PRED-EFT+HOL shadow (whole run): [gate decisions, the other HOL form picks another P, big cold requests
     /// (uncached on the owner >= 32,768 and best hit < the pull floor), big cold and differ, differ with the selected
     /// form's P less loaded, differ with the selected form keeping the owner].
@@ -1675,6 +1686,7 @@ pub struct Sim<'a> {
     lpb_rx: [f64; 4],
     lpb_rx_n: [u64; 2],
     lpb_counts: [u64; 6],
+    lpb_bypassed: u64,
     hol_hist: Vec<VecDeque<(f64, f64)>>,
     hol_sh: [u64; 6],
     iww: [f64; 3],
@@ -2085,6 +2097,7 @@ impl<'a> Sim<'a> {
             lpb_rx: [0.0; 4],
             lpb_rx_n: [0; 2],
             lpb_counts: [0; 6],
+            lpb_bypassed: 0,
             hol_hist: vec![VecDeque::new(); s5_np],
             hol_sh: [0; 6],
             iww: [0.0; 3],
@@ -2635,8 +2648,30 @@ impl<'a> Sim<'a> {
         p.snap + p.recent.iter().filter(|&&(tt, _)| tt >= st).map(|&(_, x)| x).sum::<u64>()
     }
 
+    /// PRED-GWQ: request r is bound to its owner (largest local hit - second largest >= chunk_tokens).
+    fn lpb_bound_to_owner(&mut self, r: u32) -> bool {
+        let bt = self.c.block_tokens;
+        let l = self.reqs[r as usize].pt;
+        let runs = self.reqs[r as usize].runs.clone();
+        let (mut h1, mut h2) = (0u64, 0u64);
+        for w in 0..self.p.len() {
+            let h = (self.p[w].radix.match_peek(&runs).total() as u64 * bt).min(l);
+            if h > h1 {
+                h2 = h1;
+                h1 = h;
+            } else if h > h2 {
+                h2 = h;
+            }
+        }
+        h1 - h2 >= self.c.chunk_tokens
+    }
+
     fn route(&mut self, t: f64, r: u32) {
-        if self.c.lpb && self.force_tgt.is_none() {
+        let lpb_bypass = self.c.lpb && self.c.lpb_hold_free && self.force_tgt.is_none() && self.lpb_bound_to_owner(r);
+        if lpb_bypass {
+            self.lpb_bypassed += 1;
+        }
+        if self.c.lpb && self.force_tgt.is_none() && !lpb_bypass {
             // LATE-P: the request enters the router queue; the dispatcher decides when and where.
             if !self.reqs[r as usize].warm {
                 let a = self.reqs[r as usize].agent_state;
@@ -5414,7 +5449,7 @@ impl<'a> Sim<'a> {
             let ptmax = self.lpb_q.iter().map(|&r| self.reqs[r as usize].pt).max().unwrap_or(0);
             let (rm, bm) = self.lpb_lead_parts(ptmax);
             let pm = self.c.cs_eft_pull_fixed_s + self.c.cs_eft_pull_s_per_100k * ptmax as f64 / 1e5;
-            if (0..np).all(|w| dlo[w] > rm + bm.max(pm) + ti[w]) {
+            if (0..np).all(|w| dlo[w] > rm + bm.max(pm) + ti[w] + self.c.lpb_lead_extra_s) {
                 break;
             }
             self.lpb_counts[5] += 1;
@@ -5442,7 +5477,8 @@ impl<'a> Sim<'a> {
                 let c = &cands[i];
                 let (o, cold, s, ps, dup, pt) = (c.own, c.cold, &c.s0, &c.ps, &c.dup, c.pt);
                 let (recv, boot) = self.lpb_lead_parts(pt);
-                let lead = |w: usize| recv + boot.max(ps[w]) + ti[w];
+                let extra = self.c.lpb_lead_extra_s;
+                let lead = |w: usize| recv + boot.max(ps[w]) + ti[w] + extra;
                 let open = |w: usize| dlo[w] <= lead(w);
                 let cw = |w: usize| d[w].max(recv + boot.max(ps[w])) + s[w];
                 if cold {
@@ -6862,6 +6898,7 @@ impl<'a> Sim<'a> {
                     let c = |k: u8| cmp.iter().filter(|q| q.lpb_cls == k).count() as f64 / ns;
                     rep.lpb_stats = [m, p50, p95, c(1), c(2), c(3), self.lpb_rx[0], self.lpb_rx[2]];
                     rep.lpb_counts = self.lpb_counts;
+                    rep.lpb_bypassed = self.lpb_bypassed;
                 }
                 rep.hol_shadow = self.hol_sh;
                 if self.c.iww_metric {
@@ -7453,6 +7490,30 @@ mod tests {
         assert!(f.rps > 0.0 && h.rps > 0.0);
         // Zero bound and zero receipt forecast still dispatch everything.
         go(SimConfig { lpb_bnd_scale: 0.0, lpb_rx_scale: 0.0, ..base.clone() });
+        // PRED-GWQ: only free requests enter the router queue; bound ones take the TRADE path at arrival.
+        {
+            let c = SimConfig {
+                lpb_order: "hrrn".into(),
+                lpb_moves: false,
+                lpb_hold_free: true,
+                lpb_lead_extra_s: 0.6,
+                ..base.clone()
+            };
+            let mut s = Sim::new(c, &wl, &ct);
+            s.run();
+            for w in &s.p {
+                w.radix.check().unwrap();
+            }
+            let (rep, _) = s.report(0.0);
+            assert!(rep.n_scored > 50, "scored {}", rep.n_scored);
+            let k = rep.lpb_counts;
+            assert_eq!(k[0], k[1] + k[2] + k[3] + k[4], "{k:?}");
+            assert_eq!(k[3] + k[4], 0, "no moves");
+            assert!(rep.lpb_bypassed + k[0] > 0);
+            let sh = rep.lpb_stats[3] + rep.lpb_stats[4] + rep.lpb_stats[5];
+            assert!(sh <= 1.0 + 1e-9, "{:?}", rep.lpb_stats);
+            assert!(s.lpb_q.iter().all(|&r| s.reqs[r as usize].start > s.c.duration_s - 60.0), "{}", s.lpb_q.len());
+        }
         // PRED-EFT+HOL with the r5 curve bound runs on the EFT path.
         let c = go(SimConfig {
             lpb: false,
