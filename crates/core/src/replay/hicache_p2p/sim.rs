@@ -530,6 +530,13 @@ pub struct SimConfig {
     /// first prefill pass takes inj_s more seconds (no cache effect). 0 = off.
     pub inj_rate: f64,
     pub inj_s: f64,
+    /// P2PMEM audit (2026-10-18; options, NOT engine behaviour; default off = every older arm bit-identical; need
+    /// kv_retention with kvret_mode "transfer_end"). At the transfer_end source release of a move with a pull:
+    /// kvret_move_free = TRUE MOVE: the released class-0 source copy (the transferred prefix and the subtree below
+    /// it) is freed on both tiers at once (TwoTierRadix::kv_move_free); kvret_src_first = the released class-0
+    /// source copy becomes the first host-eviction candidate (TwoTierRadix::kv_src_first; device tier unchanged).
+    pub kvret_move_free: bool,
+    pub kvret_src_first: bool,
 }
 
 impl Default for SimConfig {
@@ -746,6 +753,8 @@ impl Default for SimConfig {
             fm_min_tokens: 32_768,
             inj_rate: 0.0,
             inj_s: 1.0,
+            kvret_move_free: false,
+            kvret_src_first: false,
         }
     }
 }
@@ -1905,6 +1914,11 @@ impl<'a> Sim<'a> {
             c.kvret_idle_s <= 0.0 || (c.kv_retention && c.kvret_mode != "recency_only"),
             "kvret_idle_s needs kv_retention with session tags"
         );
+        assert!(
+            !(c.kvret_move_free || c.kvret_src_first) || (c.kv_retention && c.kvret_mode == "transfer_end"),
+            "kvret_move_free / kvret_src_first need kv_retention with kvret_mode transfer_end"
+        );
+        assert!(!(c.kvret_move_free && c.kvret_src_first), "kvret_move_free and kvret_src_first are exclusive");
         assert!(!(c.pull_free_capacity && c.shared_pool), "pull_free_capacity needs per-P pools");
         assert!(matches!(c.cs_move_mode.as_str(), "pull" | "recompute"), "cs_move_mode: pull | recompute");
         assert!(
@@ -4968,6 +4982,16 @@ impl<'a> Sim<'a> {
         let Some(i) = s.retire.iter().position(|x| x.0 as usize == src) else { return };
         let (wp, wv, t0) = s.retire.remove(i);
         self.p[src].radix.kv_release(sid, wv);
+        if self.c.kvret_move_free || self.c.kvret_src_first {
+            // P2PMEM audit: the released source copy of the transferred prefix is freed / put first in eviction order.
+            let upto = self.reqs[r as usize].pull_upto;
+            let leased = runs_prefix(&self.reqs[r as usize].runs, upto);
+            if self.c.kvret_move_free {
+                self.p[src].radix.kv_move_free(&leased);
+            } else {
+                self.p[src].radix.kv_src_first(&leased);
+            }
+        }
         self.kv_log.push((t, sid, wp, wv, 2));
         self.kv_rel.push((t, t - t0, 1));
     }

@@ -924,6 +924,76 @@ impl TwoTierRadix {
         (freed, flagged)
     }
 
+    /// P2PMEM audit (option, NOT engine behaviour): nodes of the released source copy of a transferred prefix, in
+    /// free order. Read-only match of `runs`; the subtree under the deepest matched node (children before parents),
+    /// then the matched path upward. Only retention class-0 nodes (no session covers them, known) are returned; the
+    /// upward walk stops at the first node that is not class 0.
+    fn kv_released_nodes(&mut self, runs: &[(u64, u32)]) -> Vec<NodeId> {
+        let m = self.walk(runs, None, false);
+        let Some(&(deep, _)) = m.path.last() else { return Vec::new() };
+        let c0 = |n: &Node| n.alive && n.sc == 0 && n.known;
+        let mut pre: Vec<NodeId> = Vec::new();
+        let mut st = vec![deep];
+        while let Some(n) = st.pop() {
+            pre.push(n);
+            st.extend(self.nodes[n as usize].ch.values().copied());
+        }
+        let mut out: Vec<NodeId> = pre.iter().rev().copied().filter(|&n| c0(&self.nodes[n as usize])).collect();
+        if c0(&self.nodes[deep as usize]) {
+            let mut n = self.nodes[deep as usize].par;
+            while n != NONE && n != ROOT && c0(&self.nodes[n as usize]) {
+                out.push(n);
+                n = self.nodes[n as usize].par;
+            }
+        }
+        out
+    }
+
+    /// P2PMEM audit (i) TRUE MOVE (option, NOT engine behaviour): right after the source release of a transferred
+    /// prefix, free the released source copy on both tiers. Nodes from `kv_released_nodes` are deleted deepest
+    /// first when they have no remaining child and no lock / lease / host lock; a node that cannot go stays.
+    /// Returns (freed blocks, freed nodes); counted in stats.moved_freed_blocks.
+    pub fn kv_move_free(&mut self, runs: &[(u64, u32)]) -> (u64, u64) {
+        if !self.kvret {
+            return (0, 0);
+        }
+        let (mut fb, mut fnn) = (0u64, 0u64);
+        for id in self.kv_released_nodes(runs) {
+            let n = &self.nodes[id as usize];
+            if !n.alive || !n.ch.is_empty() || n.pinned() || n.host_pinned() || n.par == NONE {
+                continue;
+            }
+            self.kv_on_delete(id);
+            fb += self.drop_node(id);
+            fnn += 1;
+        }
+        self.stats.moved_freed_blocks += fb;
+        (fb, fnn)
+    }
+
+    /// P2PMEM audit (iii) SOURCE COPY FIRST (option, NOT engine behaviour): right after the source release of a
+    /// transferred prefix, the released class-0 nodes of the source copy get the lowest host recency, so they are
+    /// the first host-eviction candidates (before older class-0 data). Device tier unchanged. Returns (flagged
+    /// blocks, flagged nodes); counted in stats.moved_flagged_blocks.
+    pub fn kv_src_first(&mut self, runs: &[(u64, u32)]) -> (u64, u64) {
+        if !self.kvret {
+            return (0, 0);
+        }
+        let (mut fb, mut fnn) = (0u64, 0u64);
+        for id in self.kv_released_nodes(runs) {
+            let n = &mut self.nodes[id as usize];
+            if !n.host {
+                continue;
+            }
+            n.hlast = -1.0;
+            fb += n.nb as u64;
+            fnn += 1;
+            self.push_r(id);
+        }
+        self.stats.moved_flagged_blocks += fb;
+        (fb, fnn)
+    }
+
     /// Remove an unpinned leaf node from both tiers (oracle O2 only).
     fn drop_node(&mut self, id: NodeId) -> u64 {
         let (nb, par, key, dev, host) = {
@@ -2270,6 +2340,44 @@ mod tests {
             assert_eq!(t.kv_audit()[..3], [0, 0, 0]);
             t.check().unwrap();
         }
+    }
+
+    #[test]
+    fn p2pmem_move_free_and_src_first_touch_only_released_class0_nodes() {
+        // Session 1 covers [0..8) + [100..4); session 2 shares [0..4). Session 1 is released (moved away).
+        let build = |dev: u64| {
+            let mut c = TwoTierRadix::new(dev, 100);
+            c.enable_kvret(true);
+            c.kv_admit(1, 1, &[(0, 8), (100, 4)]);
+            c.insert_kv(&[(0, 8), (100, 4)], 1.0, false, Some((1, 1, KV_FINISHED)));
+            c.kv_admit(2, 1, &[(0, 4), (200, 4)]);
+            c.insert_kv(&[(0, 4), (200, 4)], 2.0, false, Some((2, 1, KV_FINISHED)));
+            assert_eq!(c.kv_release(1, 1), 0);
+            c
+        };
+        // True move: the released private part [4..8) + [100..4) (one node, 8 blocks) is freed on both tiers; the
+        // shared [0..4) (session 2 still covers it) stays.
+        let mut c = build(100);
+        let used = (c.host_used, c.dev_used);
+        assert_eq!(c.kv_move_free(&runs(0, 8)), (8, 1));
+        assert_eq!((c.host_used, c.dev_used), (used.0 - 8, used.1 - 8));
+        assert_eq!(c.match_peek(&[(0, 8), (100, 4)]).total(), 4);
+        assert_eq!(c.match_peek(&[(0, 4), (200, 4)]).total(), 8, "session 2 intact");
+        assert_eq!(c.kv_audit()[..3], [0, 0, 0]);
+        assert_eq!(c.stats.moved_freed_blocks, 8);
+        c.check().unwrap();
+        // Source first (host-only pool): the released node goes before an older class-0 node.
+        let mut d = build(0);
+        d.kv_admit(3, 1, &runs(500, 4));
+        d.insert_kv(&runs(500, 4), 0.5, false, Some((3, 1, KV_FINISHED)));
+        d.kv_end(3, 1);
+        assert_eq!(d.kv_src_first(&runs(0, 8)), (8, 1));
+        d.host_cap = d.host_used - 4;
+        d.evict_host(3.0);
+        assert_eq!(d.match_peek(&runs(500, 4)).total(), 4, "older class-0 node kept");
+        assert_eq!(d.match_peek(&[(0, 8), (100, 4)]).total(), 4, "released node evicted first");
+        assert_eq!(d.stats.kv_evicted_blocks, [8, 0, 0, 0]);
+        d.check().unwrap();
     }
 
     #[test]
