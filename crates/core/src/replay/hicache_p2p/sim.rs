@@ -537,6 +537,12 @@ pub struct SimConfig {
     /// source copy becomes the first host-eviction candidate (TwoTierRadix::kv_src_first; device tier unchanged).
     pub kvret_move_free: bool,
     pub kvret_src_first: bool,
+    /// P2PMEM audit, forced-move probe variants (options, NOT engine behaviour; defaults keep every older arm):
+    /// fm_dst = target of a forced move among the non-owner P with a pull: "best" (least price-free total, the LAMBDA
+    /// probe), "random", "worst" (largest total); fm_cap_follow = the host capacity of the pulled blocks moves with
+    /// a forced move (destination +K before the landing, source -K after its release): a memory-neutral move.
+    pub fm_dst: String,
+    pub fm_cap_follow: bool,
 }
 
 impl Default for SimConfig {
@@ -755,6 +761,8 @@ impl Default for SimConfig {
             inj_s: 1.0,
             kvret_move_free: false,
             kvret_src_first: false,
+            fm_dst: "best".into(),
+            fm_cap_follow: false,
         }
     }
 }
@@ -1480,6 +1488,9 @@ pub struct SimReport {
     pub q_bp_win: [f64; 3],
     pub lam_used: [f64; 2],
     pub fm: [f64; 5],
+    /// P2PMEM audit: per-P host capacity at the end (tokens) and host capacity moved by fm_cap_follow (tokens).
+    pub p_host_cap_end: Vec<u64>,
+    pub cap_moved_tokens: u64,
     pub inj: [u64; 2],
     pub ghost_per_req: f64,
     pub wall_s: f64,
@@ -1677,6 +1688,8 @@ pub struct Sim<'a> {
     lam_win: Vec<[f64; 14]>,
     lam_used: (f64, u64, f64, u64),
     fm_rng: PyRandom,
+    /// P2PMEM audit: host capacity blocks moved by fm_cap_follow (whole run).
+    cap_moved: u64,
     fm_elig: u64,
     fm_n: [u64; 2],
     fm_tok_win: u64,
@@ -1919,6 +1932,7 @@ impl<'a> Sim<'a> {
             "kvret_move_free / kvret_src_first need kv_retention with kvret_mode transfer_end"
         );
         assert!(!(c.kvret_move_free && c.kvret_src_first), "kvret_move_free and kvret_src_first are exclusive");
+        assert!(matches!(c.fm_dst.as_str(), "best" | "random" | "worst"), "fm_dst: best | random | worst");
         assert!(!(c.pull_free_capacity && c.shared_pool), "pull_free_capacity needs per-P pools");
         assert!(matches!(c.cs_move_mode.as_str(), "pull" | "recompute"), "cs_move_mode: pull | recompute");
         assert!(
@@ -2079,6 +2093,7 @@ impl<'a> Sim<'a> {
             lam_win: Vec::new(),
             lam_used: (0.0, 0, 0.0, 0),
             fm_rng: PyRandom::new(0x4c41_0000 + s5_seed),
+            cap_moved: 0,
             fm_elig: 0,
             fm_n: [0; 2],
             fm_tok_win: 0,
@@ -3205,6 +3220,19 @@ impl<'a> Sim<'a> {
                             self.fm_elig += 1;
                             let u = self.fm_rng.random();
                             if u < self.c.fm_rate {
+                                // P2PMEM audit: fm_dst picks the forced target among the non-owner P with a pull.
+                                let cands: Vec<usize> = (0..np).filter(|&w| w != own && pulled[w] > 0).collect();
+                                let b = match self.c.fm_dst.as_str() {
+                                    "random" => {
+                                        let v = self.fm_rng.random();
+                                        cands[((v * cands.len() as f64) as usize).min(cands.len() - 1)]
+                                    }
+                                    "worst" => *cands
+                                        .iter()
+                                        .max_by(|&&x, &&y| tot0(x).total_cmp(&tot0(y)).then(y.cmp(&x)))
+                                        .unwrap(),
+                                    _ => b,
+                                };
                                 tgt = b;
                                 let g = tot0(own) - tot0(b);
                                 let rq = &mut self.reqs[r as usize];
@@ -4151,6 +4179,12 @@ impl<'a> Sim<'a> {
         } else {
             None
         };
+        // P2PMEM audit: a memory-neutral forced move carries the host capacity of its pulled blocks.
+        let follow = self.c.fm_cap_follow && self.reqs[r as usize].forced;
+        let pib = self.reqs[r as usize].pull_issue_blocks;
+        if follow {
+            self.p[dst].radix.host_cap += pib;
+        }
         // S3 (d): the pulled pages are outside the destination's host capacity (no displacement).
         self.p[dst].radix.pf_mark = self.c.pull_free_capacity;
         self.p[dst].radix.ev_cause = 1;
@@ -4160,6 +4194,11 @@ impl<'a> Sim<'a> {
         if self.c.kv_retention && self.c.kvret_mode == "transfer_end" {
             // The destination took its +1 at this commit (insert_kv tag); release the source now.
             self.kv_transfer_release(t, r, src);
+        }
+        if follow {
+            self.p[src].radix.host_cap = self.p[src].radix.host_cap.saturating_sub(pib);
+            self.p[src].radix.evict_host(t);
+            self.cap_moved += pib;
         }
         self.guard_pressure(t, dst, Some(r));
         let ins = (self.p[dst].radix.stats.host_inserted_blocks - before) * bt;
@@ -6981,6 +7020,8 @@ impl<'a> Sim<'a> {
         let nf = self.fm_n[1].max(1) as f64;
         rep.fm = [self.fm_elig as f64, self.fm_n[0] as f64, self.fm_n[1] as f64, self.fm_tok_win as f64 / nf, self.fm_gain_win / nf];
         rep.inj = self.inj_n;
+        rep.p_host_cap_end = self.p.iter().map(|p| p.radix.host_cap * self.c.block_tokens).collect();
+        rep.cap_moved_tokens = self.cap_moved * self.c.block_tokens;
         rep.ghost_per_req = cmp.iter().map(|r| r.ghost as f64).sum::<f64>() / cmp.len().max(1) as f64;
         let mut rows = Vec::new();
         if self.c.record_rows {
