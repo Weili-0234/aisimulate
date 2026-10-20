@@ -110,6 +110,12 @@ pub struct SimConfig {
     /// D step model (ms) [a, b, c, k, d]: a + b B + c (1 - exp(k B)) + d S / 1e6 (B = batch, S = summed context tokens).
     /// Empty = the GB300 GLM-5.2 fit (9.71, 0.467, 10.59, 6 ln(1 - 8/256), 0.996). CUA 2026-10-20: Kimi-K2.6 fit.
     pub d_step: Vec<f64>,
+    /// P pass model extra terms (CUA vision, 2026-10-20; both 0 = off): p_req_s seconds per request in a pass (each pass
+    /// a request takes part in), p_img_s seconds per image encoded in a pass. An image is encoded in the pass that holds
+    /// its first uncached token (images wholly inside the cached prefix are not encoded; workload
+    /// recorded_image_token_runs). With cs_router_beta empty the router view includes both terms (exact model).
+    pub p_req_s: f64,
+    pub p_img_s: f64,
     // ---- router P
     /// "smgca" | "cosched" | "sticky" | "rr" | "eft" | "ideal_eft" (the last two: SWEEP-PDLOAD variants)
     pub p_policy: String,
@@ -614,6 +620,8 @@ impl Default for SimConfig {
             tpot_fb: true,
             d_step: Vec::new(),
             cs_router_beta: Vec::new(),
+            p_req_s: 0.0,
+            p_img_s: 0.0,
             p_policy: "smgca".into(),
             smg_threshold: 0.3,
             smg_abs: 64,
@@ -892,6 +900,8 @@ struct Req {
     dec_lb: f64,
     runs: Vec<(u64, u32)>,
     pt: u64,
+    /// (first token, token count) per image in the prompt (sorted; empty = text only).
+    imgs: Vec<(u32, u32)>,
     #[allow(dead_code)]
     maxt: u32,
     ct: u32,
@@ -1754,6 +1764,25 @@ pub(crate) fn eft_secs(beta: &[f64; 5], chunk: u64, unc: u64, pre: u64, host: u6
         + beta[4] * pulled as f64 / 1e5
 }
 
+/// Images encoded in the pass chunk [a, b) of a request whose first uncached token is c0: image i (sorted,
+/// non-overlapping (first token, count)) is encoded at max(first token, c0) if it has uncached tokens.
+pub(crate) fn imgs_in_chunk(imgs: &[(u32, u32)], c0: u64, a: u64, b: u64) -> u64 {
+    if imgs.is_empty() || b <= a {
+        return 0;
+    }
+    let j0 = imgs.partition_point(|&(s, l)| s as u64 + l as u64 <= c0);
+    let rest = &imgs[j0..];
+    let k0 = rest.partition_point(|&(s, _)| (s as u64).max(c0) < a);
+    let k1 = rest.partition_point(|&(s, _)| (s as u64).max(c0) < b);
+    k1.saturating_sub(k0) as u64
+}
+
+/// Images with uncached tokens in a prompt whose first uncached token is c0 (router view).
+pub(crate) fn imgs_uncached(imgs: &[(u32, u32)], c0: u64) -> u64 {
+    let j0 = imgs.partition_point(|&(s, l)| s as u64 + l as u64 <= c0);
+    (imgs.len() - j0) as u64
+}
+
 /// EFT detour decision (pure). Per candidate P: `wait[w]` backlog seconds, `own_s[w]` own prefill
 /// seconds, `pull_s[w]` pull seconds (0 = no pull), `dup[w]` duplication charge (s), `pulled[w]`
 /// tokens a move to w pulls. Total[w] = max(wait, pull) + own + dup. Returns (target, reason):
@@ -2163,21 +2192,33 @@ impl<'a> Sim<'a> {
         for &r in p.wq.iter() {
             let rq = &self.reqs[r as usize];
             let u = rq.cs_cost.unwrap_or(rq.unc_est);
-            s += eft_secs(&p.rbeta, ch, u, rq.pt.saturating_sub(u), 0, 0);
+            s += eft_secs(&p.rbeta, ch, u, rq.pt.saturating_sub(u), 0, 0) + self.xsecs(r, u);
         }
         for &r in p.pf_set.iter() {
             let rq = &self.reqs[r as usize];
             let left = rq.unc.saturating_sub(rq.computed);
-            s += eft_secs(&p.rbeta, ch, left, rq.pt.saturating_sub(left), 0, 0);
+            s += eft_secs(&p.rbeta, ch, left, rq.pt.saturating_sub(left), 0, 0) + self.xsecs(r, left);
         }
         if with_bq {
             for &r in p.bq.iter() {
                 let rq = &self.reqs[r as usize];
                 let u = rq.cs_cost.unwrap_or(rq.unc_est);
-                s += eft_secs(&p.rbeta, ch, u, rq.pt.saturating_sub(u), 0, 0);
+                s += eft_secs(&p.rbeta, ch, u, rq.pt.saturating_sub(u), 0, 0) + self.xsecs(r, u);
             }
         }
         s
+    }
+
+    /// Router view of the extra pass terms for request r with `unc` uncached tokens: p_req_s per pass the request takes
+    /// part in (ceil(unc / chunk)) + p_img_s per image with uncached tokens. 0 unless the router view is the engine
+    /// model (cs_router_beta empty) and a term is set (then every older arm is unchanged).
+    fn xsecs(&self, r: u32, unc: u64) -> f64 {
+        if !self.c.cs_router_beta.is_empty() || (self.c.p_req_s <= 0.0 && self.c.p_img_s <= 0.0) || unc == 0 {
+            return 0.0;
+        }
+        let rq = &self.reqs[r as usize];
+        let passes = unc.div_ceil(self.c.chunk_tokens.max(1));
+        self.c.p_req_s * passes as f64 + self.c.p_img_s * imgs_uncached(&rq.imgs, rq.pt.saturating_sub(unc)) as f64
     }
 
     fn at(&mut self, t: f64, ev: Ev) {
@@ -2583,11 +2624,12 @@ impl<'a> Sim<'a> {
             let ts = &self.tasks[task as usize];
             (ts.row, ts.inst)
         };
-        let Event::Generate { runs, max_tokens, .. } =
+        let Event::Generate { runs, max_tokens, images, .. } =
             &self.wl.tasks[row as usize].agents[agent as usize].events[i as usize]
         else {
             return;
         };
+        let imgs = if self.c.p_req_s > 0.0 || self.c.p_img_s > 0.0 { images.clone() } else { Vec::new() };
         let off = inst << 32;
         let runs: Vec<(u64, u32)> = runs.iter().map(|&(s, c)| (s + off, c)).collect();
         let pt = run_blocks(&runs) * self.c.block_tokens;
@@ -2606,6 +2648,7 @@ impl<'a> Sim<'a> {
             dec_lb: then,
             runs,
             pt,
+            imgs,
             maxt,
             ct,
             need,
@@ -2996,7 +3039,7 @@ impl<'a> Sim<'a> {
                 let f: Vec<f64> = (0..np)
                     .map(|w| {
                         let h = hits[w].min(l);
-                        self.backlog_secs(w, with_bq) + eft_secs(&self.p[w].rbeta, ch, l - h, h, 0, 0)
+                        self.backlog_secs(w, with_bq) + eft_secs(&self.p[w].rbeta, ch, l - h, h, 0, 0) + self.xsecs(r, l - h)
                     })
                     .collect();
                 let act: Vec<u64> = self.p.iter().map(|p| p.cs_active).collect();
@@ -3066,7 +3109,7 @@ impl<'a> Sim<'a> {
                     } else {
                         self.backlog_secs(w, false)
                     };
-                    own_s[w] = eft_secs(&b, ch, l - exp[w], exp[w], host_local, pl);
+                    own_s[w] = eft_secs(&b, ch, l - exp[w], exp[w], host_local, pl) + self.xsecs(r, l - exp[w]);
                     if self.c.cs_eft_noise_queue > 0.0 {
                         let e = self.c.cs_eft_noise_queue;
                         let u = self.nrng.random();
@@ -3255,7 +3298,7 @@ impl<'a> Sim<'a> {
                     let rec_s: Vec<f64> = (0..np)
                         .map(|w| {
                             let host_local = local[w].saturating_sub(gpu[w].min(local[w]));
-                            eft_secs(&self.p[w].rbeta, ch, l - local[w], local[w], host_local, 0)
+                            eft_secs(&self.p[w].rbeta, ch, l - local[w], local[w], host_local, 0) + self.xsecs(r, l - local[w])
                         })
                         .collect();
                     let (k, use_pull) = self.fpi_route(t, r, own, l, &local, &wait, &own_s, &pull_s, &pulled, &rec_s);
@@ -3396,7 +3439,7 @@ impl<'a> Sim<'a> {
         let lost = best.min(pt).saturating_sub(hits[tgt].min(pt));
         if self.c.cs_eft_wait_transit || self.c.cs_eft_state_age_s > 0.0 {
             let u = self.reqs[r as usize].cs_cost.unwrap_or(pt.saturating_sub(hits[tgt].min(pt)));
-            let s = eft_secs(&self.p[tgt].rbeta, self.c.chunk_tokens, u, pt.saturating_sub(u), 0, 0);
+            let s = eft_secs(&self.p[tgt].rbeta, self.c.chunk_tokens, u, pt.saturating_sub(u), 0, 0) + self.xsecs(r, u);
             if self.c.cs_eft_wait_transit {
                 self.reqs[r as usize].transit_s = s;
                 self.p[tgt].transit_s += s;
@@ -4701,7 +4744,16 @@ impl<'a> Sim<'a> {
                 lb += rq.lbcost;
             }
         }
-        let mut svc = (b[0] + b[1] * nk as f64 / 1e3 + b[2] * pairs / 1e9 + lb).max(0.02);
+        let mut svc = b[0] + b[1] * nk as f64 / 1e3 + b[2] * pairs / 1e9 + lb;
+        if self.c.p_req_s > 0.0 || self.c.p_img_s > 0.0 {
+            let mut ni = 0u64;
+            for it in items {
+                let rq = &self.reqs[it.r as usize];
+                ni += imgs_in_chunk(&rq.imgs, rq.pt.saturating_sub(rq.unc), it.pre, it.pre + it.n);
+            }
+            svc += self.c.p_req_s * items.len() as f64 + self.c.p_img_s * ni as f64;
+        }
+        let mut svc = svc.max(0.02);
         if !self.c.p_res_q.is_empty() {
             let u = self.urand() * 200.0;
             let q = &self.c.p_res_q[p % self.c.p_res_q.len()];
@@ -5242,13 +5294,15 @@ impl<'a> Sim<'a> {
         let ch = self.c.chunk_tokens;
         let big = self.c.cs_eft_gate_big_tokens;
         let th = self.c.cs_eft_gate_theta_s;
-        let hit = |u: u64, pt: u64| u >= big && eft_secs(&p.rbeta, ch, u, pt.saturating_sub(u), 0, 0) >= th;
+        let hit = |r: u32, u: u64, pt: u64| {
+            u >= big && eft_secs(&p.rbeta, ch, u, pt.saturating_sub(u), 0, 0) + self.xsecs(r, u) >= th
+        };
         p.wq.iter().chain(p.bq.iter()).any(|&r| {
             let rq = &self.reqs[r as usize];
-            hit(rq.cs_cost.unwrap_or(rq.unc_est), rq.pt)
+            hit(r, rq.cs_cost.unwrap_or(rq.unc_est), rq.pt)
         }) || p.pf_set.iter().any(|&r| {
             let rq = &self.reqs[r as usize];
-            hit(rq.unc.saturating_sub(rq.computed), rq.pt)
+            hit(r, rq.unc.saturating_sub(rq.computed), rq.pt)
         })
     }
 
@@ -5305,9 +5359,9 @@ impl<'a> Sim<'a> {
                         } else {
                             0
                         };
-                        let so = eft_secs(&self.p[o].rbeta, ch, pt - mo, mo, 0, 0);
+                        let so = eft_secs(&self.p[o].rbeta, ch, pt - mo, mo, 0, 0) + self.xsecs(r, pt - mo);
                         let have = mj + x;
-                        let sj = eft_secs(&self.p[j].rbeta, ch, pt - have, have, 0, x);
+                        let sj = eft_secs(&self.p[j].rbeta, ch, pt - have, have, 0, x) + self.xsecs(r, pt - have);
                         let behind = self.held.iter().filter(|h| h.1 as usize == o && h.2 > t0).count().min(3) as f64;
                         let tp = if x > 0 {
                             self.c.cs_eft_pull_fixed_s + self.c.cs_eft_pull_s_per_100k * x as f64 / 1e5 + self.c.cs_eft_handoff_s
@@ -5456,7 +5510,7 @@ impl<'a> Sim<'a> {
             let exp = local[w].max(hs).min(l);
             let pl = exp.saturating_sub(local[w]);
             let host_local = local[w].saturating_sub(gpu[w].min(local[w]));
-            s[w] = eft_secs(&self.p[w].rbeta, ch, l - exp, exp, host_local, pl);
+            s[w] = eft_secs(&self.p[w].rbeta, ch, l - exp, exp, host_local, pl) + self.xsecs(r, l - exp);
             ps[w] = if pl > 0 { self.c.cs_eft_pull_fixed_s + self.c.cs_eft_pull_s_per_100k * pl as f64 / 1e5 } else { 0.0 };
             let dtok = if self.c.cs_eft_dup_on_recompute { best.saturating_sub(local[w]) } else { pl };
             dup[w] = self.c.cs_eft_dup_per_token_s * dtok as f64;
@@ -5906,7 +5960,7 @@ impl<'a> Sim<'a> {
             let mut m = vec![0.0; np];
             for w in 0..np {
                 let b = self.p[w].rbeta;
-                let x_loc = eft_secs(&b, ch, l - lmax, lmax, 0, 0);
+                let x_loc = eft_secs(&b, ch, l - lmax, lmax, 0, 0) + self.xsecs(r, l - lmax);
                 c[w] = a(w, wait[w], x_loc);
                 if w == own {
                     continue;
@@ -7238,6 +7292,74 @@ mod tests {
     }
 
     #[test]
+    fn image_and_request_pass_terms_count_uncached_images_and_default_off() {
+        // Pure helpers: images (first token, count), sorted; c0 = first uncached token of the prompt.
+        let im = [(100u32, 50u32), (200, 50), (300, 50)];
+        assert_eq!(imgs_in_chunk(&im, 0, 0, 150), 1);
+        assert_eq!(imgs_in_chunk(&im, 0, 150, 250), 1);
+        assert_eq!(imgs_in_chunk(&im, 0, 0, 400), 3);
+        // Cached up to 220: the image at 200 straddles the boundary and is encoded in the chunk that holds token 220.
+        assert_eq!(imgs_in_chunk(&im, 220, 220, 260), 1);
+        assert_eq!(imgs_in_chunk(&im, 220, 260, 400), 1);
+        // Cached up to 250: the image at 200 is wholly cached and not encoded.
+        assert_eq!(imgs_in_chunk(&im, 250, 250, 400), 1);
+        assert_eq!(imgs_in_chunk(&[], 0, 0, 100), 0);
+        assert_eq!(imgs_uncached(&im, 0), 3);
+        assert_eq!(imgs_uncached(&im, 220), 2);
+        assert_eq!(imgs_uncached(&im, 250), 1);
+        assert_eq!(imgs_uncached(&im, 350), 0);
+        // Simulator: a workload with images and both terms 0 runs bit for bit like the text-only workload.
+        let plain = synth_workload(12, 30);
+        let mut wl = synth_workload(12, 30);
+        for t in wl.tasks.iter_mut() {
+            for a in t.agents.iter_mut() {
+                for e in a.events.iter_mut() {
+                    if let Event::Generate { runs, images, .. } = e {
+                        let n = runs.iter().map(|&(_, c)| c as u64).sum::<u64>() * 64;
+                        *images = (0..n / 2000).map(|k| ((k * 2000 + 100) as u32, 1000u32)).collect();
+                    }
+                }
+            }
+        }
+        let ct = FxHashMap::default();
+        let base = SimConfig { p_policy: "eft".into(), cs_eft_wait_transit: true, ..small_cfg() };
+        let (a, _) = run(base.clone(), &plain, &ct);
+        let (b, _) = run(base.clone(), &wl, &ct);
+        assert!(a.n_scored > 50, "scored {}", a.n_scored);
+        assert_eq!(a.rps.to_bits(), b.rps.to_bits());
+        assert_eq!(a.e2e_mean.to_bits(), b.e2e_mean.to_bits());
+        assert_eq!(a.hit_actual_over_prompt.to_bits(), b.hit_actual_over_prompt.to_bits());
+        // Terms on: passes take longer, so the mean E2E grows.
+        let on = SimConfig { p_img_s: 0.05, p_req_s: 0.02, ..base.clone() };
+        let (c, _) = run(on.clone(), &wl, &ct);
+        assert!(c.e2e_mean > a.e2e_mean, "{} vs {}", c.e2e_mean, a.e2e_mean);
+        // Router view: the exact model (cs_router_beta empty) adds the same terms; a token-ledger view does not.
+        let mut s = Sim::new(on.clone(), &wl, &ct);
+        s.run();
+        let ch = s.c.chunk_tokens;
+        let mut with_imgs = 0;
+        for r in 0..s.reqs.len() {
+            let (unc, pt, ni) = {
+                let rq = &s.reqs[r];
+                (rq.unc, rq.pt, imgs_uncached(&rq.imgs, rq.pt.saturating_sub(rq.unc)))
+            };
+            if unc == 0 {
+                continue;
+            }
+            with_imgs += (ni > 0) as usize;
+            let want = 0.02 * unc.div_ceil(ch) as f64 + 0.05 * ni as f64;
+            assert!((s.xsecs(r as u32, unc) - want).abs() < 1e-12, "r {r} pt {pt}");
+        }
+        assert!(with_imgs > 10, "{with_imgs}");
+        let mut l = Sim::new(SimConfig { cs_router_beta: vec![0.0, 0.2, 0.0, 0.0, 0.0], ..on }, &wl, &ct);
+        l.run();
+        for r in 0..l.reqs.len() {
+            let unc = l.reqs[r].unc;
+            assert_eq!(l.xsecs(r as u32, unc), 0.0);
+        }
+    }
+
+    #[test]
     fn eft_secs_is_the_pass_model_with_amortized_pass_cost() {
         let u = 8192u64;
         let want = 0.12 + 0.023 * 8.192 + 0.117 * (8192.0 * 8193.0 / 2.0) / 1e9;
@@ -7650,6 +7772,7 @@ mod tests {
                     out_blocks: 1,
                     src_t: None,
                     src_api: None,
+                    images: Vec::new(),
                 });
                 ev.push(Event::Wait { seconds: 3.0 });
             }

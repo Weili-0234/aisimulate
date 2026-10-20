@@ -17,13 +17,15 @@ use serde_json::Value;
 #[derive(Debug, Clone)]
 pub enum Event {
     /// A generate request: prompt block runs (64-token blocks), max tokens, output blocks,
-    /// source start time and source API time (seconds), when recorded.
+    /// source start time and source API time (seconds), when recorded; `images` = (first token
+    /// offset, token count) of each image in the prompt, sorted, non-overlapping (empty = text only).
     Generate {
         runs: Vec<(u64, u32)>,
         max_tokens: u32,
         out_blocks: u32,
         src_t: Option<f64>,
         src_api: Option<f64>,
+        images: Vec<(u32, u32)>,
     },
     /// A wait of `seconds` (capped at replay time).
     Wait { seconds: f64 },
@@ -86,6 +88,9 @@ struct RawEvent {
     source_api_time_s: Option<f64>,
     #[serde(default)]
     seconds: Option<f64>,
+    /// Optional (first token offset, token count) per image in the prompt (CUA screenshots).
+    #[serde(default)]
+    recorded_image_token_runs: Option<Vec<(u64, u64)>>,
 }
 
 #[derive(Deserialize)]
@@ -159,6 +164,18 @@ impl Workload {
                                 .sum(),
                             src_t: e.source_t_s,
                             src_api: e.source_api_time_s,
+                            images: {
+                                let mut v: Vec<(u32, u32)> = e
+                                    .recorded_image_token_runs
+                                    .as_deref()
+                                    .unwrap_or(&[])
+                                    .iter()
+                                    .filter(|&&(_, c)| c > 0)
+                                    .map(|&(s, c)| (s as u32, c as u32))
+                                    .collect();
+                                v.sort_unstable();
+                                v
+                            },
                         },
                         "wait" => Event::Wait { seconds: e.seconds.unwrap_or(0.0) },
                         _ => Event::Other,
