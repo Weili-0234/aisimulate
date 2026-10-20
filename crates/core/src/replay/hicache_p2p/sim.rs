@@ -101,6 +101,9 @@ pub struct SimConfig {
     pub tpot_s: f64,
     pub step_ref_ms: f64,
     pub tpot_fb: bool,
+    /// D step model (ms) [a, b, c, k, d]: a + b B + c (1 - exp(k B)) + d S / 1e6 (B = batch, S = summed context tokens).
+    /// Empty = the GB300 GLM-5.2 fit (9.71, 0.467, 10.59, 6 ln(1 - 8/256), 0.996). CUA 2026-10-20: Kimi-K2.6 fit.
+    pub d_step: Vec<f64>,
     // ---- router P
     /// "smgca" | "cosched" | "sticky" | "rr" | "eft" | "ideal_eft" (the last two: SWEEP-PDLOAD variants)
     pub p_policy: String,
@@ -603,6 +606,7 @@ impl Default for SimConfig {
             tpot_s: 0.0054,
             step_ref_ms: 23.3,
             tpot_fb: true,
+            d_step: Vec::new(),
             p_policy: "smgca".into(),
             smg_threshold: 0.3,
             smg_abs: 64,
@@ -1720,9 +1724,12 @@ pub struct Sim<'a> {
     inj_n: [u64; 2],
 }
 
-fn step_ms(b: i64, s_tok: u64) -> f64 {
-    let lk = (1.0f64 - 8.0 / 256.0).ln();
+fn step_ms(coef: &[f64], b: i64, s_tok: u64) -> f64 {
     let b = b as f64;
+    if coef.len() == 5 {
+        return (coef[0] + coef[1] * b + coef[2] * (1.0 - (coef[3] * b).exp()) + coef[4] * s_tok as f64 / 1e6).max(0.1);
+    }
+    let lk = (1.0f64 - 8.0 / 256.0).ln();
     9.71 + 0.467 * b + 10.59 * (1.0 - (6.0 * b * lk).exp()) + 0.996 * s_tok as f64 / 1e6
 }
 
@@ -4849,7 +4856,7 @@ impl<'a> Sim<'a> {
             let a = dw.vt.max(lo);
             let b = t.min(hi);
             if b > a {
-                let st = step_ms(dw.b, dw.s);
+                let st = step_ms(&self.c.d_step, dw.b, dw.s);
                 dw.ib += dw.b as f64 * (b - a);
                 dw.ib_inv += dw.b as f64 * (b - a) / st;
             }
@@ -4864,7 +4871,7 @@ impl<'a> Sim<'a> {
             return;
         };
         let tgt = f64::from_bits(tgt_bits);
-        let mut step = step_ms(self.d[d].b, self.d[d].s);
+        let mut step = step_ms(&self.c.d_step, self.d[d].b, self.d[d].s);
         if self.c.ld_held_scan_ms > 0.0 {
             step += self.c.ld_held_scan_ms * (self.d[d].held.len() as f64 + self.d[d].legs.max(0) as f64);
         }
@@ -7161,9 +7168,21 @@ pub fn run(c: SimConfig, wl: &Workload, ct_map: &FxHashMap<(u32, u32, u32), u32>
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::replay::hicache_p2p::trie::{Agent, Task};
 
     const B: [f64; 5] = [0.12, 0.023, 0.117, 0.0855, 0.0855];
+
+    #[test]
+    fn d_step_coefficients_default_to_the_glm_fit_and_take_a_linear_kimi_fit() {
+        let lk = (1.0f64 - 8.0 / 256.0).ln();
+        let legacy = 9.71 + 0.467 * 3.0 + 10.59 * (1.0 - (6.0 * 3.0 * lk).exp()) + 0.996 * 0.25;
+        assert!((step_ms(&[], 3, 250_000) - legacy).abs() < 1e-9);
+        let kimi = [12.23, 3.456, 0.0, 0.0, 49.8];
+        assert!((step_ms(&kimi, 2, 100_000) - (12.23 + 6.912 + 4.98)).abs() < 1e-9);
+        let c = SimConfig::default();
+        assert!(c.d_step.is_empty());
+    }
 
     #[test]
     fn eft_secs_is_the_pass_model_with_amortized_pass_cost() {
