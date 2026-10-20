@@ -493,6 +493,9 @@ pub struct SimConfig {
     pub lpb_hold_free: bool,
     /// PRED-GWQ: extra lead (s) added to every P's lead (a deeper engine queue: + R x extra tokens).
     pub lpb_lead_extra_s: f64,
+    /// PRED-GWQ force release (GPU GWQ-AUTO: 300 s; 0 = off): a request held in the router queue for >= this many
+    /// seconds goes to its TRADE argmin P (earliest predicted finish + copy price over all P, open or not).
+    pub lpb_force_s: f64,
     /// PRED-GWQ: cs_pred_noise only on the LATE-P drains, not on the TRADE (eft) arrival terms (the router build
     /// with the E3 state for the drain only and the ledger TRADE decision).
     pub lpb_noise_drain_only: bool,
@@ -772,6 +775,7 @@ impl Default for SimConfig {
             lpb_bnd_scale: 1.0,
             lpb_hold_free: false,
             lpb_lead_extra_s: 0.0,
+            lpb_force_s: 0.0,
             lpb_noise_drain_only: false,
             lpb_floor: false,
             bnd_idle_k: Vec::new(),
@@ -1512,6 +1516,8 @@ pub struct SimReport {
     pub lpb_counts: [u64; 6],
     /// PRED-GWQ (lpb_hold_free): arrivals bound to their owner that skipped the router queue (whole run).
     pub lpb_bypassed: u64,
+    /// PRED-GWQ force releases (lpb_force_s; whole run; also counted in lpb_counts[0]).
+    pub lpb_forced: u64,
     /// PRED-EFT+HOL shadow (whole run): [gate decisions, the other HOL form picks another P, big cold requests
     /// (uncached on the owner >= 32,768 and best hit < the pull floor), big cold and differ, differ with the selected
     /// form's P less loaded, differ with the selected form keeping the owner].
@@ -1718,6 +1724,7 @@ pub struct Sim<'a> {
     lpb_rx_n: [u64; 2],
     lpb_counts: [u64; 6],
     lpb_bypassed: u64,
+    lpb_forced: u64,
     hol_hist: Vec<VecDeque<(f64, f64)>>,
     hol_sh: [u64; 6],
     iww: [f64; 3],
@@ -2157,6 +2164,7 @@ impl<'a> Sim<'a> {
             lpb_rx_n: [0; 2],
             lpb_counts: [0; 6],
             lpb_bypassed: 0,
+            lpb_forced: 0,
             hol_hist: vec![VecDeque::new(); s5_np],
             hol_sh: [0; 6],
             iww: [0.0; 3],
@@ -5521,6 +5529,9 @@ impl<'a> Sim<'a> {
     /// LATE-P dispatcher (see SimConfig::lpb). Runs on arrivals, pass ends and the router timer.
     fn lpb_dispatch(&mut self, t: f64) {
         let np = self.p.len();
+        if self.c.lpb_force_s > 0.0 {
+            self.lpb_force(t);
+        }
         loop {
             if self.lpb_q.is_empty() {
                 break;
@@ -5626,6 +5637,43 @@ impl<'a> Sim<'a> {
         if !self.lpb_q.is_empty() && !self.lpb_tick_on && t < self.c.duration_s {
             self.lpb_tick_on = true;
             self.at(t + self.c.lpb_tick_s, Ev::LpbTick);
+        }
+    }
+
+    /// PRED-GWQ force release: every request held >= lpb_force_s goes to the P with the least predicted finish
+    /// (drain or receipt + boot / pull, then own pass seconds) + copy price, over all P (open or not).
+    fn lpb_force(&mut self, t: f64) {
+        let np = self.p.len();
+        let lim = self.c.lpb_force_s;
+        let due: Vec<u32> =
+            self.lpb_q.iter().copied().filter(|&r| t - self.reqs[r as usize].lpb_arr >= lim).collect();
+        for r in due {
+            let mut d: Vec<f64> = (0..np).map(|w| self.lpb_drain(t, w)).collect();
+            if self.c.lpb_floor {
+                for (w, x) in d.iter_mut().enumerate() {
+                    *x = x.min(*x / self.p[w].lpb_nf.max(1e-9));
+                }
+            }
+            let nf: Vec<f64> = (0..np).map(|w| self.p[w].lpb_nf).collect();
+            let c = self.lpb_cand(t, r, &d);
+            let (recv, boot) = self.lpb_lead_parts(c.pt);
+            let cost = |w: usize| d[w].max(recv + boot.max(c.ps[w])) + c.s0[w] * nf[w] + c.dup[w];
+            let w = (0..np).min_by(|&a, &b| cost(a).total_cmp(&cost(b)).then(a.cmp(&b))).unwrap();
+            let pos = self.lpb_q.iter().position(|&x| x == r).unwrap();
+            self.lpb_q.remove(pos);
+            let cls: u8 = if c.cold { 2 } else if w == c.own { 1 } else { 3 };
+            {
+                let rq = &mut self.reqs[r as usize];
+                rq.lpb_disp = t;
+                rq.hold_s = t - rq.lpb_arr;
+                rq.lpb_cls = cls;
+            }
+            self.lpb_cache.remove(&r);
+            self.dispatch_to(t, r, w);
+            let k = if cls == 3 && self.reqs[r as usize].pull_src.is_none() { 4 } else { cls as usize };
+            self.lpb_counts[0] += 1;
+            self.lpb_counts[k] += 1;
+            self.lpb_forced += 1;
         }
     }
 
@@ -6993,6 +7041,7 @@ impl<'a> Sim<'a> {
                     rep.lpb_stats = [m, p50, p95, c(1), c(2), c(3), self.lpb_rx[0], self.lpb_rx[2]];
                     rep.lpb_counts = self.lpb_counts;
                     rep.lpb_bypassed = self.lpb_bypassed;
+                    rep.lpb_forced = self.lpb_forced;
                 }
                 rep.hol_shadow = self.hol_sh;
                 if self.c.iww_metric {
@@ -7357,6 +7406,42 @@ mod tests {
             let unc = l.reqs[r].unc;
             assert_eq!(l.xsecs(r as u32, unc), 0.0);
         }
+    }
+
+    #[test]
+    fn gwq_force_release_dispatches_held_requests_after_the_limit() {
+        let wl = synth_workload(12, 30);
+        let ct = FxHashMap::default();
+        let base = SimConfig {
+            cs_workload: "true".into(),
+            p_policy: "eft".into(),
+            cs_eft_wait_transit: true,
+            lpb: true,
+            lpb_order: "hrrn".into(),
+            lpb_moves: false,
+            lpb_hold_free: true,
+            // No P ever opens (lead far below any drain): free requests starve in the router queue.
+            lpb_lead_extra_s: -1e9,
+            ..kv_cfg("smgca")
+        };
+        let mut s = Sim::new(SimConfig { lpb_force_s: 2.0, ..base.clone() }, &wl, &ct);
+        s.run();
+        let (rep, _) = s.report(0.0);
+        assert!(rep.lpb_forced > 0);
+        let k = rep.lpb_counts;
+        assert_eq!(k[0], k[1] + k[2] + k[3] + k[4], "{k:?}");
+        assert_eq!(k[0], rep.lpb_forced, "only forced releases can dispatch");
+        let tick = s.c.lpb_tick_s;
+        for q in s.reqs.iter().filter(|q| q.lpb_cls > 0) {
+            assert!(q.hold_s >= 2.0 - 1e-9 && q.hold_s <= 2.0 + tick + 1e-6, "hold {}", q.hold_s);
+        }
+        assert!(s.lpb_q.iter().all(|&r| s.c.duration_s - s.reqs[r as usize].lpb_arr < 2.0 + tick + 1e-6));
+        // Default (off): nothing is forced and the starving queue scores fewer requests.
+        let mut o = Sim::new(base, &wl, &ct);
+        o.run();
+        let (r0, _) = o.report(0.0);
+        assert_eq!(r0.lpb_forced, 0);
+        assert!(rep.n_scored > r0.n_scored + 50, "{} vs {}", rep.n_scored, r0.n_scored);
     }
 
     #[test]
