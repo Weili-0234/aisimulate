@@ -101,6 +101,12 @@ pub struct SimConfig {
     pub tpot_s: f64,
     pub step_ref_ms: f64,
     pub tpot_fb: bool,
+    /// Router-side P pass model [c0, c1, c2, c3, c4] (as p_beta) used by every router estimate (EFT / TRADE wait and own
+    /// seconds, in-flight ledger, LATE-P / GWQ drain, B1 hold): empty = the true P pass model (an exact step-time-model
+    /// predictor; cs_pred_noise adds its forecast error). [0, 1000 / R, 0, 0, 0] = the token ledger at rate R tokens per
+    /// second (context-blind: wait = queued uncached tokens / R), as the GPU router's ledger wait. Engine passes always
+    /// use p_beta. (CUA 2026-10-20.)
+    pub cs_router_beta: Vec<f64>,
     /// D step model (ms) [a, b, c, k, d]: a + b B + c (1 - exp(k B)) + d S / 1e6 (B = batch, S = summed context tokens).
     /// Empty = the GB300 GLM-5.2 fit (9.71, 0.467, 10.59, 6 ln(1 - 8/256), 0.996). CUA 2026-10-20: Kimi-K2.6 fit.
     pub d_step: Vec<f64>,
@@ -607,6 +613,7 @@ impl Default for SimConfig {
             step_ref_ms: 23.3,
             tpot_fb: true,
             d_step: Vec::new(),
+            cs_router_beta: Vec::new(),
             p_policy: "smgca".into(),
             smg_threshold: 0.3,
             smg_abs: 64,
@@ -1069,6 +1076,8 @@ struct BItem {
 
 struct PW {
     beta: [f64; 5],
+    /// Router view of the pass model (cs_router_beta, else beta).
+    rbeta: [f64; 5],
     radix: TwoTierRadix,
     wq: VecDeque<u32>,
     chunked: Option<u32>,
@@ -1872,8 +1881,14 @@ impl<'a> Sim<'a> {
             if c.kv_retention {
                 radix.enable_kvret(c.kvret_dup_reclaim);
             }
+            let rbeta = if c.cs_router_beta.len() == 5 {
+                [c.cs_router_beta[0], c.cs_router_beta[1], c.cs_router_beta[2], c.cs_router_beta[3], c.cs_router_beta[4]]
+            } else {
+                beta
+            };
             p.push(PW {
                 beta,
+                rbeta,
                 radix,
                 wq: VecDeque::new(),
                 chunked: None,
@@ -2148,18 +2163,18 @@ impl<'a> Sim<'a> {
         for &r in p.wq.iter() {
             let rq = &self.reqs[r as usize];
             let u = rq.cs_cost.unwrap_or(rq.unc_est);
-            s += eft_secs(&p.beta, ch, u, rq.pt.saturating_sub(u), 0, 0);
+            s += eft_secs(&p.rbeta, ch, u, rq.pt.saturating_sub(u), 0, 0);
         }
         for &r in p.pf_set.iter() {
             let rq = &self.reqs[r as usize];
             let left = rq.unc.saturating_sub(rq.computed);
-            s += eft_secs(&p.beta, ch, left, rq.pt.saturating_sub(left), 0, 0);
+            s += eft_secs(&p.rbeta, ch, left, rq.pt.saturating_sub(left), 0, 0);
         }
         if with_bq {
             for &r in p.bq.iter() {
                 let rq = &self.reqs[r as usize];
                 let u = rq.cs_cost.unwrap_or(rq.unc_est);
-                s += eft_secs(&p.beta, ch, u, rq.pt.saturating_sub(u), 0, 0);
+                s += eft_secs(&p.rbeta, ch, u, rq.pt.saturating_sub(u), 0, 0);
             }
         }
         s
@@ -2981,7 +2996,7 @@ impl<'a> Sim<'a> {
                 let f: Vec<f64> = (0..np)
                     .map(|w| {
                         let h = hits[w].min(l);
-                        self.backlog_secs(w, with_bq) + eft_secs(&self.p[w].beta, ch, l - h, h, 0, 0)
+                        self.backlog_secs(w, with_bq) + eft_secs(&self.p[w].rbeta, ch, l - h, h, 0, 0)
                     })
                     .collect();
                 let act: Vec<u64> = self.p.iter().map(|p| p.cs_active).collect();
@@ -3041,7 +3056,7 @@ impl<'a> Sim<'a> {
                 let mut wait0 = vec![0.0; np];
                 let mut own0 = vec![0.0; np];
                 for w in 0..np {
-                    let b = self.p[w].beta;
+                    let b = self.p[w].rbeta;
                     let pl = exp[w].saturating_sub(local[w]);
                     let host_local = local[w].saturating_sub(gpu[w].min(local[w]));
                     wait[w] = if self.c.cs_eft_state_age_s > 0.0 {
@@ -3240,7 +3255,7 @@ impl<'a> Sim<'a> {
                     let rec_s: Vec<f64> = (0..np)
                         .map(|w| {
                             let host_local = local[w].saturating_sub(gpu[w].min(local[w]));
-                            eft_secs(&self.p[w].beta, ch, l - local[w], local[w], host_local, 0)
+                            eft_secs(&self.p[w].rbeta, ch, l - local[w], local[w], host_local, 0)
                         })
                         .collect();
                     let (k, use_pull) = self.fpi_route(t, r, own, l, &local, &wait, &own_s, &pull_s, &pulled, &rec_s);
@@ -3381,7 +3396,7 @@ impl<'a> Sim<'a> {
         let lost = best.min(pt).saturating_sub(hits[tgt].min(pt));
         if self.c.cs_eft_wait_transit || self.c.cs_eft_state_age_s > 0.0 {
             let u = self.reqs[r as usize].cs_cost.unwrap_or(pt.saturating_sub(hits[tgt].min(pt)));
-            let s = eft_secs(&self.p[tgt].beta, self.c.chunk_tokens, u, pt.saturating_sub(u), 0, 0);
+            let s = eft_secs(&self.p[tgt].rbeta, self.c.chunk_tokens, u, pt.saturating_sub(u), 0, 0);
             if self.c.cs_eft_wait_transit {
                 self.reqs[r as usize].transit_s = s;
                 self.p[tgt].transit_s += s;
@@ -5227,7 +5242,7 @@ impl<'a> Sim<'a> {
         let ch = self.c.chunk_tokens;
         let big = self.c.cs_eft_gate_big_tokens;
         let th = self.c.cs_eft_gate_theta_s;
-        let hit = |u: u64, pt: u64| u >= big && eft_secs(&p.beta, ch, u, pt.saturating_sub(u), 0, 0) >= th;
+        let hit = |u: u64, pt: u64| u >= big && eft_secs(&p.rbeta, ch, u, pt.saturating_sub(u), 0, 0) >= th;
         p.wq.iter().chain(p.bq.iter()).any(|&r| {
             let rq = &self.reqs[r as usize];
             hit(rq.cs_cost.unwrap_or(rq.unc_est), rq.pt)
@@ -5244,7 +5259,7 @@ impl<'a> Sim<'a> {
 
     fn hold_limit(&self, w: usize) -> f64 {
         let ch = self.c.chunk_tokens;
-        self.c.cs_hold_passes * eft_secs(&self.p[w].beta, ch, ch, 0, 0, 0)
+        self.c.cs_hold_passes * eft_secs(&self.p[w].rbeta, ch, ch, 0, 0, 0)
     }
 
     /// S7 B1: route request r now, to P w (pull from the best other holder as the EFT path hints).
@@ -5290,9 +5305,9 @@ impl<'a> Sim<'a> {
                         } else {
                             0
                         };
-                        let so = eft_secs(&self.p[o].beta, ch, pt - mo, mo, 0, 0);
+                        let so = eft_secs(&self.p[o].rbeta, ch, pt - mo, mo, 0, 0);
                         let have = mj + x;
-                        let sj = eft_secs(&self.p[j].beta, ch, pt - have, have, 0, x);
+                        let sj = eft_secs(&self.p[j].rbeta, ch, pt - have, have, 0, x);
                         let behind = self.held.iter().filter(|h| h.1 as usize == o && h.2 > t0).count().min(3) as f64;
                         let tp = if x > 0 {
                             self.c.cs_eft_pull_fixed_s + self.c.cs_eft_pull_s_per_100k * x as f64 / 1e5 + self.c.cs_eft_handoff_s
@@ -5384,7 +5399,7 @@ impl<'a> Sim<'a> {
 
     fn lpb_titer(&self, w: usize) -> f64 {
         let ti = self.p[w].ld_ti;
-        if ti > 0.0 { ti } else { eft_secs(&self.p[w].beta, self.c.chunk_tokens, self.c.chunk_tokens, 0, 0, 0) }
+        if ti > 0.0 { ti } else { eft_secs(&self.p[w].rbeta, self.c.chunk_tokens, self.c.chunk_tokens, 0, 0, 0) }
     }
 
     fn lpb_bound(&self, idle: bool, x: f64) -> f64 {
@@ -5441,7 +5456,7 @@ impl<'a> Sim<'a> {
             let exp = local[w].max(hs).min(l);
             let pl = exp.saturating_sub(local[w]);
             let host_local = local[w].saturating_sub(gpu[w].min(local[w]));
-            s[w] = eft_secs(&self.p[w].beta, ch, l - exp, exp, host_local, pl);
+            s[w] = eft_secs(&self.p[w].rbeta, ch, l - exp, exp, host_local, pl);
             ps[w] = if pl > 0 { self.c.cs_eft_pull_fixed_s + self.c.cs_eft_pull_s_per_100k * pl as f64 / 1e5 } else { 0.0 };
             let dtok = if self.c.cs_eft_dup_on_recompute { best.saturating_sub(local[w]) } else { pl };
             dup[w] = self.c.cs_eft_dup_per_token_s * dtok as f64;
@@ -5890,7 +5905,7 @@ impl<'a> Sim<'a> {
             let mut c = vec![0.0; np];
             let mut m = vec![0.0; np];
             for w in 0..np {
-                let b = self.p[w].beta;
+                let b = self.p[w].rbeta;
                 let x_loc = eft_secs(&b, ch, l - lmax, lmax, 0, 0);
                 c[w] = a(w, wait[w], x_loc);
                 if w == own {
@@ -7182,6 +7197,44 @@ mod tests {
         assert!((step_ms(&kimi, 2, 100_000) - (12.23 + 6.912 + 4.98)).abs() < 1e-9);
         let c = SimConfig::default();
         assert!(c.d_step.is_empty());
+    }
+
+    #[test]
+    fn router_pass_model_defaults_to_the_engine_model_and_a_token_ledger_changes_only_the_router_view() {
+        let wl = synth_workload(12, 30);
+        let ct = FxHashMap::default();
+        let base = SimConfig { p_policy: "eft".into(), cs_eft_wait_transit: true, ..small_cfg() };
+        let b0 = base.p_beta[0];
+        // Flag-off identity: a router model equal to p_beta gives the same run bit for bit.
+        let (a, _) = run(base.clone(), &wl, &ct);
+        let (b, _) = run(SimConfig { cs_router_beta: b0.to_vec(), ..base.clone() }, &wl, &ct);
+        assert!(a.n_scored > 50, "scored {}", a.n_scored);
+        assert_eq!(a.rps.to_bits(), b.rps.to_bits());
+        assert_eq!(a.e2e_mean.to_bits(), b.e2e_mean.to_bits());
+        assert_eq!(a.hit_actual_over_prompt.to_bits(), b.hit_actual_over_prompt.to_bits());
+        // Token ledger at R = 5,000 tokens/s: the router's backlog = queued uncached tokens / R; engine passes keep p_beta.
+        let c = SimConfig { cs_router_beta: vec![0.0, 1000.0 / 5000.0, 0.0, 0.0, 0.0], ..base.clone() };
+        let mut s = Sim::new(c, &wl, &ct);
+        s.run();
+        let mut seen = 0;
+        for w in 0..s.p.len() {
+            assert_eq!(s.p[w].beta, b0);
+            let p = &s.p[w];
+            let mut tok = 0u64;
+            for &r in p.wq.iter().chain(p.bq.iter()) {
+                let rq = &s.reqs[r as usize];
+                tok += rq.cs_cost.unwrap_or(rq.unc_est);
+            }
+            for &r in p.pf_set.iter() {
+                let rq = &s.reqs[r as usize];
+                tok += rq.unc.saturating_sub(rq.computed);
+            }
+            seen += tok;
+            assert!((s.backlog_secs(w, true) - tok as f64 / 5000.0).abs() < 1e-9, "P{w}");
+        }
+        let _ = seen;
+        let (rep, _) = s.report(0.0);
+        assert!(rep.n_scored > 50, "scored {}", rep.n_scored);
     }
 
     #[test]
